@@ -1,0 +1,40 @@
+# Rust build output
+/target/
+/fuzz/target/
+
+# Frontend dependencies and generated assets
+/frontend/node_modules/
+/frontend/dist/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Local rexec state
+/data/
+/~/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite-journal
+
+# Test, coverage, profiling, and fuzz output
+/coverage/
+/fuzz/artifacts/
+/fuzz/corpus/
+*.profraw
+*.profdata
+lcov.info
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+*~
+
+# Editors and operating systems
+/.idea/
+/.vscode/
+.DS_Store
+Thumbs.db

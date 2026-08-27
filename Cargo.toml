@@ -1,0 +1,55 @@
+[package]
+name = "cog"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+license = "Apache-2.0"
+description = "Clanker Operations Gateway: secure, governed tool access for AI agents"
+
+[dependencies]
+aes-gcm = "0.10"
+anyhow = "1"
+argon2 = "0.5"
+async-trait = "0.1"
+async-stream = "0.3"
+axum = { version = "0.8", features = ["form", "macros"] }
+base64 = "0.22"
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3"
+hex = "0.4"
+http = "1"
+jsonwebtoken = "9"
+lz4_flex = { version = "0.11", features = ["frame"] }
+libc = "0.2"
+object_store = { version = "0.12", features = ["aws"] }
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
+rpassword = "7"
+rust-embed = "8"
+rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+rustyriver = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
+thiserror = "2"
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tower-http = { version = "0.6", features = ["catch-panic", "cors", "limit", "request-id", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = { version = "2", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+v8 = "152.1"
+
+[dev-dependencies]
+http-body-util = "0.1"
+proptest = "1"
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+lto = "thin"
+strip = true

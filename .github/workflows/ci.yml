@@ -1,0 +1,29 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: "rustfmt, clippy, llvm-tools-preview" }
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: taiki-e/install-action@cargo-audit
+      - uses: taiki-e/install-action@cargo-deny
+      - name: Install pinned Litestream reference
+        run: |
+          curl -fsSL https://github.com/benbjohnson/litestream/releases/download/v0.5.16/litestream-0.5.16-linux-x86_64.tar.gz | tar -xz -C /tmp
+          echo "LITESTREAM_BIN=/tmp/litestream" >> "$GITHUB_ENV"
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo audit --deny warnings
+      - run: cargo deny check licenses bans sources
+      - run: cargo llvm-cov clean --workspace
+      - run: cargo llvm-cov --all-targets --no-report
+      - run: REXEC_COVERAGE=1 scripts/test-s3.sh
+      - run: cargo llvm-cov report --fail-under-lines 95
+      - run: docker build -t rexec:ci .
+      - run: docker run --rm rexec:ci --version
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
