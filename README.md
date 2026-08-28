@@ -182,13 +182,14 @@ CI requires 95% line coverage. The full CI sequence, including the instrumented 
 
 ### Request path and code mode
 
-The MCP endpoint defaults to code mode at `/mcp`. Connect to
-`/mcp?codemode=false` to advertise every connected integration tool directly
-under its immutable `<integration-id>.<tool-name>` name instead of advertising
-the `execute` tool. COG administration tools remain available with their
-`cog_` prefix in either mode. Directly advertised integration tools declare
-their `integration:<id>` OAuth scope and use the same incremental-consent flow
-as code mode.
+The MCP endpoint defaults to hybrid mode at `/mcp`: `execute` provides code-mode
+access to every connected integration without expanding their tools into the
+top-level list, while COG-native tools are advertised directly. Native Git
+orchestration includes `repository_access` and `ssh_certificate`; native
+administration tools use the `cog_` prefix. Connect to `/mcp?codemode=true` for
+code-mode-only discovery, where `execute` is the sole top-level tool and the
+same COG-native operations remain available through the `git` and `cog`
+catalog targets. Both modes use the same incremental-consent flow.
 
 An agent discovers cog's OAuth metadata and dynamically registers an untrusted OAuth client. During PKCE authorization the user selects or creates an identity; approval creates the durable agent binding. Tokens identify that agent, while current identity grants and connections determine access.
 

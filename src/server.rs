@@ -626,7 +626,7 @@ impl ToolProvider for GitControlProvider {
     async fn tools(&self) -> anyhow::Result<Vec<Tool>> {
         let mut tools = vec![git_control_tool(
             "repository_access",
-            "Resolve a GitHub repository and return its SSH remote. Access is controlled by the GitHub App installation and this client's existing integration authorization.",
+            "Resolve a GitHub repository and begin the required SSH workflow. After this tool returns: generate or reuse a local Ed25519 key, call ssh_certificate with repositoryId and only the public key, write the returned certificate and knownHosts files, then use sshRemoteUrl. Never send the private key or disable host-key checking. Access is controlled by the GitHub App installation and this client's existing integration authorization.",
             false,
         )];
         if self.app.ssh_keys.is_some() && self.app.ssh_ready.load(Ordering::Acquire) {
@@ -742,6 +742,13 @@ impl ToolProvider for GitControlProvider {
                     "displayName":repo.display_name,
                     "remoteUrl":remote,
                     "remoteUrlVersion":2,
+                    "nextAction":"generateOrReuseEd25519KeyThenCallSshCertificate",
+                    "workflow":[
+                        {"step":1,"action":"generateOrReuseLocalKey","program":"ssh-keygen","arguments":["-q","-t","ed25519","-N","","-f","<private-key-path>"],"privateKeyRemainsLocal":true},
+                        {"step":2,"action":"callTool","tool":"ssh_certificate","arguments":{"repositoryId":repo.id,"publicKey":"contents of <private-key-path>.pub without a comment","permission":"read or write"}},
+                        {"step":3,"action":"writeOutputs","certificatePath":"<private-key-path>-cert.pub","knownHostsPath":"<private-known-hosts-path>"},
+                        {"step":4,"action":"useRemote","remoteField":"sshRemoteUrl","strictHostKeyChecking":true}
+                    ],
                     "remotes":{
                         "version":2,
                         "preferred":"ssh",
@@ -4290,7 +4297,8 @@ async fn mcp_endpoint(
     if req.id.is_none() {
         return StatusCode::ACCEPTED.into_response();
     }
-    if req.method == "tools/call"
+    if !options.codemode
+        && req.method == "tools/call"
         && let Some(name) = req.params.get("name").and_then(Value::as_str)
         && let Some(required) = native_admin_scope(name)
         && name != "cog_integrations_list"
@@ -4386,7 +4394,7 @@ struct McpOptions {
 }
 
 fn default_codemode() -> bool {
-    true
+    false
 }
 
 fn native_admin_scope(tool: &str) -> Option<&'static str> {
@@ -7272,10 +7280,21 @@ mod tests {
             .clone();
         assert!(code_mode_tools.iter().any(|tool| tool["name"] == "execute"));
 
-        let direct = router
+        assert!(
+            code_mode_tools
+                .iter()
+                .any(|tool| tool["name"] == "repository_access")
+        );
+        assert!(
+            !code_mode_tools
+                .iter()
+                .any(|tool| tool["name"] == format!("{integration}.echo"))
+        );
+
+        let code_mode_only = router
             .clone()
             .oneshot(
-                axum::http::Request::post("/mcp?codemode=false")
+                axum::http::Request::post("/mcp?codemode=true")
                     .header(http::header::AUTHORIZATION, format!("Bearer {access}"))
                     .header(http::header::CONTENT_TYPE, "application/json")
                     .body(axum::body::Body::from(
@@ -7285,20 +7304,13 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(direct.status(), StatusCode::OK);
-        let direct_tools = response_json(direct).await["result"]["tools"]
+        assert_eq!(code_mode_only.status(), StatusCode::OK);
+        let code_mode_only_tools = response_json(code_mode_only).await["result"]["tools"]
             .as_array()
             .unwrap()
             .clone();
-        assert!(!direct_tools.iter().any(|tool| tool["name"] == "execute"));
-        let direct_echo = direct_tools
-            .iter()
-            .find(|tool| tool["name"] == format!("{integration}.echo"))
-            .unwrap();
-        assert_eq!(
-            direct_echo["securitySchemes"][0]["scopes"],
-            json!([format!("integration:{integration}")])
-        );
+        assert_eq!(code_mode_only_tools.len(), 1);
+        assert_eq!(code_mode_only_tools[0]["name"], "execute");
 
         let malformed_mode = router
             .clone()
@@ -7353,7 +7365,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let direct_step_up = router
+        let hidden_integration_call = router
             .clone()
             .oneshot(
                 axum::http::Request::post("/mcp?codemode=false")
@@ -7375,10 +7387,14 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(direct_step_up.status(), StatusCode::OK);
-        let direct_step_up = response_json(direct_step_up).await;
-        assert_ne!(direct_step_up["result"]["isError"], true);
-        assert!(direct_step_up["result"]["structuredContent"]["requiredScopes"].is_null());
+        assert_eq!(hidden_integration_call.status(), StatusCode::OK);
+        let hidden_integration_call = response_json(hidden_integration_call).await;
+        assert!(
+            hidden_integration_call["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("unknown tool")
+        );
         let step_up = router
             .clone()
             .oneshot(
@@ -7534,7 +7550,7 @@ mod tests {
         assert_ne!(retried["result"]["isError"], true);
         assert_eq!(retried["result"]["structuredContent"]["name"], "echo");
 
-        let direct_call = router
+        let hidden_elevated_integration_call = router
             .clone()
             .oneshot(
                 axum::http::Request::post("/mcp?codemode=false")
@@ -7559,12 +7575,14 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(direct_call.status(), StatusCode::OK);
-        let direct_call = response_json(direct_call).await;
-        assert_ne!(direct_call["result"]["isError"], true);
-        assert_eq!(
-            direct_call["result"]["structuredContent"],
-            json!({"value":42})
+        assert_eq!(hidden_elevated_integration_call.status(), StatusCode::OK);
+        let hidden_elevated_integration_call =
+            response_json(hidden_elevated_integration_call).await;
+        assert!(
+            hidden_elevated_integration_call["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("unknown tool")
         );
 
         let dynamic_step_up = router

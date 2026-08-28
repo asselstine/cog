@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-const EXECUTE_INSTRUCTIONS: &str = "The execute tool accepts a synchronous JavaScript function body. Write statements directly; do not wrap them in a function or arrow function, do not use async/await, and do not return a Promise. Include an explicit return statement (use `return null;` for intentional empty output). Discovery is literal case-insensitive substring matching, not semantic search. If a task phrase finds nothing, use `return codemode.search('');` to enumerate the full catalog. `codemode.describe()` and `codemode.call()` require the immutable `<integration-id>.<tool-name>` target returned by search, never an integration label or bare tool name. Some providers, including Cloudflare, expose a nested search/execution surface: find and describe that upstream search tool, then call it to locate the provider operation. Prefer an object-shaped final result for broad MCP-client compatibility. Authorization: upstreamConnected reports whether cog is connected to the provider; clientAccessGranted reports whether this calling client has downstream access. If clientAccessGranted=false, call describe or call so cog returns the OAuth insufficient_scope challenge. Reauthorize and refresh this same MCP client's credential; a new process or registration is a different client and does not inherit grants. Never use integration_reconnect for a downstream grant: it replaces upstream provider credentials and cannot authorize the calling client. For Git, call repository_access first, generate or reuse a local Ed25519 key, send only its public key to ssh_certificate, write the returned certificate beside the private key, pin knownHosts, and use sshRemoteUrl. Never send the private key, implicitly renew a certificate, or disable host-key checking; call ssh_certificate with the same public key again after expiry, or generate a new key after sandbox loss.";
-const DIRECT_INSTRUCTIONS: &str = "Integration tools are advertised directly under immutable `<integration-id>.<tool-name>` names. Calling a tool may request incremental OAuth authorization for its `integration:<id>` scope. Reauthorize and refresh this same MCP client's credential; a new process or registration is a different client and does not inherit grants. For Git, call repository_access first. If SSH is preferred, generate an Ed25519 private key locally, send only its public key to ssh_certificate, pin knownHosts, and use the structured argument arrays. Never send the private key, implicitly renew a certificate, or disable host-key checking; generate a new key after expiry or sandbox loss and use HTTPS when outbound SSH is blocked.";
+const EXECUTE_INSTRUCTIONS: &str = "The execute tool accepts a synchronous JavaScript function body. Write statements directly; do not wrap them in a function or arrow function, do not use async/await, and do not return a Promise. Include an explicit return statement (use `return null;` for intentional empty output). Discovery is literal case-insensitive substring matching, not semantic search. If a task phrase finds nothing, use `return codemode.search('');` to enumerate the full catalog. `codemode.describe()` and `codemode.call()` require the immutable `<integration-id>.<tool-name>` target returned by search, never an integration label or bare tool name. Some providers, including Cloudflare, expose a nested search/execution surface: find and describe that upstream search tool, then call it to locate the provider operation. Prefer an object-shaped final result for broad MCP-client compatibility. Authorization: upstreamConnected reports whether cog is connected to the provider; clientAccessGranted reports whether this calling client has downstream access. If clientAccessGranted=false, call describe or call so cog returns the OAuth insufficient_scope challenge. Reauthorize and refresh this same MCP client's credential; a new process or registration is a different client and does not inherit grants. Never use integration_reconnect for a downstream grant: it replaces upstream provider credentials and cannot authorize the calling client. In code-mode-only mode, Git tools use the `git.repository_access` and `git.ssh_certificate` targets. Call repository_access first, generate or reuse a local Ed25519 key, send only its public key to ssh_certificate, write the returned certificate beside the private key, pin knownHosts, and use sshRemoteUrl. Never send the private key, implicitly renew a certificate, or disable host-key checking; call ssh_certificate with the same public key again after expiry, or generate a new key after sandbox loss.";
+const HYBRID_INSTRUCTIONS: &str = "External integration tools are available through execute and are never expanded into the top-level tool list. COG-native tools are also advertised directly in this default mode. Calling a tool may request incremental OAuth authorization; reauthorize and refresh this same MCP client's credential because a new process or registration is a different client and does not inherit grants. For Git, call repository_access first, generate or reuse a local Ed25519 private key, send only its public key to ssh_certificate, write the returned certificate beside the private key, pin knownHosts, and use sshRemoteUrl. Never send the private key, implicitly renew a certificate, or disable host-key checking; call ssh_certificate with the same public key again after expiry, or generate a new key after sandbox loss.";
 
 pub const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
 pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[LATEST_PROTOCOL_VERSION, "2025-06-18"];
@@ -101,33 +101,27 @@ pub async fn handle_with_options(
                 };
                 RpcResponse::ok(
                     req.id,
-                    json!({"protocolVersion":selected,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"cog","version":env!("CARGO_PKG_VERSION")},"instructions":if codemode { EXECUTE_INSTRUCTIONS } else { DIRECT_INSTRUCTIONS }}),
+                    json!({"protocolVersion":selected,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"cog","version":env!("CARGO_PKG_VERSION")},"instructions":if codemode { EXECUTE_INSTRUCTIONS } else { HYBRID_INSTRUCTIONS }}),
                 )
             }
         }
         "ping" => RpcResponse::ok(req.id, json!({})),
         "notifications/initialized" => RpcResponse::ok(req.id, Value::Null),
         "tools/list" => {
-            let mut tools = if codemode {
-                vec![
-                    json!({"name":"execute","description":format!("Run JavaScript in an isolated V8 runtime. {EXECUTE_INSTRUCTIONS}"),"inputSchema":{"type":"object","properties":{"code":{"type":"string","description":EXECUTE_INSTRUCTIONS}},"required":["code"],"additionalProperties":false},"securitySchemes":[{"type":"oauth2","scopes":["mcp"]}],"_meta":{"securitySchemes":[{"type":"oauth2","scopes":["mcp"]}]}}),
-                ]
-            } else {
-                match catalog.direct_tools("cog").await {
-                    Ok(tools) => tools
-                        .into_iter()
-                        .map(|tool| serde_json::to_value(tool).expect("tool serializes"))
-                        .collect(),
-                    Err(error) => return RpcResponse::err(req.id, -32603, error),
+            let mut tools = vec![
+                json!({"name":"execute","description":format!("Run JavaScript in an isolated V8 runtime. {EXECUTE_INSTRUCTIONS}"),"inputSchema":{"type":"object","properties":{"code":{"type":"string","description":EXECUTE_INSTRUCTIONS}},"required":["code"],"additionalProperties":false},"securitySchemes":[{"type":"oauth2","scopes":["mcp"]}],"_meta":{"securitySchemes":[{"type":"oauth2","scopes":["mcp"]}]}}),
+            ];
+            if !codemode {
+                for (integration, prefix) in [("git", ""), ("cog", "cog_")] {
+                    match catalog.native_tools(integration, prefix).await {
+                        Ok(native) => tools.extend(
+                            native
+                                .into_iter()
+                                .map(|tool| serde_json::to_value(tool).expect("tool serializes")),
+                        ),
+                        Err(error) => return RpcResponse::err(req.id, -32603, error),
+                    }
                 }
-            };
-            match catalog.native_tools("cog", "cog_").await {
-                Ok(native) => tools.extend(
-                    native
-                        .into_iter()
-                        .map(|tool| serde_json::to_value(tool).expect("tool serializes")),
-                ),
-                Err(error) => return RpcResponse::err(req.id, -32603, error),
             }
             RpcResponse::ok(req.id, json!({"tools":tools}))
         }
@@ -135,13 +129,13 @@ pub async fn handle_with_options(
             let Some(name) = req.params.get("name").and_then(Value::as_str) else {
                 return RpcResponse::err(req.id, -32602, "tool name is required");
             };
-            if let Some(admin) = name.strip_prefix("cog_") {
+            if !codemode && let Some(target) = native_target(name) {
                 let args = req
                     .params
                     .get("arguments")
                     .cloned()
                     .unwrap_or_else(|| json!({}));
-                return match catalog.call(&format!("cog.{admin}"), args).await {
+                return match catalog.call(&target, args).await {
                     Ok(value) => {
                         let text = serde_json::to_string(&value).unwrap();
                         let structured = if value.is_object() {
@@ -154,22 +148,6 @@ pub async fn handle_with_options(
                             json!({"content":[{"type":"text","text":text}],"structuredContent":structured}),
                         )
                     }
-                    Err(error) => RpcResponse::ok(
-                        req.id,
-                        json!({"content":[{"type":"text","text":error.to_string()}],"structuredContent":{"error":{"message":error.to_string(),"corrective":true}},"isError":true}),
-                    ),
-                };
-            }
-            if !codemode {
-                let args = req
-                    .params
-                    .get("arguments")
-                    .cloned()
-                    .unwrap_or_else(|| json!({}));
-                return match catalog.call(name, args).await {
-                    // Direct mode is an MCP proxy: the provider already returned
-                    // a tools/call result, so preserve its content and metadata.
-                    Ok(value) => RpcResponse::ok(req.id, value),
                     Err(error) => match error.downcast_ref::<InsufficientScope>() {
                         Some(required) => insufficient_scope_result(
                             req.id,
@@ -215,6 +193,13 @@ pub async fn handle_with_options(
             }
         }
         _ => RpcResponse::err(req.id, -32601, "method not found"),
+    }
+}
+
+fn native_target(name: &str) -> Option<String> {
+    match name {
+        "repository_access" | "ssh_certificate" => Some(format!("git.{name}")),
+        _ => name.strip_prefix("cog_").map(|tool| format!("cog.{tool}")),
     }
 }
 
@@ -413,7 +398,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_mode_has_native_instructions_and_no_execute_fallback() {
+    async fn hybrid_mode_keeps_execute_available() {
         let runtime = Arc::new(CodeRuntime::new(16, std::time::Duration::from_secs(1)));
         let catalog = Arc::new(Catalog::new());
         let initialized = handle_with_options(
@@ -438,7 +423,7 @@ mod tests {
             .unwrap()
             .to_owned();
         assert!(instructions.contains("advertised directly"));
-        assert!(!instructions.contains("codemode.search"));
+        assert!(instructions.contains("External integration tools"));
 
         let listed = handle_with_options(
             RpcRequest {
@@ -453,12 +438,7 @@ mod tests {
             false,
         )
         .await;
-        assert!(
-            listed.result.unwrap()["tools"]
-                .as_array()
-                .unwrap()
-                .is_empty()
-        );
+        assert_eq!(listed.result.unwrap()["tools"][0]["name"], "execute");
 
         let execute = handle_with_options(
             RpcRequest {
@@ -473,7 +453,7 @@ mod tests {
             false,
         )
         .await;
-        assert_eq!(execute.result.unwrap()["isError"], true);
+        assert_eq!(execute.result.unwrap()["structuredContent"]["result"], 42);
     }
 
     proptest! {
