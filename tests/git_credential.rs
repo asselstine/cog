@@ -1,6 +1,5 @@
 use std::{
-    io::{Read, Write},
-    net::TcpListener,
+    io::Write,
     path::Path,
     process::{Command, Output, Stdio},
 };
@@ -10,8 +9,6 @@ fn helper(runtime: &Path, origin: Option<&str>, operation: &str, input: &str) ->
     command
         .arg(operation)
         .env("XDG_RUNTIME_DIR", runtime)
-        .env_remove("COG_GIT_BOOTSTRAP")
-        .env_remove("COG_OAUTH_TOKEN")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -93,65 +90,42 @@ fn store_get_erase_and_validation_are_origin_and_path_scoped() {
 }
 
 #[test]
-fn bootstrap_exchange_stores_only_the_derived_credential() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut request = Vec::new();
-        let mut buffer = [0_u8; 4096];
-        loop {
-            let count = stream.read(&mut buffer).unwrap();
-            request.extend_from_slice(&buffer[..count]);
-            if request.windows(4).any(|window| window == b"\r\n\r\n")
-                && String::from_utf8_lossy(&request).contains("repository_id")
-            {
-                break;
-            }
-        }
-        let text = String::from_utf8_lossy(&request);
-        assert!(text.starts_with("POST /git/bootstrap HTTP/1.1"));
-        assert!(
-            text.to_ascii_lowercase()
-                .contains("authorization: bearer oauth-token")
-        );
-        assert!(text.contains("bootstrap-secret"));
-        let body = br#"{"username":"cog","password":"derived-secret"}"#;
-        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
-        stream.write_all(body).unwrap();
-    });
+fn sealed_exchange_keeps_plaintext_out_of_agent_visible_steps() {
     let directory = tempfile::tempdir().unwrap();
     let repository = uuid::Uuid::new_v4();
-    let input = format!("protocol=http\nhost={address}\npath=git/{repository}.git\n\n");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_git-credential-cog"));
-    let mut child = command
-        .arg("get")
+    let origin = "https://cog.example";
+    let prepare = Command::new(env!("CARGO_BIN_EXE_git-credential-cog"))
+        .args(["prepare", &format!("{origin}/git/{repository}.git")])
         .env("XDG_RUNTIME_DIR", directory.path())
-        .env("COG_GIT_ORIGIN", format!("http://{address}"))
-        .env("COG_GIT_BOOTSTRAP", "bootstrap-secret")
-        .env("COG_OAUTH_TOKEN", "oauth-token")
+        .output()
+        .unwrap();
+    assert!(prepare.status.success());
+    let request: cog::git::sealed::SealedCredentialRequest =
+        serde_json::from_slice(&prepare.stdout).unwrap();
+    let payload = cog::git::sealed::CredentialPayload {
+        username: "cog".into(),
+        password: "derived-secret".into(),
+        repository_id: repository.to_string(),
+        origin: origin.into(),
+        expires_at: chrono::Utc::now().timestamp() + 900,
+    };
+    let envelope = cog::git::sealed::seal(&request, origin, &payload).unwrap();
+    let visible = serde_json::to_vec(&envelope).unwrap();
+    assert!(!String::from_utf8_lossy(&visible).contains("derived-secret"));
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_git-credential-cog"))
+        .arg("import")
+        .env("XDG_RUNTIME_DIR", directory.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input.as_bytes())
-        .unwrap();
+    child.stdin.take().unwrap().write_all(&visible).unwrap();
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap(),
-        "username=cog\npassword=derived-secret\n"
-    );
-    server.join().unwrap();
-    let cached = helper(
-        directory.path(),
-        Some(&format!("http://{address}")),
-        "get",
-        &input,
-    );
+    assert!(output.stdout.is_empty());
+
+    let input = format!("protocol=https\nhost=cog.example\npath=git/{repository}.git\n\n");
+    let cached = helper(directory.path(), Some(origin), "get", &input);
     assert!(String::from_utf8_lossy(&cached.stdout).contains("password=derived-secret"));
 }

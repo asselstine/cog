@@ -6,5 +6,6 @@ pub mod headers;
 pub mod model;
 pub mod providers;
 pub mod proxy;
+pub mod sealed;
 
 pub use model::*;

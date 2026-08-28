@@ -45,8 +45,8 @@ installation, it returns `github_repository_installation_required` with a
 retry. GitHub App repository selection is the repository authorization boundary;
 COG does not maintain a second per-client repository approval layer.
 
-The built-in `git` code-mode catalog target provides `repository_access`,
-`remote_credentials`, and `credential_bootstrap`.
+The built-in `git` code-mode catalog target provides `repository_access` and
+`sealed_credentials`.
 Calling it requires the agent's existing `integration:<id>` OAuth authorization.
 Configure Git credentials with `credential.useHttpPath=true`; never embed a
 credential in a remote URL. Provider branch protection and rulesets remain
@@ -67,13 +67,24 @@ git config credential.useHttpPath true
 git clone https://cog.example/git/00000000-0000-0000-0000-000000000000.git
 ```
 
-Call `remote_credentials` to obtain a 15-minute credential and feed its password
-to the helper. For MCP hosts that cannot do that directly, call
-`credential_bootstrap`, then pass the returned single-use, 60-second capability
-as `COG_GIT_BOOTSTRAP` and the current MCP access token as `COG_OAUTH_TOKEN`.
-The helper exchanges them over `POST /git/bootstrap` and stores only the derived
-credential in its mode-0600 runtime file. It rejects unrelated origins and
-invalid Git paths and never puts credentials in a remote URL.
+Never request or pass a plaintext Git password through MCP, tool arguments, a
+shell command, or an interactive terminal. Prepare a one-use encryption request
+with the helper:
+
+```sh
+git-credential-cog prepare https://cog.example/git/00000000-0000-0000-0000-000000000000.git
+```
+
+The command prints only a repository ID, ephemeral public key, and random
+request nonce. Pass that JSON object to `sealed_credentials`, then feed the
+returned encrypted JSON envelope to `git-credential-cog import` over standard
+input. Do not put the envelope in command-line arguments. Import writes no
+output, deletes the one-use private key, and stores the decrypted 15-minute
+credential in its mode-0600 runtime file. The helper rejects expired requests,
+unrelated origins, mismatched repositories, invalid Git paths, and modified
+envelopes. A subsequent Git command receives the credential through Git's
+private credential-helper pipe; the password is never returned to the MCP
+client or agent transcript.
 
 The non-secret controls are `COG_GIT_MAX_REQUEST_BYTES`,
 `COG_GIT_MAX_RESPONSE_BYTES`, `COG_GIT_TIMEOUT_SECS`,

@@ -524,8 +524,7 @@ impl ToolProvider for AdminProvider {
 fn git_control_tool(name: &str, description: &str, destructive: bool) -> Tool {
     Tool{name:name.into(),description:Some(description.into()),input_schema:match name{
  "repository_access"=>json!({"type":"object","properties":{"integrationId":{"type":"string"},"repository":{"type":"string"}},"required":["integrationId","repository"],"additionalProperties":false}),
- "remote_credentials"=>json!({"type":"object","properties":{"repositoryId":{"type":"string"}},"required":["repositoryId"],"additionalProperties":false}),
- "credential_bootstrap"=>json!({"type":"object","properties":{"repositoryId":{"type":"string"}},"required":["repositoryId"],"additionalProperties":false}),
+ "sealed_credentials"=>json!({"type":"object","properties":{"repositoryId":{"type":"string"},"recipientPublicKey":{"type":"string"},"requestNonce":{"type":"string"}},"required":["repositoryId","recipientPublicKey","requestNonce"],"additionalProperties":false}),
  _=>json!({"type":"object","properties":{},"additionalProperties":false})},extra:serde_json::from_value(json!({"annotations":{"readOnlyHint":!destructive,"destructiveHint":destructive,"openWorldHint":false}})).unwrap_or_default()}
 }
 
@@ -596,13 +595,8 @@ impl ToolProvider for GitControlProvider {
                 false,
             ),
             git_control_tool(
-                "remote_credentials",
-                "Mint a 15-minute credential bound to one resolved repository.",
-                false,
-            ),
-            git_control_tool(
-                "credential_bootstrap",
-                "Mint a single-use capability for the credential helper.",
+                "sealed_credentials",
+                "Mint a 15-minute repository credential encrypted to a one-use git-credential-cog public key. The result contains ciphertext only and must be passed to `git-credential-cog import` over stdin.",
                 false,
             ),
         ])
@@ -618,7 +612,7 @@ impl ToolProvider for GitControlProvider {
                     .get("integrationId")
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("integrationId is required"))?;
-                if !self.auth.allows(&format!("integration:{integration_id}")) {
+                if !self.auth.allows_integration(integration_id) {
                     return Err(crate::authz::InsufficientScope {
                         scopes: vec![format!("integration:{integration_id}")],
                     }
@@ -701,24 +695,21 @@ impl ToolProvider for GitControlProvider {
                     .set_git_grant(&self.auth.user, &self.auth.client, &repo.id, "write")?;
                 persist(&self.app).await?;
                 Ok(
-                    json!({"repositoryId":repo.id,"displayName":repo.display_name,"remoteUrl":format!("{}/git/{}.git",self.app.config.base_url.as_str().trim_end_matches('/'),repo.id),"credential":{"username":"cog","source":"remote_credentials","useHttpPath":true}}),
+                    json!({"repositoryId":repo.id,"displayName":repo.display_name,"remoteUrl":format!("{}/git/{}.git",self.app.config.base_url.as_str().trim_end_matches('/'),repo.id),"credential":{"source":"sealed_credentials","helper":"git-credential-cog","useHttpPath":true}}),
                 )
             }
-            "remote_credentials" | "credential_bootstrap" => {
-                let repository_id = args
-                    .get("repositoryId")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("repositoryId is required"))?;
+            "sealed_credentials" => {
+                let request: crate::git::sealed::SealedCredentialRequest =
+                    serde_json::from_value(args)?;
+                let repository_id = &request.repository_id;
+                crate::git::sealed::decode_array::<32>(&request.request_nonce, "request nonce")?;
                 let repository = self
                     .app
                     .db
                     .git_repository(repository_id)?
                     .filter(|repository| repository.user_id == self.auth.user)
                     .ok_or_else(|| anyhow::anyhow!("repository not found"))?;
-                if !self
-                    .auth
-                    .allows(&format!("integration:{}", repository.integration_id))
-                {
+                if !self.auth.allows_integration(&repository.integration_id) {
                     return Err(crate::authz::InsufficientScope {
                         scopes: vec![format!("integration:{}", repository.integration_id)],
                     }
@@ -726,31 +717,27 @@ impl ToolProvider for GitControlProvider {
                 }
                 let _mutation = self.app.mutations.lock().await;
                 self.app.lease.assert_live()?;
-                if name == "remote_credentials" {
-                    let credential = self.app.db.issue_git_credential(
-                        &self.auth.user,
-                        &self.auth.client,
-                        repository_id,
-                        "write",
-                        900,
-                    )?;
-                    persist(&self.app).await?;
-                    Ok(
-                        json!({"username":"cog","password":credential,"expiresIn":900,"useHttpPath":true}),
-                    )
-                } else {
-                    let bootstrap = self.app.db.issue_git_bootstrap(
-                        &self.auth.user,
-                        &self.auth.client,
-                        repository_id,
-                        "write",
-                        60,
-                    )?;
-                    persist(&self.app).await?;
-                    Ok(
-                        json!({"bootstrap":bootstrap,"expiresIn":60,"repositoryId":repository_id,"exchangeUrl":format!("{}/git/bootstrap",self.app.config.base_url.as_str().trim_end_matches('/')),"singleUse":true}),
-                    )
-                }
+                let expires_at = chrono::Utc::now().timestamp() + 900;
+                let credential = self.app.db.issue_git_credential(
+                    &self.auth.user,
+                    &self.auth.client,
+                    repository_id,
+                    "write",
+                    900,
+                )?;
+                persist(&self.app).await?;
+                let origin = self.app.config.base_url.as_str().trim_end_matches('/');
+                Ok(serde_json::to_value(crate::git::sealed::seal(
+                    &request,
+                    origin,
+                    &crate::git::sealed::CredentialPayload {
+                        username: "cog".into(),
+                        password: credential,
+                        repository_id: repository_id.clone(),
+                        origin: origin.to_owned(),
+                        expires_at,
+                    },
+                )?)?)
             }
             _ => anyhow::bail!("unknown Git control operation"),
         }
@@ -1221,7 +1208,6 @@ fn build_router(app: App) -> Router {
         .route("/oauth/token", post(token))
         .route("/oauth/revoke", post(revoke_token))
         .route("/mcp", post(mcp_endpoint))
-        .route("/git/bootstrap", post(exchange_git_bootstrap))
         .route("/git/{*path}", axum::routing::any(git_smart_http))
         .route("/github/app/setup/{state}", get(github_app_setup_launch))
         .route(
@@ -1232,6 +1218,7 @@ fn build_router(app: App) -> Router {
             "/github/app/installation/callback",
             get(github_app_installation_callback),
         )
+        .route("/github/app/installation/complete", get(authorize_page))
         .route(
             "/api/integrations",
             get(list_integrations).post(add_integration),
@@ -1336,7 +1323,7 @@ async fn git_smart_http(
         Some(v) => v,
         None => {
             a.metrics.git_auth_denied.fetch_add(1, Ordering::Relaxed);
-            return auth_failure(&a, AuthFailure::Missing, "mcp");
+            return git_auth_failure(AuthFailure::Missing);
         }
     };
     let now = chrono::Utc::now().timestamp();
@@ -1359,7 +1346,7 @@ async fn git_smart_http(
     {
         Some(v) => v,
         None => {
-            return auth_failure(&a, AuthFailure::Invalid, "mcp");
+            return git_auth_failure(AuthFailure::Invalid);
         }
     };
     let repo = match a.db.git_repository(&repository).ok().flatten() {
@@ -1377,11 +1364,7 @@ async fn git_smart_http(
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     }
     if !context.integration_ids.contains(&repo.integration_id) {
-        return auth_failure(
-            &a,
-            AuthFailure::Insufficient,
-            &format!("integration:{}", repo.integration_id),
-        );
+        return git_auth_failure(AuthFailure::Insufficient);
     }
     let Some(client_permit) = a
         .git_client_streams
@@ -1498,56 +1481,6 @@ async fn git_smart_http(
     *downstream.status_mut() = status;
     *downstream.headers_mut() = headers;
     downstream
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct GitBootstrapExchange {
-    bootstrap: String,
-    repository_id: String,
-}
-
-async fn exchange_git_bootstrap(
-    State(a): State<App>,
-    headers: HeaderMap,
-    Json(request): Json<GitBootstrapExchange>,
-) -> Response {
-    let auth = match auth_context(&a, &headers) {
-        Ok(auth) => auth,
-        Err(failure) => return auth_failure(&a, failure, "mcp"),
-    };
-    if !crate::git::model::valid_repository_id(&request.repository_id) {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
-    let Some(repository) = a.db.git_repository(&request.repository_id).ok().flatten() else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    if repository.user_id != auth.user
-        || !auth.allows(&format!("integration:{}", repository.integration_id))
-    {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-    let _mutation = a.mutations.lock().await;
-    if a.lease.assert_live().is_err() {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    }
-    let credential = match a.db.exchange_git_bootstrap(
-        &request.bootstrap,
-        &auth.user,
-        &auth.client,
-        &request.repository_id,
-        "write",
-        chrono::Utc::now().timestamp(),
-    ) {
-        Ok(Some(credential)) => credential,
-        Ok(None) => return StatusCode::GONE.into_response(),
-        Err(_) => return StatusCode::FORBIDDEN.into_response(),
-    };
-    if persist(&a).await.is_err() {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    }
-    Json(json!({"username":"cog","password":credential,"expiresIn":900,"useHttpPath":true}))
-        .into_response()
 }
 
 fn build_store(c: &Config) -> anyhow::Result<Arc<dyn ObjectStore>> {
@@ -3263,6 +3196,10 @@ impl AuthContext {
                         | "audit:read"
                 ))
     }
+
+    fn allows_integration(&self, integration_id: &str) -> bool {
+        self.scopes.contains("admin") || self.integrations.contains(integration_id)
+    }
 }
 
 fn auth_context(a: &App, h: &HeaderMap) -> Result<AuthContext, AuthFailure> {
@@ -3307,6 +3244,23 @@ fn auth_failure(a: &App, failure: AuthFailure, scope: &str) -> axum::response::R
     (
         status,
         [(http::header::WWW_AUTHENTICATE, challenge)],
+        "unauthorized",
+    )
+        .into_response()
+}
+
+fn git_auth_failure(failure: AuthFailure) -> axum::response::Response {
+    if matches!(failure, AuthFailure::Internal) {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let status = if matches!(failure, AuthFailure::Insufficient) {
+        StatusCode::FORBIDDEN
+    } else {
+        StatusCode::UNAUTHORIZED
+    };
+    (
+        status,
+        [(http::header::WWW_AUTHENTICATE, "Basic realm=\"cog-git\"")],
         "unauthorized",
     )
         .into_response()
@@ -4419,7 +4373,11 @@ async fn github_app_installation_callback(
     {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-    Html(format!("<!doctype html><html><head><meta charset=\"utf-8\"><title>GitHub connected</title></head><body><h1>GitHub App installed</h1><p>COG integration <code>{}</code> is ready. You can close this window and retry repository access.</p></body></html>", html_escape(&id))).into_response()
+    Redirect::to(&format!(
+        "/github/app/installation/complete?integration_id={}",
+        id
+    ))
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -5724,6 +5682,24 @@ mod tests {
                 .body(Body::from(body))
                 .unwrap()
         };
+        let missing = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/git/{}.git/info/refs?service=git-upload-pack",
+                        repository.id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            missing.headers()[header::WWW_AUTHENTICATE],
+            "Basic realm=\"cog-git\""
+        );
         let read = router
             .clone()
             .oneshot(request(oauth, "info/refs", Some("git-upload-pack"), ""))
@@ -6003,10 +5979,9 @@ mod tests {
             },
         };
         let tools = control.tools().await.unwrap();
-        assert_eq!(tools.len(), 3);
+        assert_eq!(tools.len(), 2);
         assert!(tools.iter().any(|tool| tool.name == "repository_access"));
-        assert!(tools.iter().any(|tool| tool.name == "remote_credentials"));
-        assert!(tools.iter().any(|tool| tool.name == "credential_bootstrap"));
+        assert!(tools.iter().any(|tool| tool.name == "sealed_credentials"));
         let allowed = control
             .call(
                 "repository_access",
@@ -6025,7 +6000,7 @@ mod tests {
                 .unwrap()
                 .contains(&pending_repo.id)
         );
-        assert_eq!(allowed["credential"]["source"], "remote_credentials");
+        assert_eq!(allowed["credential"]["source"], "sealed_credentials");
         assert_eq!(
             app.db
                 .git_grant_permission(&user, "git-client", &pending_repo.id)
@@ -6033,6 +6008,27 @@ mod tests {
                 .as_deref(),
             Some("write")
         );
+        let (recipient_secret, recipient_public_key) = crate::git::sealed::new_recipient();
+        let sealed_request = crate::git::sealed::SealedCredentialRequest {
+            repository_id: pending_repo.id.clone(),
+            recipient_public_key,
+            request_nonce: crate::crypto::random_token(32),
+        };
+        let sealed = control
+            .call(
+                "sealed_credentials",
+                serde_json::to_value(&sealed_request).unwrap(),
+            )
+            .await
+            .unwrap();
+        let visible = serde_json::to_string(&sealed).unwrap();
+        assert!(!visible.contains("password"));
+        assert!(!visible.contains("cog_git_"));
+        let payload =
+            crate::git::sealed::open(&serde_json::from_value(sealed).unwrap(), &recipient_secret)
+                .unwrap();
+        assert_eq!(payload.repository_id, pending_repo.id);
+        assert!(payload.password.starts_with("cog_git_"));
         assert!(control.call("unknown", json!({})).await.is_err());
         if let Authority::S3(lease) = &app.lease {
             lease.relinquish().await.unwrap();
@@ -9268,6 +9264,23 @@ mod tests {
         assert!(source.contains("payload.identities[0]?.id"));
         assert!(source.contains("identity===\"\""));
         assert!(source.contains("action=\"/api/oauth/consent\""));
+        assert!(source.contains("function GitHubInstallationComplete()"));
+        assert!(source.contains("/github/app/installation/complete"));
+    }
+
+    #[test]
+    fn integration_access_follows_identity_membership_without_incremental_scope() {
+        let integration = "identity-integration".to_owned();
+        let auth = AuthContext {
+            user: "user".into(),
+            agent: "agent".into(),
+            client: "client".into(),
+            identity: "identity".into(),
+            scopes: HashSet::from(["mcp".into()]),
+            integrations: HashSet::from([integration.clone()]),
+        };
+        assert!(auth.allows_integration(&integration));
+        assert!(!auth.allows_integration("another-integration"));
     }
 
     #[tokio::test]

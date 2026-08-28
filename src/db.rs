@@ -128,15 +128,6 @@ CREATE TABLE IF NOT EXISTS git_credentials(
  permission TEXT NOT NULL CHECK(permission IN ('read','write')), issued_at INTEGER NOT NULL,
  expires_at INTEGER NOT NULL, last_used_at INTEGER, revoked_at INTEGER
 );
-CREATE TABLE IF NOT EXISTS git_credential_bootstraps(
- bootstrap_hash BLOB PRIMARY KEY, identity_id TEXT NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
- agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
- user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
- client_id TEXT NOT NULL REFERENCES oauth_clients(client_id) ON DELETE CASCADE,
- repository_id TEXT NOT NULL REFERENCES git_repositories(id) ON DELETE CASCADE,
- permission TEXT NOT NULL CHECK(permission IN ('read','write')), issued_at INTEGER NOT NULL,
- expires_at INTEGER NOT NULL, consumed_at INTEGER, revoked_at INTEGER
-);
 CREATE TABLE IF NOT EXISTS git_pending_requests(
  id_hash BLOB PRIMARY KEY, identity_id TEXT NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -362,7 +353,7 @@ impl Database {
             "invalid Git permission"
         );
         let now = chrono::Utc::now().timestamp();
-        self.transact(|tx|{let identity:String=tx.query_row("SELECT a.identity_id FROM agents a JOIN identities i ON i.id=a.identity_id JOIN git_repositories r ON r.id=? JOIN integrations n ON n.id=r.integration_id WHERE a.oauth_client_id=? AND i.user_id=? AND n.identity_id=a.identity_id",params![repository,client,user],|r|r.get(0))?;tx.execute("INSERT INTO git_repository_grants(identity_id,user_id,client_id,repository_id,permission,created_at,revoked_at) VALUES(?,?,?,?,?,?,NULL) ON CONFLICT(identity_id,repository_id) DO UPDATE SET permission=excluded.permission,revoked_at=NULL",params![identity,user,client,repository,permission,now])?;if permission=="read"{tx.execute("UPDATE git_credentials SET revoked_at=? WHERE identity_id=? AND repository_id=? AND permission='write' AND revoked_at IS NULL",params![now,identity,repository])?;tx.execute("UPDATE git_credential_bootstraps SET revoked_at=? WHERE identity_id=? AND repository_id=? AND permission='write' AND revoked_at IS NULL",params![now,identity,repository])?;}Ok(())})
+        self.transact(|tx|{let identity:String=tx.query_row("SELECT a.identity_id FROM agents a JOIN identities i ON i.id=a.identity_id JOIN git_repositories r ON r.id=? JOIN integrations n ON n.id=r.integration_id WHERE a.oauth_client_id=? AND i.user_id=? AND n.identity_id=a.identity_id",params![repository,client,user],|r|r.get(0))?;tx.execute("INSERT INTO git_repository_grants(identity_id,user_id,client_id,repository_id,permission,created_at,revoked_at) VALUES(?,?,?,?,?,?,NULL) ON CONFLICT(identity_id,repository_id) DO UPDATE SET permission=excluded.permission,revoked_at=NULL",params![identity,user,client,repository,permission,now])?;if permission=="read"{tx.execute("UPDATE git_credentials SET revoked_at=? WHERE identity_id=? AND repository_id=? AND permission='write' AND revoked_at IS NULL",params![now,identity,repository])?;}Ok(())})
     }
     pub fn revoke_git_grant(
         &self,
@@ -371,7 +362,7 @@ impl Database {
         repository: &str,
     ) -> anyhow::Result<bool> {
         let now = chrono::Utc::now().timestamp();
-        self.transact(|tx|{let identity:Option<String>=tx.query_row("SELECT a.identity_id FROM agents a JOIN identities i ON i.id=a.identity_id WHERE a.oauth_client_id=? AND i.user_id=?",params![client,user],|r|r.get(0)).optional()?;let Some(identity)=identity else{return Ok(false)};let changed=tx.execute("UPDATE git_repository_grants SET revoked_at=? WHERE identity_id=? AND repository_id=? AND revoked_at IS NULL",params![now,identity,repository])?;tx.execute("UPDATE git_credentials SET revoked_at=? WHERE identity_id=? AND repository_id=? AND revoked_at IS NULL",params![now,identity,repository])?;tx.execute("UPDATE git_credential_bootstraps SET revoked_at=? WHERE identity_id=? AND repository_id=? AND revoked_at IS NULL",params![now,identity,repository])?;Ok(changed>0)})
+        self.transact(|tx|{let identity:Option<String>=tx.query_row("SELECT a.identity_id FROM agents a JOIN identities i ON i.id=a.identity_id WHERE a.oauth_client_id=? AND i.user_id=?",params![client,user],|r|r.get(0)).optional()?;let Some(identity)=identity else{return Ok(false)};let changed=tx.execute("UPDATE git_repository_grants SET revoked_at=? WHERE identity_id=? AND repository_id=? AND revoked_at IS NULL",params![now,identity,repository])?;tx.execute("UPDATE git_credentials SET revoked_at=? WHERE identity_id=? AND repository_id=? AND revoked_at IS NULL",params![now,identity,repository])?;Ok(changed>0)})
     }
     pub fn git_grant_permission(
         &self,
@@ -442,71 +433,6 @@ impl Database {
         let now = chrono::Utc::now().timestamp();
         self.transact(|tx|{let(agent,identity):(String,String)=tx.query_row("SELECT a.id,a.identity_id FROM agents a JOIN identities i ON i.id=a.identity_id WHERE a.oauth_client_id=? AND i.user_id=?",params![client,user],|r|Ok((r.get(0)?,r.get(1)?)))?;tx.execute("INSERT INTO git_credentials(credential_hash,identity_id,agent_id,user_id,client_id,repository_id,permission,issued_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?)",params![crate::crypto::token_hash(&token).as_slice(),identity,agent,user,client,repository,permission,now,now+ttl])?;Ok(())})?;
         Ok(token)
-    }
-    pub fn issue_git_bootstrap(
-        &self,
-        user: &str,
-        client: &str,
-        repository: &str,
-        permission: &str,
-        ttl: i64,
-    ) -> anyhow::Result<String> {
-        anyhow::ensure!(
-            matches!(permission, "read" | "write"),
-            "invalid Git permission"
-        );
-        anyhow::ensure!(
-            (1..=120).contains(&ttl),
-            "Git bootstrap lifetime is invalid"
-        );
-        let capability = format!("cog_bootstrap_{}", crate::crypto::random_token(32));
-        let hash = crate::crypto::token_hash(&capability);
-        let now = chrono::Utc::now().timestamp();
-        self.transact(|tx| {
-            tx.execute("DELETE FROM git_credential_bootstraps WHERE expires_at<=? OR consumed_at IS NOT NULL OR revoked_at IS NOT NULL", [now])?;
-            let(agent,identity):(String,String)=tx.query_row("SELECT a.id,a.identity_id FROM agents a JOIN identities i ON i.id=a.identity_id WHERE a.oauth_client_id=? AND i.user_id=?",params![client,user],|r|Ok((r.get(0)?,r.get(1)?)))?;
-            tx.execute("INSERT INTO git_credential_bootstraps(bootstrap_hash,identity_id,agent_id,user_id,client_id,repository_id,permission,issued_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?)", params![hash.as_slice(),identity,agent,user,client,repository,permission,now,now+ttl])?;
-            Ok(())
-        })?;
-        Ok(capability)
-    }
-    pub fn exchange_git_bootstrap(
-        &self,
-        capability: &str,
-        user: &str,
-        client: &str,
-        repository: &str,
-        requested_permission: &str,
-        now: i64,
-    ) -> anyhow::Result<Option<String>> {
-        anyhow::ensure!(
-            matches!(requested_permission, "read" | "write"),
-            "invalid Git permission"
-        );
-        let hash = crate::crypto::token_hash(capability);
-        self.transact(|tx| {
-            let ceiling: Option<String> = tx.query_row(
-                "SELECT permission FROM git_credential_bootstraps WHERE bootstrap_hash=? AND user_id=? AND client_id=? AND repository_id=? AND expires_at>? AND consumed_at IS NULL AND revoked_at IS NULL",
-                params![hash.as_slice(),user,client,repository,now], |r| r.get(0)
-            ).optional()?;
-            let Some(ceiling) = ceiling else { return Ok(None) };
-            anyhow::ensure!(ceiling == "write" || requested_permission == "read", "Git bootstrap permission ceiling exceeded");
-            let changed = tx.execute("UPDATE git_credential_bootstraps SET consumed_at=? WHERE bootstrap_hash=? AND consumed_at IS NULL", params![now,hash.as_slice()])?;
-            anyhow::ensure!(changed == 1, "Git bootstrap was already consumed");
-            let token = format!("cog_git_{}", crate::crypto::random_token(32));
-            let(agent,identity):(String,String)=tx.query_row("SELECT a.id,a.identity_id FROM agents a JOIN identities i ON i.id=a.identity_id WHERE a.oauth_client_id=? AND i.user_id=?",params![client,user],|r|Ok((r.get(0)?,r.get(1)?)))?;
-            tx.execute("INSERT INTO git_credentials(credential_hash,identity_id,agent_id,user_id,client_id,repository_id,permission,issued_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?)", params![crate::crypto::token_hash(&token).as_slice(),identity,agent,user,client,repository,requested_permission,now,now+900])?;
-            Ok(Some(token))
-        })
-    }
-    pub fn revoke_git_bootstraps(
-        &self,
-        user: &str,
-        client: &str,
-        repository: &str,
-    ) -> anyhow::Result<usize> {
-        let now = chrono::Utc::now().timestamp();
-        self.transact(|tx| Ok(tx.execute("UPDATE git_credential_bootstraps SET revoked_at=? WHERE user_id=? AND client_id=? AND repository_id=? AND consumed_at IS NULL AND revoked_at IS NULL", params![now,user,client,repository])?))
     }
     pub fn create_git_pending_request(
         &self,
@@ -2377,78 +2303,6 @@ mod tests {
         );
         db.set_git_grant(&user, "client", &repository.id, "write")
             .unwrap();
-        let bootstrap = db
-            .issue_git_bootstrap(&user, "client", &repository.id, "write", 60)
-            .unwrap();
-        assert!(
-            db.exchange_git_bootstrap(
-                &bootstrap,
-                &user,
-                "wrong-client",
-                &repository.id,
-                "read",
-                now
-            )
-            .unwrap()
-            .is_none()
-        );
-        assert!(
-            db.exchange_git_bootstrap(
-                &bootstrap,
-                &user,
-                "client",
-                &uuid::Uuid::new_v4().to_string(),
-                "read",
-                now
-            )
-            .unwrap()
-            .is_none()
-        );
-        assert!(
-            db.exchange_git_bootstrap(&bootstrap, &user, "client", &repository.id, "write", now)
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            db.exchange_git_bootstrap(&bootstrap, &user, "client", &repository.id, "read", now)
-                .unwrap()
-                .is_none()
-        );
-        let read_bootstrap = db
-            .issue_git_bootstrap(&user, "client", &repository.id, "read", 60)
-            .unwrap();
-        assert!(
-            db.exchange_git_bootstrap(
-                &read_bootstrap,
-                &user,
-                "client",
-                &repository.id,
-                "write",
-                now
-            )
-            .is_err()
-        );
-        let expired = db
-            .issue_git_bootstrap(&user, "client", &repository.id, "read", 1)
-            .unwrap();
-        assert!(
-            db.exchange_git_bootstrap(&expired, &user, "client", &repository.id, "read", now + 2)
-                .unwrap()
-                .is_none()
-        );
-        let revoked = db
-            .issue_git_bootstrap(&user, "client", &repository.id, "read", 60)
-            .unwrap();
-        assert!(
-            db.revoke_git_bootstraps(&user, "client", &repository.id)
-                .unwrap()
-                >= 1
-        );
-        assert!(
-            db.exchange_git_bootstrap(&revoked, &user, "client", &repository.id, "read", now)
-                .unwrap()
-                .is_none()
-        );
         let credential = db
             .issue_git_credential(&user, "client", &repository.id, "write", 60)
             .unwrap();

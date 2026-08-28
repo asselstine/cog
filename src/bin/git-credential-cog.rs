@@ -1,14 +1,20 @@
-use serde::Deserialize;
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use cog::git::sealed::{SealedCredentialEnvelope, SealedCredentialRequest};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    io::{self, BufRead},
-    path::PathBuf,
+    io::{self, BufRead, Read},
+    path::{Path, PathBuf},
 };
 
-#[derive(Deserialize)]
-struct ExchangedCredential {
-    username: String,
-    password: String,
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PendingChallenge {
+    private_key: String,
+    repository_id: String,
+    origin: String,
+    request_nonce: String,
+    expires_at: i64,
 }
 
 fn main() {
@@ -20,7 +26,16 @@ fn main() {
 fn run() -> anyhow::Result<()> {
     let operation = std::env::args()
         .nth(1)
-        .ok_or_else(|| anyhow::anyhow!("expected get, store, or erase"))?;
+        .ok_or_else(|| anyhow::anyhow!("expected get, store, erase, prepare, or import"))?;
+    if operation == "prepare" {
+        let remote = std::env::args()
+            .nth(2)
+            .ok_or_else(|| anyhow::anyhow!("prepare requires a COG remote URL"))?;
+        return prepare(&remote);
+    }
+    if operation == "import" {
+        return import();
+    }
     anyhow::ensure!(
         matches!(operation.as_str(), "get" | "store" | "erase"),
         "unsupported operation"
@@ -65,39 +80,6 @@ fn run() -> anyhow::Result<()> {
         "get" => {
             if let Some(password) = entries.get(&key) {
                 println!("username=cog\npassword={password}")
-            } else if let (Ok(bootstrap), Ok(oauth)) = (
-                std::env::var("COG_GIT_BOOTSTRAP"),
-                std::env::var("COG_OAUTH_TOKEN"),
-            ) {
-                let repository_id = path
-                    .strip_prefix("git/")
-                    .and_then(|value| value.strip_suffix(".git"))
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("credential request has an invalid repository path")
-                    })?;
-                uuid::Uuid::parse_str(repository_id).map_err(|_| {
-                    anyhow::anyhow!("credential request has a non-opaque repository path")
-                })?;
-                let response = reqwest::blocking::Client::builder()
-                    .redirect(reqwest::redirect::Policy::none())
-                    .build()?
-                    .post(configured.join("git/bootstrap")?)
-                    .bearer_auth(oauth)
-                    .json(&serde_json::json!({"bootstrap":bootstrap,"repository_id":repository_id}))
-                    .send()?;
-                anyhow::ensure!(
-                    response.status().is_success(),
-                    "bootstrap exchange was rejected ({})",
-                    response.status()
-                );
-                let exchanged: ExchangedCredential = response.json()?;
-                anyhow::ensure!(
-                    exchanged.username == "cog",
-                    "bootstrap exchange returned an invalid username"
-                );
-                entries.insert(key, exchanged.password.clone());
-                write_entries(&file, &entries)?;
-                println!("username=cog\npassword={}", exchanged.password)
             }
         }
         "store" => {
@@ -119,27 +101,140 @@ fn run() -> anyhow::Result<()> {
     };
     Ok(())
 }
+
+fn prepare(remote: &str) -> anyhow::Result<()> {
+    let (origin, repository_id) = parse_remote(remote)?;
+    let (private, recipient_public_key) = cog::git::sealed::new_recipient();
+    let request_nonce = cog::crypto::random_token(32);
+    let challenge = PendingChallenge {
+        private_key: URL_SAFE_NO_PAD.encode(private.to_bytes()),
+        repository_id: repository_id.clone(),
+        origin,
+        request_nonce: request_nonce.clone(),
+        expires_at: chrono::Utc::now().timestamp() + 60,
+    };
+    let path = challenge_file(&request_nonce)?;
+    write_private_json(&path, &challenge)?;
+    println!(
+        "{}",
+        serde_json::to_string(&SealedCredentialRequest {
+            repository_id,
+            recipient_public_key,
+            request_nonce,
+        })?
+    );
+    Ok(())
+}
+
+fn import() -> anyhow::Result<()> {
+    let mut input = String::new();
+    io::stdin().read_to_string(&mut input)?;
+    let envelope: SealedCredentialEnvelope = serde_json::from_str(&input)?;
+    let challenge_path = challenge_file(&envelope.request_nonce)?;
+    let challenge: PendingChallenge = serde_json::from_slice(&std::fs::read(&challenge_path)?)?;
+    anyhow::ensure!(
+        challenge.expires_at > chrono::Utc::now().timestamp(),
+        "sealed credential request expired"
+    );
+    anyhow::ensure!(
+        envelope.repository_id == challenge.repository_id
+            && envelope.origin == challenge.origin
+            && envelope.request_nonce == challenge.request_nonce,
+        "sealed credential does not match its request"
+    );
+    let private = x25519_dalek::StaticSecret::from(cog::git::sealed::decode_array::<32>(
+        &challenge.private_key,
+        "recipient private key",
+    )?);
+    let payload = cog::git::sealed::open(&envelope, &private)?;
+    anyhow::ensure!(
+        payload.username == "cog"
+            && payload.repository_id == challenge.repository_id
+            && payload.origin == challenge.origin
+            && payload.expires_at > chrono::Utc::now().timestamp(),
+        "sealed credential payload does not match its request"
+    );
+    let key = format!(
+        "{}/git/{}.git",
+        challenge.origin.trim_end_matches('/'),
+        challenge.repository_id
+    );
+    let file = credential_file()?;
+    let mut entries = read_entries(&file);
+    entries.insert(key, payload.password);
+    write_entries(&file, &entries)?;
+    std::fs::remove_file(challenge_path)?;
+    Ok(())
+}
+
+fn parse_remote(remote: &str) -> anyhow::Result<(String, String)> {
+    let url = url::Url::parse(remote)?;
+    anyhow::ensure!(
+        url.username().is_empty() && url.password().is_none(),
+        "remote URL must not contain credentials"
+    );
+    anyhow::ensure!(
+        matches!(url.scheme(), "https" | "http"),
+        "unsupported remote URL scheme"
+    );
+    let path = url.path().trim_start_matches('/');
+    let repository_id = path
+        .strip_prefix("git/")
+        .and_then(|value| value.strip_suffix(".git"))
+        .ok_or_else(|| anyhow::anyhow!("remote URL has an invalid repository path"))?;
+    uuid::Uuid::parse_str(repository_id)
+        .map_err(|_| anyhow::anyhow!("remote URL has a non-opaque repository path"))?;
+    Ok((url.origin().ascii_serialization(), repository_id.to_owned()))
+}
+
 fn credential_file() -> anyhow::Result<PathBuf> {
+    Ok(runtime_directory()?.join("git-credentials.json"))
+}
+
+fn challenge_file(request_nonce: &str) -> anyhow::Result<PathBuf> {
+    anyhow::ensure!(
+        !request_nonce.is_empty()
+            && request_nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+        "invalid request nonce"
+    );
+    let directory = runtime_directory()?.join("git-challenges");
+    std::fs::create_dir_all(&directory)?;
+    set_private_directory(&directory)?;
+    Ok(directory.join(format!("{request_nonce}.json")))
+}
+
+fn runtime_directory() -> anyhow::Result<PathBuf> {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             std::env::temp_dir().join(format!("cog-{}", unsafe { libc::geteuid() }))
         });
     std::fs::create_dir_all(&base)?;
+    set_private_directory(&base)?;
+    Ok(base)
+}
+
+fn set_private_directory(path: &Path) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))?
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?
     }
-    Ok(base.join("git-credentials.json"))
+    Ok(())
 }
-fn read_entries(path: &PathBuf) -> HashMap<String, String> {
+fn read_entries(path: &Path) -> HashMap<String, String> {
     std::fs::read(path)
         .ok()
         .and_then(|v| serde_json::from_slice(&v).ok())
         .unwrap_or_default()
 }
-fn write_entries(path: &PathBuf, entries: &HashMap<String, String>) -> anyhow::Result<()> {
+fn write_entries(path: &Path, entries: &HashMap<String, String>) -> anyhow::Result<()> {
+    write_private_json(path, entries)
+}
+
+fn write_private_json(path: &Path, value: &impl Serialize) -> anyhow::Result<()> {
     use std::io::Write;
     let temporary = path.with_extension("tmp");
     let mut options = std::fs::OpenOptions::new();
@@ -150,7 +245,7 @@ fn write_entries(path: &PathBuf, entries: &HashMap<String, String>) -> anyhow::R
         options.mode(0o600);
     }
     let mut file = options.open(&temporary)?;
-    file.write_all(&serde_json::to_vec(entries)?)?;
+    file.write_all(&serde_json::to_vec(value)?)?;
     file.sync_all()?;
     std::fs::rename(temporary, path)?;
     Ok(())
