@@ -130,6 +130,35 @@ pub fn safe_error(error: &(dyn std::error::Error + 'static)) -> String {
     }
 }
 
+/// Classify Git transport failures without retaining request data, provider
+/// response bodies, authorization material, URLs, or the raw error chain.
+pub fn safe_git_error(error: &(dyn std::error::Error + 'static)) -> &'static str {
+    let mut text = String::new();
+    let mut current = Some(error);
+    while let Some(item) = current {
+        text.push_str(&item.to_string().to_ascii_lowercase());
+        text.push(' ');
+        current = item.source();
+    }
+    if text.contains("pack") || text.contains("zlib") || text.contains("deflate") {
+        "invalid Git pack stream"
+    } else if text.contains("upstream discovery") {
+        "upstream Git discovery failed"
+    } else if text.contains("upstream git rpc") || text.contains("error sending request") {
+        "upstream Git request failed"
+    } else if text.contains("idle timeout") || text.contains("timed out") {
+        "Git transport timed out"
+    } else if text.contains("byte limit") || text.contains("stream limit") {
+        "Git transport limit exceeded"
+    } else if text.contains("client disconnected") || text.contains("input closed") {
+        "Git client disconnected"
+    } else if text.contains("grant") || text.contains("permission") || text.contains("revoked") {
+        "Git authorization is no longer valid"
+    } else {
+        "Git transport operation failed"
+    }
+}
+
 pub fn credential_provider_class() -> &'static str {
     credential_provider_class_from(|name| std::env::var_os(name).is_some())
 }
@@ -197,6 +226,13 @@ mod tests {
         }
     }
     impl std::error::Error for Injected {}
+
+    #[test]
+    fn git_errors_are_bounded_and_do_not_retain_input() {
+        let error = Injected("corrupt deflate stream token=recognizable-secret".into());
+        assert_eq!(safe_git_error(&error), "invalid Git pack stream");
+        assert!(!safe_git_error(&error).contains("recognizable-secret"));
+    }
 
     #[test]
     fn startup_errors_do_not_retain_provider_secrets_or_response_bodies() {

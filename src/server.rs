@@ -4,7 +4,7 @@ use crate::{
     db::{Database, StorageMode, UpstreamOAuthClient, UpstreamOAuthToken},
     diagnostics::{
         StartupError, StartupPhase, credential_provider_class, redacted_error, safe_endpoint,
-        safe_error,
+        safe_error, safe_git_error,
     },
     git::providers::{GitProvider, github::GitHubProvider},
     git::{GitOperation, RepositoryReference, ResolvedRepository},
@@ -1763,16 +1763,30 @@ impl russh::server::Handler for SshConnection {
                 app.metrics
                     .ssh_upstream_failures
                     .fetch_add(1, Ordering::Relaxed);
+                let error_kind = match &result {
+                    Ok(Err(error)) => safe_git_error(error.as_ref()),
+                    Err(_) => "Git transport timed out",
+                    Ok(Ok(())) => "Git transport operation failed",
+                };
+                tracing::warn!(
+                    repository_id = %repository_id,
+                    service = ?service,
+                    error = error_kind,
+                    "SSH Git operation failed"
+                );
                 let _ = app.db.record_audit(
                     Some(&binding.user_id),
                     "git.ssh_operation",
                     Some(&repository_id),
                     "failure",
-                    &json!({"identity_id":binding.identity_id,"agent_id":binding.agent_id,"client_id":binding.client_id,"integration_id":binding.integration_id,"permission":binding.permission,"transport":"ssh"}),
+                    &json!({"identity_id":binding.identity_id,"agent_id":binding.agent_id,"client_id":binding.client_id,"integration_id":binding.integration_id,"permission":binding.permission,"transport":"ssh","error":error_kind}),
                 );
                 let message = match &result {
                     Ok(Err(error)) => {
-                        format!("COG Git operation failed: {}\n", safe_error(error.as_ref()))
+                        format!(
+                            "COG Git operation failed: {}\n",
+                            safe_git_error(error.as_ref())
+                        )
                     }
                     Err(_) => "COG Git operation timed out\n".to_owned(),
                     Ok(Ok(())) => String::new(),
