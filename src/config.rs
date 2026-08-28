@@ -136,6 +136,67 @@ pub struct Config {
         default_value_t = 4
     )]
     pub git_max_streams_per_client: usize,
+    /// Embedded Git-over-SSH listener. Defaults to loopback for safe local use.
+    #[arg(
+        long,
+        env = "COG_SSH_LISTEN",
+        hide_env_values = true,
+        default_value = "127.0.0.1:2222"
+    )]
+    pub ssh_listen: Option<SocketAddr>,
+    #[arg(long, env = "COG_SSH_PUBLIC_HOST", hide_env_values = true)]
+    pub ssh_public_host: Option<String>,
+    #[arg(long, env = "COG_SSH_PUBLIC_PORT", hide_env_values = true)]
+    pub ssh_public_port: Option<u16>,
+    #[arg(
+        long,
+        env = "COG_SSH_CERTIFICATE_TTL_SECS",
+        hide_env_values = true,
+        default_value_t = 900
+    )]
+    pub ssh_certificate_ttl_secs: u64,
+    #[arg(
+        long,
+        env = "COG_SSH_CERTIFICATE_MAX_TTL_SECS",
+        hide_env_values = true,
+        default_value_t = 900
+    )]
+    pub ssh_certificate_max_ttl_secs: u64,
+    #[arg(
+        long,
+        env = "COG_SSH_HANDSHAKE_TIMEOUT_SECS",
+        hide_env_values = true,
+        default_value_t = 15
+    )]
+    pub ssh_handshake_timeout_secs: u64,
+    #[arg(
+        long,
+        env = "COG_SSH_AUTH_TIMEOUT_SECS",
+        hide_env_values = true,
+        default_value_t = 15
+    )]
+    pub ssh_auth_timeout_secs: u64,
+    #[arg(
+        long,
+        env = "COG_SSH_CHANNEL_TIMEOUT_SECS",
+        hide_env_values = true,
+        default_value_t = 30
+    )]
+    pub ssh_channel_timeout_secs: u64,
+    #[arg(
+        long,
+        env = "COG_SSH_MAX_CONNECTIONS",
+        hide_env_values = true,
+        default_value_t = 64
+    )]
+    pub ssh_max_connections: usize,
+    #[arg(
+        long,
+        env = "COG_SSH_MAX_CHANNELS_PER_CONNECTION",
+        hide_env_values = true,
+        default_value_t = 1
+    )]
+    pub ssh_max_channels_per_connection: usize,
     /// Deliver downstream OAuth callbacks from the cog host to literal
     /// loopback listeners. Disabled by default because this is a constrained
     /// server-side request feature, not part of standard browser OAuth.
@@ -164,6 +225,13 @@ impl Config {
     }
 
     fn initialize_in(&mut self, home: &Path) -> anyhow::Result<()> {
+        let listen = self.ssh_listen.expect("COG_SSH_LISTEN has a clap default");
+        if self.ssh_public_host.is_none() {
+            self.ssh_public_host = self.base_url.host_str().map(str::to_owned);
+        }
+        if self.ssh_public_port.is_none() {
+            self.ssh_public_port = Some(listen.port());
+        }
         create_private_dir(home)?;
         create_private_dir(&self.data_dir)?;
         if self.master_key.is_empty() {
@@ -199,6 +267,35 @@ impl Config {
                 && self.git_max_response_bytes > 0,
             "Git limits must be positive"
         );
+        anyhow::ensure!(
+            self.ssh_certificate_ttl_secs > 0
+                && self.ssh_certificate_ttl_secs <= self.ssh_certificate_max_ttl_secs
+                && self.ssh_certificate_max_ttl_secs <= 900,
+            "SSH certificate TTL must be positive and may not exceed 15 minutes"
+        );
+        if let Some(listen) = self.ssh_listen {
+            let host = self.ssh_public_host.as_deref().unwrap_or_default().trim();
+            anyhow::ensure!(
+                !host.is_empty(),
+                "COG_SSH_PUBLIC_HOST is required when SSH is enabled"
+            );
+            anyhow::ensure!(
+                !host.contains(['/', '\\', '@', '[', ']']),
+                "COG_SSH_PUBLIC_HOST is invalid"
+            );
+            anyhow::ensure!(
+                self.ssh_public_port.unwrap_or(listen.port()) > 0,
+                "COG_SSH_PUBLIC_PORT must be positive"
+            );
+            anyhow::ensure!(
+                self.ssh_handshake_timeout_secs > 0
+                    && self.ssh_auth_timeout_secs > 0
+                    && self.ssh_channel_timeout_secs > 0
+                    && self.ssh_max_connections > 0
+                    && self.ssh_max_channels_per_connection == 1,
+                "SSH timeouts and limits must be positive; exactly one channel per connection is supported"
+            );
+        }
         anyhow::ensure!(
             self.master_key.len() >= 32,
             "COG_MASTER_KEY must be at least 32 characters"
@@ -354,7 +451,7 @@ mod tests {
     use tempfile::tempdir;
     #[test]
     fn paths_and_validation() {
-        let c = Config::parse_from([
+        let mut c = Config::parse_from([
             "cog",
             "--data-dir",
             "/data",
@@ -366,6 +463,11 @@ mod tests {
         assert_eq!(c.db_path(), PathBuf::from("/data/cog.sqlite"));
         assert_eq!(c.lease_ttl(), Duration::from_secs(30));
         assert!(c.s3_enabled());
+        assert_eq!(c.ssh_listen, Some("127.0.0.1:2222".parse().unwrap()));
+        let temp = tempdir().unwrap();
+        c.initialize_in(temp.path()).unwrap();
+        assert_eq!(c.ssh_public_host.as_deref(), Some("localhost"));
+        assert_eq!(c.ssh_public_port, Some(2222));
         assert!(c.validate().is_ok());
         let mut bad = c.clone();
         bad.s3_bucket = Some(String::new());

@@ -16,6 +16,8 @@ RestartSec=5s
 TimeoutStopSec=45s
 NoNewPrivileges=true
 PrivateTmp=true
+# Git-over-SSH is disabled unless COG_SSH_LISTEN is present in the protected
+# environment file. Open that TCP port directly; it is not an HTTP/Nginx route.
 
 [Install]
 WantedBy=multi-user.target

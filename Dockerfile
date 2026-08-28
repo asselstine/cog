@@ -19,6 +19,6 @@ COPY --from=build /src/target/release/cog /usr/local/bin/cog
 RUN useradd --system --uid 10001 --home /data cog && mkdir /data && chown cog:cog /data
 USER cog
 VOLUME /data
-EXPOSE 4788
-ENV COG_DATA_DIR=/data COG_LISTEN=0.0.0.0:4788
+EXPOSE 4788 2222
+ENV COG_DATA_DIR=/data COG_LISTEN=0.0.0.0:4788 COG_SSH_LISTEN=0.0.0.0:2222
 ENTRYPOINT ["cog"]

@@ -18,6 +18,7 @@ bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 futures-util = "0.3"
+flate2 = "1"
 hex = "0.4"
 hkdf = "0.12"
 http = "1"
@@ -27,12 +28,14 @@ libc = "0.2"
 object_store = { version = "0.14", features = ["aws"] }
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
+russh = { version = "0.60.3", default-features = false, features = ["ring"] }
 rust-embed = "8"
 rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
 rustyriver = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+ssh-key = { version = "0.6.7", default-features = false, features = ["std", "ed25519", "getrandom"] }
 subtle = "2"
 thiserror = "2"
 tempfile = "3"
@@ -44,7 +47,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = { version = "2", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 v8 = "152.1"
-x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 [dev-dependencies]
 http-body-util = "0.1"

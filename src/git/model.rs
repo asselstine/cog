@@ -91,22 +91,6 @@ pub fn valid_repository_id(id: &str) -> bool {
     id.len() == 36 && uuid::Uuid::parse_str(id).is_ok() && !id.contains(['/', '\\'])
 }
 
-pub fn classify(
-    method: &str,
-    endpoint: &str,
-    service: Option<&str>,
-) -> anyhow::Result<GitOperation> {
-    match (method, endpoint, service) {
-        ("GET", "info/refs", Some("git-upload-pack")) | ("POST", "git-upload-pack", None) => {
-            Ok(GitOperation::Read)
-        }
-        ("GET", "info/refs", Some("git-receive-pack")) | ("POST", "git-receive-pack", None) => {
-            Ok(GitOperation::Write)
-        }
-        _ => anyhow::bail!("unsupported Git smart-HTTP request"),
-    }
-}
-
 pub fn validate_upstream(
     url: &Url,
     expected_host: &str,
@@ -163,26 +147,7 @@ pub async fn validate_resolved_network(url: &Url, allow_loopback: bool) -> anyho
 mod tests {
     use super::*;
     #[test]
-    fn routes_are_strict() {
-        assert_eq!(
-            classify("GET", "info/refs", Some("git-upload-pack")).unwrap(),
-            GitOperation::Read
-        );
-        assert_eq!(
-            classify("POST", "git-receive-pack", None).unwrap(),
-            GitOperation::Write
-        );
-        assert!(classify("POST", "git-upload-pack", Some("git-receive-pack")).is_err());
-        assert_eq!(
-            classify("GET", "info/refs", Some("git-receive-pack")).unwrap(),
-            GitOperation::Write
-        );
-        assert_eq!(
-            classify("POST", "git-upload-pack", None).unwrap(),
-            GitOperation::Read
-        );
-        assert!(classify("GET", "info/refs", None).is_err());
-        assert!(classify("DELETE", "git-upload-pack", None).is_err());
+    fn repository_ids_are_strict() {
         assert!(!valid_repository_id("../x"));
         assert!(valid_repository_id(&uuid::Uuid::new_v4().to_string()));
     }

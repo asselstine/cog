@@ -83,124 +83,29 @@ async fn incremental_replication_restores_across_generation() {
 
 #[tokio::test]
 #[ignore = "requires compose.test.yml MinIO"]
-async fn git_grants_credentials_and_revocations_survive_takeover() {
+async fn ssh_host_and_ca_identity_survive_s3_takeover() {
     let s = store();
-    let prefix = format!("git-takeover/{}/", uuid::Uuid::new_v4());
+    let prefix = format!("ssh-takeover/{}/", uuid::Uuid::new_v4());
     let directory = tempfile::tempdir().unwrap();
     let first_path = directory.path().join("first.sqlite");
     let first = Database::open(&first_path).unwrap();
-    let user = first.create_user("git-owner@example.com", "hash").unwrap();
-    first
-        .register_client(
-            "agent",
-            Some(&user),
-            "agent",
-            &["http://localhost/cb".into()],
-        )
-        .unwrap();
-    let integration = first
-        .create_integration(
-            &user,
-            "Git",
-            "git",
-            &serde_json::json!({"kind":"git"}),
-            None,
-        )
-        .unwrap();
-    let repository = first
-        .upsert_git_repository(
-            &user,
-            &integration,
-            &cog::git::ResolvedRepository {
-                provider_repository_id: "stable-provider-id".into(),
-                display_name: "owner/repo".into(),
-                upstream_url: "https://github.com/owner/repo.git".parse().unwrap(),
-                metadata: serde_json::json!({}),
-            },
-        )
-        .unwrap();
-    let now = chrono::Utc::now().timestamp();
-    first
-        .store_access_token(
-            &cog::crypto::token_hash("oauth"),
-            "agent",
-            &user,
-            &format!("mcp git:write integration:{integration}"),
-            now + 600,
-            None,
-            None,
-        )
-        .unwrap();
-    first
-        .set_git_grant(&user, "agent", &repository.id, "write")
-        .unwrap();
-    let credential = first
-        .issue_git_credential(&user, "agent", &repository.id, "write", 600)
-        .unwrap();
+    let secrets = cog::crypto::SecretBox::new(b"0123456789abcdef0123456789abcdef");
+    let first_keys = cog::git::ssh::KeySet::load_or_create(&first, &secrets).unwrap();
+    let host = first_keys.host.public_key().to_openssh().unwrap();
+    let ca = first_keys.user_ca.public_key().to_openssh().unwrap();
     let generation1 = Replicator::new(s.clone(), prefix.clone(), first_path, 1);
     generation1.sync().await.unwrap();
     generation1.commit_generation().await.unwrap();
     drop(first);
+    drop(first_keys);
 
     let second_path = directory.path().join("second.sqlite");
-    let generation2 = Replicator::new(s.clone(), prefix.clone(), second_path.clone(), 2);
+    let generation2 = Replicator::new(s, prefix, second_path.clone(), 2);
     assert!(generation2.restore().await.unwrap());
     let second = Database::open(&second_path).unwrap();
-    let restored = second.git_repository(&repository.id).unwrap().unwrap();
-    assert_eq!(restored.provider_repository_id, "stable-provider-id");
-    assert_eq!(
-        second
-            .git_grant_permission(&user, "agent", &repository.id)
-            .unwrap()
-            .as_deref(),
-        Some("write")
-    );
-    assert!(
-        second
-            .git_credential_context(&credential, &repository.id, now)
-            .unwrap()
-            .is_some()
-    );
-    second
-        .set_git_grant(&user, "agent", &repository.id, "read")
-        .unwrap();
-    assert!(
-        second
-            .git_credential_context(&credential, &repository.id, now)
-            .unwrap()
-            .is_none()
-    );
-    second
-        .revoke_git_grant(&user, "agent", &repository.id)
-        .unwrap();
-    generation2.sync().await.unwrap();
-    generation2.commit_generation().await.unwrap();
-    drop(second);
-
-    let third_path = directory.path().join("third.sqlite");
-    let generation3 = Replicator::new(s.clone(), prefix.clone(), third_path.clone(), 3);
-    assert!(generation3.restore().await.unwrap());
-    let third = Database::open(&third_path).unwrap();
-    assert_eq!(
-        third
-            .git_repository(&repository.id)
-            .unwrap()
-            .unwrap()
-            .display_name,
-        "owner/repo"
-    );
-    assert!(
-        third
-            .git_grant_permission(&user, "agent", &repository.id)
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        third
-            .git_credential_context(&credential, &repository.id, now)
-            .unwrap()
-            .is_none()
-    );
+    let second_keys = cog::git::ssh::KeySet::load_or_create(&second, &secrets).unwrap();
+    assert_eq!(second_keys.host.public_key().to_openssh().unwrap(), host);
+    assert_eq!(second_keys.user_ca.public_key().to_openssh().unwrap(), ca);
 }
 
 #[tokio::test]

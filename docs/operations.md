@@ -115,10 +115,26 @@ and conditionally expires only its own lease record. SIGKILL and host loss rely
 on lease expiry; a replacement must not be started with clocks known to be
 incorrect.
 
-## Git smart HTTP
+## Git transports and SSH incident response
 
-See [Git smart HTTP](git.md) for GitHub App registration, exact repository
-approval, credential-helper setup, streaming reverse-proxy requirements, limits,
-metrics, audit events, rotation, and incident response. Git private keys remain
-inside encrypted integration secrets and must not enter environment dumps,
-command arguments, remotes, audit details, or logs.
+See [Git transports](git.md) for SSH certificate setup.
+SSH is a separate TCP listener and must be allowed through the host firewall and
+load balancer directly; Nginx's HTTP listener cannot proxy it as an HTTP route.
+Verify the effective systemd configuration, listener ownership, `/readyz`, and
+both host/CA fingerprints after deployment and S3 takeover.
+
+For emergency SSH disablement, stop COG orderly with SIGINT and block the
+published SSH port; Git access remains unavailable until COG is restarted. For a user
+CA compromise, prepare and activate a replacement CA, revoke affected OAuth
+clients or repository grants immediately, and retain the retiring CA only for
+the maximum certificate lifetime. For a host-key compromise, disable SSH,
+prepare and activate a replacement while stopped, distribute the new pinned
+`known_hosts` entry through `repository_access`, and then re-enable the listener.
+Never tell clients to bypass host-key checking.
+
+Repository removal, integration disconnect, client revocation, and stale-owner
+fencing take effect at the next SSH command even for an unexpired certificate.
+Rotation order is prepare, durably replicate, distribute overlap, activate,
+observe, then retire after `retirement_time`. CA overlap is at least the maximum
+certificate lifetime plus clock skew; host overlap is at least 24 hours unless
+the operator documents a longer client rollout window and rollback plan.

@@ -22,12 +22,12 @@ impl StorageMode {
     }
 }
 
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 6;
 
 const INITIAL_SCHEMA: &str = r#"
 PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS schema_meta(version INTEGER NOT NULL);
-INSERT INTO schema_meta(version) SELECT 4 WHERE NOT EXISTS (SELECT 1 FROM schema_meta);
+INSERT INTO schema_meta(version) SELECT 5 WHERE NOT EXISTS (SELECT 1 FROM schema_meta);
 CREATE TABLE IF NOT EXISTS cog_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS users(
  id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
@@ -121,15 +121,6 @@ CREATE TABLE IF NOT EXISTS git_repository_grants(
  permission TEXT NOT NULL CHECK(permission IN ('read','write')), created_at INTEGER NOT NULL,
  revoked_at INTEGER, last_used_at INTEGER, PRIMARY KEY(identity_id,repository_id)
 );
-CREATE TABLE IF NOT EXISTS git_credentials(
- credential_hash BLOB PRIMARY KEY, identity_id TEXT NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
- agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
- user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
- client_id TEXT NOT NULL REFERENCES oauth_clients(client_id) ON DELETE CASCADE,
- repository_id TEXT NOT NULL REFERENCES git_repositories(id) ON DELETE CASCADE,
- permission TEXT NOT NULL CHECK(permission IN ('read','write')), issued_at INTEGER NOT NULL,
- expires_at INTEGER NOT NULL, last_used_at INTEGER, revoked_at INTEGER
-);
 CREATE TABLE IF NOT EXISTS git_pending_requests(
  id_hash BLOB PRIMARY KEY, identity_id TEXT NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -139,6 +130,13 @@ CREATE TABLE IF NOT EXISTS git_pending_requests(
  permission TEXT NOT NULL CHECK(permission IN ('read','write')), expires_at INTEGER NOT NULL,
  consumed_at INTEGER
 );
+CREATE TABLE IF NOT EXISTS ssh_keys(
+ id TEXT PRIMARY KEY, purpose TEXT NOT NULL CHECK(purpose IN ('host','user_ca')),
+ algorithm TEXT NOT NULL, public_key TEXT NOT NULL, private_ciphertext TEXT NOT NULL,
+ created_at INTEGER NOT NULL, active INTEGER NOT NULL DEFAULT 0,
+ retirement_time INTEGER
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ssh_keys_one_active ON ssh_keys(purpose) WHERE active=1;
 CREATE TABLE IF NOT EXISTS github_app_setups(
  state_hash BLOB PRIMARY KEY,
  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -193,6 +191,22 @@ fn apply_migration(tx: &rusqlite::Transaction<'_>, version: i64) -> anyhow::Resu
         // the complete idempotent DDL keeps upgrades from development builds
         // (which shipped parts of this schema under v2) safe.
         4 => tx.execute_batch(INITIAL_SCHEMA)?,
+        // Version 5 introduced encrypted, durable SSH host and user-CA keys.
+        5 => tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS ssh_keys(
+               id TEXT PRIMARY KEY,
+               purpose TEXT NOT NULL CHECK(purpose IN ('host','user_ca')),
+               algorithm TEXT NOT NULL,
+               public_key TEXT NOT NULL,
+               private_ciphertext TEXT NOT NULL,
+               created_at INTEGER NOT NULL,
+               active INTEGER NOT NULL DEFAULT 0,
+               retirement_time INTEGER
+             );
+             CREATE UNIQUE INDEX IF NOT EXISTS ssh_keys_one_active ON ssh_keys(purpose) WHERE active=1;",
+        )?,
+        // Version 6 removes the superseded downstream HTTPS credential path.
+        6 => tx.execute_batch("DROP TABLE IF EXISTS git_credentials;")?,
         _ => anyhow::bail!("unsupported migration target {version}"),
     }
     Ok(())
@@ -341,6 +355,19 @@ pub struct TokenContext {
     pub scopes: Vec<String>,
     pub integration_ids: Vec<String>,
 }
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SshKeyRecord {
+    pub id: String,
+    pub purpose: String,
+    pub algorithm: String,
+    pub public_key: String,
+    #[serde(skip_serializing)]
+    pub private_ciphertext: String,
+    pub created_at: i64,
+    pub active: bool,
+    pub retirement_time: Option<i64>,
+}
 type RefreshTokenRow = (Vec<u8>, String, String, String, Option<i64>);
 fn git_repo_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::git::GitRepository> {
     Ok(crate::git::GitRepository {
@@ -394,6 +421,133 @@ fn agent_for_client_tx(
 }
 
 impl Database {
+    pub fn ssh_keys(&self) -> anyhow::Result<Vec<SshKeyRecord>> {
+        let conn = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+        let mut statement = conn.prepare(
+            "SELECT id,purpose,algorithm,public_key,private_ciphertext,created_at,active,retirement_time FROM ssh_keys ORDER BY purpose,created_at DESC",
+        )?;
+        Ok(statement
+            .query_map([], |row| {
+                Ok(SshKeyRecord {
+                    id: row.get(0)?,
+                    purpose: row.get(1)?,
+                    algorithm: row.get(2)?,
+                    public_key: row.get(3)?,
+                    private_ciphertext: row.get(4)?,
+                    created_at: row.get(5)?,
+                    active: row.get::<_, i64>(6)? != 0,
+                    retirement_time: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn active_ssh_key(&self, purpose: &str) -> anyhow::Result<Option<SshKeyRecord>> {
+        anyhow::ensure!(
+            matches!(purpose, "host" | "user_ca"),
+            "invalid SSH key purpose"
+        );
+        let conn = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+        Ok(conn.query_row(
+            "SELECT id,purpose,algorithm,public_key,private_ciphertext,created_at,active,retirement_time FROM ssh_keys WHERE purpose=? AND active=1",
+            [purpose],
+            |row| Ok(SshKeyRecord { id: row.get(0)?, purpose: row.get(1)?, algorithm: row.get(2)?, public_key: row.get(3)?, private_ciphertext: row.get(4)?, created_at: row.get(5)?, active: row.get::<_, i64>(6)? != 0, retirement_time: row.get(7)? }),
+        ).optional()?)
+    }
+
+    /// Atomically installs a first key. A concurrent creator loses the insert
+    /// race and receives the already-active durable record.
+    pub fn install_initial_ssh_key(
+        &self,
+        purpose: &str,
+        public_key: &str,
+        private_ciphertext: &str,
+    ) -> anyhow::Result<SshKeyRecord> {
+        anyhow::ensure!(
+            matches!(purpose, "host" | "user_ca"),
+            "invalid SSH key purpose"
+        );
+        let id = Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp();
+        self.transact(|tx| {
+            tx.execute(
+                "INSERT OR IGNORE INTO ssh_keys(id,purpose,algorithm,public_key,private_ciphertext,created_at,active) VALUES(?,?,'ssh-ed25519',?,?,?,1)",
+                params![id, purpose, public_key, private_ciphertext, now],
+            )?;
+            Ok(())
+        })?;
+        self.active_ssh_key(purpose)?
+            .ok_or_else(|| anyhow::anyhow!("SSH key initialization did not converge"))
+    }
+
+    pub fn prepare_ssh_key(
+        &self,
+        purpose: &str,
+        public_key: &str,
+        private_ciphertext: &str,
+    ) -> anyhow::Result<SshKeyRecord> {
+        anyhow::ensure!(
+            matches!(purpose, "host" | "user_ca"),
+            "invalid SSH key purpose"
+        );
+        let id = Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp();
+        self.transact(|tx| {
+            tx.execute(
+                "INSERT INTO ssh_keys(id,purpose,algorithm,public_key,private_ciphertext,created_at,active) VALUES(?,?,'ssh-ed25519',?,?,?,0)",
+                params![id, purpose, public_key, private_ciphertext, now],
+            )?;
+            Ok(())
+        })?;
+        self.ssh_keys()?
+            .into_iter()
+            .find(|key| key.id == id)
+            .ok_or_else(|| anyhow::anyhow!("prepared SSH key was not found"))
+    }
+
+    pub fn activate_ssh_key(
+        &self,
+        id: &str,
+        purpose: &str,
+        retirement_time: i64,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            matches!(purpose, "host" | "user_ca"),
+            "invalid SSH key purpose"
+        );
+        self.transact(|tx| {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM ssh_keys WHERE id=? AND purpose=? AND active=0 AND retirement_time IS NULL)",
+                params![id, purpose],
+                |row| row.get(0),
+            )?;
+            anyhow::ensure!(exists, "prepared SSH key not found");
+            tx.execute(
+                "UPDATE ssh_keys SET active=0,retirement_time=? WHERE purpose=? AND active=1",
+                params![retirement_time, purpose],
+            )?;
+            tx.execute("UPDATE ssh_keys SET active=1 WHERE id=?", [id])?;
+            Ok(())
+        })
+    }
+
+    pub fn retire_ssh_key(&self, id: &str, now: i64) -> anyhow::Result<()> {
+        self.transact(|tx| {
+            let changed = tx.execute(
+                "DELETE FROM ssh_keys WHERE id=? AND active=0 AND retirement_time IS NOT NULL AND retirement_time<=?",
+                params![id, now],
+            )?;
+            anyhow::ensure!(changed == 1, "SSH key is active or its overlap window has not elapsed");
+            Ok(())
+        })
+    }
+
     pub fn upsert_git_repository(
         &self,
         user: &str,
@@ -437,7 +591,7 @@ impl Database {
             "invalid Git permission"
         );
         let now = chrono::Utc::now().timestamp();
-        self.transact(|tx|{let identity:String=tx.query_row("SELECT a.identity_id FROM agents a JOIN identities i ON i.id=a.identity_id JOIN git_repositories r ON r.id=? JOIN integrations n ON n.id=r.integration_id WHERE a.oauth_client_id=? AND i.user_id=? AND n.identity_id=a.identity_id",params![repository,client,user],|r|r.get(0))?;tx.execute("INSERT INTO git_repository_grants(identity_id,user_id,client_id,repository_id,permission,created_at,revoked_at) VALUES(?,?,?,?,?,?,NULL) ON CONFLICT(identity_id,repository_id) DO UPDATE SET permission=excluded.permission,revoked_at=NULL",params![identity,user,client,repository,permission,now])?;if permission=="read"{tx.execute("UPDATE git_credentials SET revoked_at=? WHERE identity_id=? AND repository_id=? AND permission='write' AND revoked_at IS NULL",params![now,identity,repository])?;}Ok(())})
+        self.transact(|tx|{let identity:String=tx.query_row("SELECT a.identity_id FROM agents a JOIN identities i ON i.id=a.identity_id JOIN git_repositories r ON r.id=? JOIN integrations n ON n.id=r.integration_id WHERE a.oauth_client_id=? AND i.user_id=? AND n.identity_id=a.identity_id",params![repository,client,user],|r|r.get(0))?;tx.execute("INSERT INTO git_repository_grants(identity_id,user_id,client_id,repository_id,permission,created_at,revoked_at) VALUES(?,?,?,?,?,?,NULL) ON CONFLICT(identity_id,repository_id) DO UPDATE SET permission=excluded.permission,revoked_at=NULL",params![identity,user,client,repository,permission,now])?;Ok(())})
     }
     pub fn revoke_git_grant(
         &self,
@@ -446,7 +600,7 @@ impl Database {
         repository: &str,
     ) -> anyhow::Result<bool> {
         let now = chrono::Utc::now().timestamp();
-        self.transact(|tx|{let identity:Option<String>=tx.query_row("SELECT a.identity_id FROM agents a JOIN identities i ON i.id=a.identity_id WHERE a.oauth_client_id=? AND i.user_id=?",params![client,user],|r|r.get(0)).optional()?;let Some(identity)=identity else{return Ok(false)};let changed=tx.execute("UPDATE git_repository_grants SET revoked_at=? WHERE identity_id=? AND repository_id=? AND revoked_at IS NULL",params![now,identity,repository])?;tx.execute("UPDATE git_credentials SET revoked_at=? WHERE identity_id=? AND repository_id=? AND revoked_at IS NULL",params![now,identity,repository])?;Ok(changed>0)})
+        self.transact(|tx|{let identity:Option<String>=tx.query_row("SELECT a.identity_id FROM agents a JOIN identities i ON i.id=a.identity_id WHERE a.oauth_client_id=? AND i.user_id=?",params![client,user],|r|r.get(0)).optional()?;let Some(identity)=identity else{return Ok(false)};let changed=tx.execute("UPDATE git_repository_grants SET revoked_at=? WHERE identity_id=? AND repository_id=? AND revoked_at IS NULL",params![now,identity,repository])?;Ok(changed>0)})
     }
     pub fn git_grant_permission(
         &self,
@@ -505,19 +659,6 @@ impl Database {
         let rows=s.query_map([user],|r|Ok(serde_json::json!({"client_id":r.get::<_,String>(0)?,"client_name":r.get::<_,String>(1)?,"repository_id":r.get::<_,String>(2)?,"integration_id":r.get::<_,String>(3)?,"display_name":r.get::<_,String>(4)?,"permission":r.get::<_,String>(5)?,"created_at":r.get::<_,i64>(6)?,"last_used_at":r.get::<_,Option<i64>>(7)?})))?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
-    pub fn issue_git_credential(
-        &self,
-        user: &str,
-        client: &str,
-        repository: &str,
-        permission: &str,
-        ttl: i64,
-    ) -> anyhow::Result<String> {
-        let token = format!("cog_git_{}", crate::crypto::random_token(32));
-        let now = chrono::Utc::now().timestamp();
-        self.transact(|tx|{let(agent,identity):(String,String)=tx.query_row("SELECT a.id,a.identity_id FROM agents a JOIN identities i ON i.id=a.identity_id WHERE a.oauth_client_id=? AND i.user_id=?",params![client,user],|r|Ok((r.get(0)?,r.get(1)?)))?;tx.execute("INSERT INTO git_credentials(credential_hash,identity_id,agent_id,user_id,client_id,repository_id,permission,issued_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?)",params![crate::crypto::token_hash(&token).as_slice(),identity,agent,user,client,repository,permission,now,now+ttl])?;Ok(())})?;
-        Ok(token)
-    }
     pub fn create_git_pending_request(
         &self,
         user: &str,
@@ -570,15 +711,6 @@ impl Database {
     ) -> anyhow::Result<Vec<(String, String)>> {
         self.transact(|tx|{let mut grants=Vec::new();for id in approved{let hash=hex::decode(id)?;let row:Option<(String,String,String)>=tx.query_row("SELECT repository_id,permission,identity_id FROM git_pending_requests WHERE id_hash=? AND user_id=? AND client_id=? AND expires_at>? AND consumed_at IS NULL",params![hash,user,client,now],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;if let Some((repository,permission,identity))=row{tx.execute("INSERT INTO git_repository_grants(identity_id,user_id,client_id,repository_id,permission,created_at,revoked_at) VALUES(?,?,?,?,?,?,NULL) ON CONFLICT(identity_id,repository_id) DO UPDATE SET permission=CASE WHEN git_repository_grants.permission='write' OR excluded.permission='write' THEN 'write' ELSE 'read' END,revoked_at=NULL",params![identity,user,client,repository,permission,now])?;tx.execute("UPDATE git_pending_requests SET consumed_at=? WHERE id_hash=?",params![now,hash])?;grants.push((repository,permission));}}
         tx.execute("UPDATE git_pending_requests SET consumed_at=? WHERE user_id=? AND client_id=? AND consumed_at IS NULL",params![now,user,client])?;Ok(grants)})
-    }
-    pub fn git_credential_context(
-        &self,
-        token: &str,
-        repository: &str,
-        now: i64,
-    ) -> anyhow::Result<Option<TokenContext>> {
-        let hash = crate::crypto::token_hash(token);
-        self.transact(|tx|{let row=tx.query_row("SELECT i.user_id,a.oauth_client_id,c.permission,r.integration_id,a.id,i.id FROM git_credentials c JOIN agents a ON a.id=c.agent_id AND a.identity_id=c.identity_id JOIN identities i ON i.id=a.identity_id JOIN git_repositories r ON r.id=c.repository_id JOIN integrations n ON n.id=r.integration_id AND n.identity_id=i.id AND n.enabled=1 JOIN git_repository_grants g ON g.identity_id=i.id AND g.repository_id=r.id AND g.revoked_at IS NULL WHERE c.credential_hash=? AND c.repository_id=? AND c.expires_at>? AND c.revoked_at IS NULL AND (g.permission='write' OR c.permission='read')",params![hash.as_slice(),repository,now],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?))).optional()?;if let Some((user,client,permission,integration,agent,identity))=row{tx.execute("UPDATE git_credentials SET last_used_at=? WHERE credential_hash=?",params![now,hash.as_slice()])?;Ok(Some(TokenContext{user_id:user,agent_id:agent,client_id:client,identity_id:identity,scopes:vec![format!("git:{permission}"),format!("integration:{integration}")],integration_ids:vec![integration]}))}else{Ok(None)}})
     }
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         Self::open_with_mode(path, StorageMode::S3)
@@ -2287,7 +2419,7 @@ mod tests {
     }
 
     #[test]
-    fn git_pending_grants_credentials_and_cascades() {
+    fn git_pending_grants_and_cascades() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(&dir.path().join("git.db")).unwrap();
         let user = db.create_user("git@example.com", "hash").unwrap();
@@ -2348,23 +2480,10 @@ mod tests {
         );
         db.set_git_grant(&user, "client", &repository.id, "write")
             .unwrap();
-        let credential = db
-            .issue_git_credential(&user, "client", &repository.id, "write", 60)
-            .unwrap();
-        assert!(
-            db.git_credential_context(&credential, &repository.id, now)
-                .unwrap()
-                .is_some()
-        );
         db.revoke_git_grant(&user, "client", &repository.id)
             .unwrap();
         assert!(
             db.git_grant_permission(&user, "client", &repository.id)
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            db.git_credential_context(&credential, &repository.id, now)
                 .unwrap()
                 .is_none()
         );

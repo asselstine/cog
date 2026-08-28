@@ -30,3 +30,13 @@ jobs:
       - uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  ssh-interop:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-2025]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify certificate, parser, and stock OpenSSH interoperability
+        run: cargo test git::ssh::tests --lib

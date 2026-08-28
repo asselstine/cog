@@ -1,11 +1,9 @@
 //! Provider-neutral Git smart-HTTP support.
-pub mod auth;
-pub mod control;
 pub mod grants;
-pub mod headers;
 pub mod model;
+pub mod pack;
 pub mod providers;
-pub mod proxy;
-pub mod sealed;
+pub mod service;
+pub mod ssh;
 
 pub use model::*;

@@ -7,7 +7,7 @@ use crate::{
         safe_error,
     },
     git::providers::{GitProvider, github::GitHubProvider},
-    git::{GitOperation, RepositoryReference, ResolvedRepository, UpstreamAuthorization},
+    git::{GitOperation, RepositoryReference, ResolvedRepository},
     lease::{LeaseGuard, probe_conditional_writes},
     ltx::Replicator,
     mcp::{self, RpcRequest, RpcResponse},
@@ -22,15 +22,16 @@ use argon2::{
 };
 use axum::{
     Json, Router,
-    body::{Body, HttpBody},
     extract::{DefaultBodyLimit, Query},
     extract::{Form, Path, State},
-    http::{HeaderMap, Request, StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
 use futures_util::StreamExt;
 use object_store::{ObjectStore, aws::AmazonS3Builder, path::Path as ObjectPath};
+use russh::server::{Msg as SshMsg, Server as _, Session as SshSession};
+use russh::{Channel, ChannelId};
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -39,7 +40,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -52,14 +53,19 @@ struct Metrics {
     v8_limit_hits: AtomicU64,
     upstream_calls: AtomicU64,
     upstream_failures: AtomicU64,
-    git_active_streams: AtomicU64,
-    git_operations: AtomicU64,
-    git_auth_denied: AtomicU64,
-    git_upstream_failures: AtomicU64,
-    git_request_bytes: AtomicU64,
-    git_response_bytes: AtomicU64,
-    git_limit_rejections: AtomicU64,
-    git_client_limit_rejections: AtomicU64,
+    ssh_handshakes: AtomicU64,
+    ssh_auth_success: AtomicU64,
+    ssh_auth_denied: AtomicU64,
+    ssh_active_sessions: AtomicU64,
+    ssh_read_operations: AtomicU64,
+    ssh_write_operations: AtomicU64,
+    ssh_request_bytes: AtomicU64,
+    ssh_response_bytes: AtomicU64,
+    ssh_timeouts: AtomicU64,
+    ssh_limit_rejections: AtomicU64,
+    ssh_upstream_failures: AtomicU64,
+    ssh_certificates_issued: AtomicU64,
+    ssh_certificates_denied: AtomicU64,
 }
 
 #[derive(Default)]
@@ -524,8 +530,38 @@ impl ToolProvider for AdminProvider {
 fn git_control_tool(name: &str, description: &str, destructive: bool) -> Tool {
     Tool{name:name.into(),description:Some(description.into()),input_schema:match name{
  "repository_access"=>json!({"type":"object","properties":{"integrationId":{"type":"string"},"repository":{"type":"string"}},"required":["integrationId","repository"],"additionalProperties":false}),
- "sealed_credentials"=>json!({"type":"object","properties":{"repositoryId":{"type":"string"},"recipientPublicKey":{"type":"string"},"requestNonce":{"type":"string"}},"required":["repositoryId","recipientPublicKey","requestNonce"],"additionalProperties":false}),
+ "ssh_certificate"=>json!({"type":"object","properties":{"repositoryId":{"type":"string"},"publicKey":{"type":"string"},"permission":{"enum":["read","write"]}},"required":["repositoryId","publicKey","permission"],"additionalProperties":false}),
  _=>json!({"type":"object","properties":{},"additionalProperties":false})},extra:serde_json::from_value(json!({"annotations":{"readOnlyHint":!destructive,"destructiveHint":destructive,"openWorldHint":false}})).unwrap_or_default()}
+}
+
+fn ssh_advertisement(app: &App, repository_id: &str) -> Option<Value> {
+    if !app.ssh_ready.load(Ordering::Acquire) {
+        return None;
+    }
+    let keys = app.ssh_keys.as_ref()?;
+    let keys = keys.read().ok()?;
+    let host = app.config.ssh_public_host.as_deref()?;
+    let port = app
+        .config
+        .ssh_public_port
+        .unwrap_or(app.config.ssh_listen?.port());
+    let host_field = if port == 22 {
+        host.to_owned()
+    } else {
+        format!("[{host}]:{port}")
+    };
+    let public_key = keys.host.public_key().to_openssh().ok()?;
+    Some(json!({
+        "available":true,
+        "url":format!("ssh://git@{host}:{port}/{repository_id}"),
+        "certificateTool":"ssh_certificate",
+        "certificateTtlSeconds":app.config.ssh_certificate_ttl_secs,
+        "publicHost":host,
+        "publicPort":port,
+        "hostKeyFingerprint":crate::git::ssh::fingerprint(keys.host.public_key()),
+        "knownHosts":format!("{host_field} {public_key}"),
+        "requiredPrograms":["git","ssh","ssh-keygen"]
+    }))
 }
 
 async fn git_provider(
@@ -588,18 +624,19 @@ async fn git_provider(
 #[async_trait::async_trait]
 impl ToolProvider for GitControlProvider {
     async fn tools(&self) -> anyhow::Result<Vec<Tool>> {
-        Ok(vec![
-            git_control_tool(
-                "repository_access",
-                "Resolve a GitHub repository and return its COG remote. Access is controlled by the GitHub App installation and this client's existing integration authorization.",
+        let mut tools = vec![git_control_tool(
+            "repository_access",
+            "Resolve a GitHub repository and return its SSH remote. Access is controlled by the GitHub App installation and this client's existing integration authorization.",
+            false,
+        )];
+        if self.app.ssh_keys.is_some() && self.app.ssh_ready.load(Ordering::Acquire) {
+            tools.push(git_control_tool(
+                "ssh_certificate",
+                "Issue a short-lived SSH user certificate for a client-generated Ed25519 public key. Generate the private key locally with ssh-keygen; the private key must never be sent to COG. Write the returned certificate beside that private key using the returned certificateFileSuffix, pin knownHosts, and use sshRemoteUrl. On expiry or sandbox loss, generate a new key and call this tool again.",
                 false,
-            ),
-            git_control_tool(
-                "sealed_credentials",
-                "Mint a 15-minute repository credential encrypted to a one-use git-credential-cog public key. The result contains ciphertext only and must be passed to `git-credential-cog import` over stdin.",
-                false,
-            ),
-        ])
+            ));
+        }
+        Ok(tools)
     }
     async fn call(&self, name: &str, args: Value) -> anyhow::Result<Value> {
         match name {
@@ -694,20 +731,88 @@ impl ToolProvider for GitControlProvider {
                     .db
                     .set_git_grant(&self.auth.user, &self.auth.client, &repo.id, "write")?;
                 persist(&self.app).await?;
-                Ok(
-                    json!({"repositoryId":repo.id,"displayName":repo.display_name,"remoteUrl":format!("{}/git/{}.git",self.app.config.base_url.as_str().trim_end_matches('/'),repo.id),"credential":{"source":"sealed_credentials","helper":"git-credential-cog","useHttpPath":true}}),
-                )
+                let ssh = ssh_advertisement(&self.app, &repo.id);
+                let remote = ssh
+                    .as_ref()
+                    .and_then(|value| value.get("url"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("SSH listener is disabled or not ready"))?;
+                Ok(json!({
+                    "repositoryId":repo.id,
+                    "displayName":repo.display_name,
+                    "remoteUrl":remote,
+                    "remoteUrlVersion":2,
+                    "remotes":{
+                        "version":2,
+                        "preferred":"ssh",
+                        "ssh":ssh.expect("checked above")
+                    }
+                }))
             }
-            "sealed_credentials" => {
-                let request: crate::git::sealed::SealedCredentialRequest =
-                    serde_json::from_value(args)?;
-                let repository_id = &request.repository_id;
-                crate::git::sealed::decode_array::<32>(&request.request_nonce, "request nonce")?;
+            "ssh_certificate" => {
+                struct IssuanceGuard {
+                    db: Database,
+                    metrics: Arc<Metrics>,
+                    user: String,
+                    client: String,
+                    repository: Option<String>,
+                    permission: Option<String>,
+                    success: bool,
+                }
+                impl Drop for IssuanceGuard {
+                    fn drop(&mut self) {
+                        if !self.success {
+                            self.metrics
+                                .ssh_certificates_denied
+                                .fetch_add(1, Ordering::Relaxed);
+                            let _ = self.db.record_audit(
+                                Some(&self.user),
+                                "git.ssh_certificate.issue",
+                                self.repository.as_deref(),
+                                "denied",
+                                &json!({"client_id":self.client,"permission":self.permission}),
+                            );
+                        }
+                    }
+                }
+                let mut issuance = IssuanceGuard {
+                    db: self.app.db.clone(),
+                    metrics: self.app.metrics.clone(),
+                    user: self.auth.user.clone(),
+                    client: self.auth.client.clone(),
+                    repository: args
+                        .get("repositoryId")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    permission: args
+                        .get("permission")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    success: false,
+                };
+                let keys = self
+                    .app
+                    .ssh_keys
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("SSH transport is disabled"))?;
+                anyhow::ensure!(
+                    self.app.ssh_ready.load(Ordering::Acquire),
+                    "SSH listener is not ready"
+                );
+                let repository_id = args
+                    .get("repositoryId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("repositoryId is required"))?;
+                let permission = args
+                    .get("permission")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("permission is required"))?;
+                anyhow::ensure!(matches!(permission, "read" | "write"), "invalid permission");
                 let repository = self
                     .app
                     .db
                     .git_repository(repository_id)?
-                    .filter(|repository| repository.user_id == self.auth.user)
+                    .filter(|repo| repo.user_id == self.auth.user)
                     .ok_or_else(|| anyhow::anyhow!("repository not found"))?;
                 if !self.auth.allows_integration(&repository.integration_id) {
                     return Err(crate::authz::InsufficientScope {
@@ -715,29 +820,106 @@ impl ToolProvider for GitControlProvider {
                     }
                     .into());
                 }
-                let _mutation = self.app.mutations.lock().await;
+                let integration = self
+                    .app
+                    .db
+                    .integration(&repository.integration_id, &self.auth.user)?
+                    .filter(|integration| integration.enabled)
+                    .ok_or_else(|| anyhow::anyhow!("integration disabled"))?;
+                let granted = self
+                    .app
+                    .db
+                    .git_grant_permission(&self.auth.user, &self.auth.client, repository_id)?
+                    .ok_or_else(|| anyhow::anyhow!("repository grant not found"))?;
+                anyhow::ensure!(
+                    permission == "read" || granted == "write",
+                    "write access is not granted"
+                );
                 self.app.lease.assert_live()?;
-                let expires_at = chrono::Utc::now().timestamp() + 900;
-                let credential = self.app.db.issue_git_credential(
-                    &self.auth.user,
-                    &self.auth.client,
-                    repository_id,
-                    "write",
-                    900,
+                anyhow::ensure!(
+                    self.app.auth_rate_limit.allow(
+                        format!("ssh-certificate:{}:{repository_id}", self.auth.client),
+                        30,
+                        Duration::from_secs(60)
+                    ),
+                    "SSH certificate issuance rate limit exceeded"
+                );
+                let public_key = crate::git::ssh::parse_public_key(
+                    args.get("publicKey")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| anyhow::anyhow!("publicKey is required"))?,
                 )?;
+                let now = chrono::Utc::now().timestamp();
+                let expires_at = now + self.app.config.ssh_certificate_ttl_secs as i64;
+                let issuance_id = uuid::Uuid::new_v4().to_string();
+                let binding = crate::git::ssh::Binding {
+                    version: 1,
+                    issuance_id: issuance_id.clone(),
+                    user_id: self.auth.user.clone(),
+                    identity_id: self.auth.identity.clone(),
+                    agent_id: self.auth.agent.clone(),
+                    client_id: self.auth.client.clone(),
+                    integration_id: integration.id,
+                    repository_id: repository_id.to_owned(),
+                    permission: permission.to_owned(),
+                    fingerprint: crate::git::ssh::fingerprint(&public_key),
+                    issued_at: now,
+                    expires_at,
+                };
+                let serial = crate::git::ssh::stable_serial(&issuance_id);
+                let (certificate, host_public) = {
+                    let keys = keys
+                        .read()
+                        .map_err(|_| anyhow::anyhow!("SSH key lock poisoned"))?;
+                    (
+                        crate::git::ssh::sign(&keys.user_ca, &public_key, &binding, serial)?,
+                        keys.host.public_key().to_openssh()?,
+                    )
+                };
+                let host = self
+                    .app
+                    .config
+                    .ssh_public_host
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("SSH public host is not configured"))?;
+                let port = self.app.config.ssh_public_port.unwrap_or_else(|| {
+                    self.app
+                        .config
+                        .ssh_listen
+                        .expect("keys imply SSH configuration")
+                        .port()
+                });
+                let host_field = if port == 22 {
+                    host.to_owned()
+                } else {
+                    format!("[{host}]:{port}")
+                };
+                let remote = format!("ssh://git@{host}:{port}/{repository_id}");
+                self.app.db.record_audit(Some(&self.auth.user), "git.ssh_certificate.issue", Some(repository_id), "success", &json!({"identity_id":self.auth.identity,"agent_id":self.auth.agent,"client_id":self.auth.client,"integration_id":repository.integration_id,"permission":permission,"fingerprint":binding.fingerprint,"serial":serial,"expires_at":expires_at}))?;
                 persist(&self.app).await?;
-                let origin = self.app.config.base_url.as_str().trim_end_matches('/');
-                Ok(serde_json::to_value(crate::git::sealed::seal(
-                    &request,
-                    origin,
-                    &crate::git::sealed::CredentialPayload {
-                        username: "cog".into(),
-                        password: credential,
-                        repository_id: repository_id.clone(),
-                        origin: origin.to_owned(),
-                        expires_at,
-                    },
-                )?)?)
+                issuance.success = true;
+                issuance
+                    .metrics
+                    .ssh_certificates_issued
+                    .fetch_add(1, Ordering::Relaxed);
+                Ok(json!({
+                    "repositoryId": repository_id,
+                    "permission": permission,
+                    "expiresAt": chrono::DateTime::from_timestamp(expires_at, 0).expect("valid timestamp").to_rfc3339(),
+                    "sshRemoteUrl": remote,
+                    "certificate": certificate,
+                    "certificateFileSuffix": "-cert.pub",
+                    "knownHosts": format!("{host_field} {host_public}"),
+                    "identityFileHint": "path to the private key corresponding to publicKey",
+                    "requiredPrograms": ["git", "ssh", "ssh-keygen"],
+                    "privateKeyGeneration": {"program":"ssh-keygen","arguments":["-q","-t","ed25519","-N","","-f","<private-key-path>"]},
+                    "certificateOutput": {"path":"<private-key-path>-cert.pub","contentsField":"certificate","encoding":"UTF-8","trailingNewline":true},
+                    "knownHostsOutput": {"path":"<private-known-hosts-path>","contentsField":"knownHosts","encoding":"UTF-8","trailingNewline":true},
+                    "gitArguments": ["clone", "--", remote],
+                    "sshArguments": ["-o","IdentitiesOnly=yes","-o","StrictHostKeyChecking=yes","-o","UserKnownHostsFile=<private-known-hosts-path>","-i","<private-key-path>"],
+                    "sshOptions": {"identitiesOnly": true, "strictHostKeyChecking": true, "userKnownHostsFile": "path to the private known_hosts file"},
+                    "renewal": {"implicit":false,"action":"generate a new local key and call ssh_certificate again after expiry or sandbox replacement","privateKeyRemainsLocal":true}
+                }))
             }
             _ => anyhow::bail!("unknown Git control operation"),
         }
@@ -887,6 +1069,9 @@ struct App {
     git_providers: Arc<tokio::sync::Mutex<HashMap<String, Arc<dyn GitProvider>>>>,
     git_streams: Arc<tokio::sync::Semaphore>,
     git_client_streams: Arc<ClientStreamLimiter>,
+    ssh_keys: Option<Arc<std::sync::RwLock<crate::git::ssh::KeySet>>>,
+    ssh_ready: Arc<AtomicBool>,
+    ssh_connections: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Clone)]
@@ -1105,8 +1290,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         );
         return Ok(());
     }
-    let app = App {
-        secrets: SecretBox::new(config.master_key.as_bytes()),
+    let secrets = SecretBox::new(config.master_key.as_bytes());
+    let mut app = App {
+        secrets,
         runtime: Arc::new(CodeRuntime::new(
             config.v8_heap_mb,
             Duration::from_secs(config.execution_timeout_secs),
@@ -1122,15 +1308,78 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         git_providers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         git_streams: Arc::new(tokio::sync::Semaphore::new(config.git_max_streams)),
         git_client_streams: Arc::new(ClientStreamLimiter::default()),
+        ssh_keys: None,
+        ssh_ready: Arc::new(AtomicBool::new(false)),
+        ssh_connections: Arc::new(tokio::sync::Semaphore::new(config.ssh_max_connections)),
+    };
+    let ssh_listener = if let Some(address) = config.ssh_listen {
+        let keys = Arc::new(std::sync::RwLock::new(
+            crate::git::ssh::KeySet::load_or_create(&app.db, &app.secrets)?,
+        ));
+        app.ssh_keys = Some(keys);
+        // Key creation is a durable mutation. In S3 mode it must be replicated
+        // before either the public key or listener is advertised.
+        persist(&app).await?;
+        Some(
+            tokio::net::TcpListener::bind(address)
+                .await
+                .with_context(|| format!("configured SSH listener {address} could not be bound"))?,
+        )
+    } else {
+        None
+    };
+    let (ssh_shutdown, _) = tokio::sync::broadcast::channel::<()>(1);
+    let ssh_task = if let Some(listener) = ssh_listener {
+        let keys = app.ssh_keys.as_ref().expect("SSH keys loaded");
+        let encoded = crate::git::ssh::encode_private(
+            &keys
+                .read()
+                .map_err(|_| anyhow::anyhow!("SSH key lock poisoned"))?
+                .host,
+        )?;
+        let host_key = russh::keys::PrivateKey::from_openssh(&encoded)?;
+        let ssh_config = Arc::new(russh::server::Config {
+            methods: russh::MethodSet::from(&[russh::MethodKind::PublicKey][..]),
+            auth_rejection_time: Duration::from_secs(1),
+            auth_rejection_time_initial: Some(Duration::ZERO),
+            keys: vec![host_key],
+            window_size: 256 * 1024,
+            maximum_packet_size: 32 * 1024,
+            channel_buffer_size: 8,
+            event_buffer_size: 8,
+            max_auth_attempts: 3,
+            inactivity_timeout: Some(Duration::from_secs(config.ssh_channel_timeout_secs)),
+            nodelay: true,
+            ..Default::default()
+        });
+        let factory = SshServerFactory { app: app.clone() };
+        let mut shutdown = ssh_shutdown.subscribe();
+        app.ssh_ready.store(true, Ordering::Release);
+        Some(tokio::spawn(async move {
+            let mut factory = factory;
+            let running = factory.run_on_socket(ssh_config, &listener);
+            let handle = running.handle();
+            tokio::pin!(running);
+            tokio::select! {
+                result = &mut running => result,
+                _ = shutdown.recv() => {
+                    handle.shutdown("COG is shutting down".into());
+                    running.await
+                }
+            }
+        }))
+    } else {
+        None
     };
     let shutdown_providers = app.providers.clone();
-    let router = build_router(app);
+    let router = build_router(app.clone());
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     tracing::info!(address=%config.listen,"cog ready");
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
+                    let _ = ssh_shutdown.send(());
                     // Stop admitting new work, capture the final committed
                     // position while authority is still proven, then stop the
                     // renewer and conditionally expire our ownership record.
@@ -1152,6 +1401,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                         None => std::future::pending::<()>().await,
                     }
                 } => {
+                    let _ = ssh_shutdown.send(());
                     tracing::error!("SELF-FENCE: lease renewal terminated; shutting down");
                 }
             }
@@ -1169,6 +1419,17 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             }
         })
         .await?;
+    app.ssh_ready.store(false, Ordering::Release);
+    if let Some(mut task) = ssh_task
+        && tokio::time::timeout(
+            Duration::from_secs(config.ssh_channel_timeout_secs),
+            &mut task,
+        )
+        .await
+        .is_err()
+    {
+        task.abort();
+    }
     Ok(())
 }
 
@@ -1196,6 +1457,9 @@ fn build_router(app: App) -> Router {
         )
         .route("/ui/tokens/{id}/revoke", post(ui_revoke_token))
         .route("/ui/clients/{id}/revoke", post(ui_revoke_client))
+        .route("/ui/ssh/{purpose}/prepare", post(ui_prepare_ssh_key))
+        .route("/ui/ssh/{purpose}/{id}/activate", post(ui_activate_ssh_key))
+        .route("/ui/ssh/{purpose}/{id}/retire", post(ui_retire_ssh_key))
         .route(
             "/ui/clients/{client}/integrations/{integration}/revoke",
             post(ui_revoke_grant),
@@ -1221,7 +1485,6 @@ fn build_router(app: App) -> Router {
         .route("/oauth/token", post(token))
         .route("/oauth/revoke", post(revoke_token))
         .route("/mcp", post(mcp_endpoint))
-        .route("/git/{*path}", axum::routing::any(git_smart_http))
         .route("/github/app/setup/{state}", get(github_app_setup_launch))
         .route(
             "/github/app/manifest/callback",
@@ -1278,222 +1541,569 @@ fn build_router(app: App) -> Router {
         .with_state(app)
 }
 
-async fn git_smart_http(
-    State(a): State<App>,
-    Path(path): Path<String>,
-    request: Request<Body>,
-) -> Response {
-    let Some((repository, endpoint)) = path
-        .split_once(".git/")
-        .map(|(repository, endpoint)| (repository.to_owned(), endpoint.to_owned()))
-    else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let permit = match a.git_streams.clone().try_acquire_owned() {
-        Ok(v) => v,
-        Err(_) => {
-            a.metrics
-                .git_limit_rejections
+#[derive(Clone)]
+struct SshServerFactory {
+    app: App,
+}
+
+struct SshConnection {
+    app: App,
+    binding: Option<crate::git::ssh::Binding>,
+    protocols: HashMap<ChannelId, String>,
+    inputs: HashMap<ChannelId, tokio::sync::mpsc::Sender<anyhow::Result<bytes::Bytes>>>,
+    opened_channel: bool,
+    executed_channel: Option<ChannelId>,
+    _connection_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl russh::server::Server for SshServerFactory {
+    type Handler = SshConnection;
+
+    fn new_client(&mut self, _peer_addr: Option<SocketAddr>) -> Self::Handler {
+        self.app
+            .metrics
+            .ssh_handshakes
+            .fetch_add(1, Ordering::Relaxed);
+        let permit = self.app.ssh_connections.clone().try_acquire_owned().ok();
+        if permit.is_none() {
+            self.app
+                .metrics
+                .ssh_limit_rejections
                 .fetch_add(1, Ordering::Relaxed);
-            return StatusCode::TOO_MANY_REQUESTS.into_response();
         }
-    };
-    a.metrics.git_active_streams.fetch_add(1, Ordering::Relaxed);
-    a.metrics.git_operations.fetch_add(1, Ordering::Relaxed);
-    struct ActiveGuard {
-        metrics: Arc<Metrics>,
-        _permit: tokio::sync::OwnedSemaphorePermit,
+        SshConnection {
+            app: self.app.clone(),
+            binding: None,
+            protocols: HashMap::new(),
+            inputs: HashMap::new(),
+            opened_channel: false,
+            executed_channel: None,
+            _connection_permit: permit,
+        }
     }
-    impl Drop for ActiveGuard {
-        fn drop(&mut self) {
-            self.metrics
-                .git_active_streams
+
+    fn handle_session_error(&mut self, error: <Self::Handler as russh::server::Handler>::Error) {
+        tracing::debug!(error = %safe_error(error.as_ref()), "SSH session ended with an error");
+    }
+}
+
+impl Drop for SshConnection {
+    fn drop(&mut self) {
+        if self.binding.is_some() {
+            self.app
+                .metrics
+                .ssh_active_sessions
                 .fetch_sub(1, Ordering::Relaxed);
         }
     }
-    let active = ActiveGuard {
-        metrics: a.metrics.clone(),
-        _permit: permit,
-    };
-    if !crate::git::model::valid_repository_id(&repository) {
-        return StatusCode::NOT_FOUND.into_response();
+}
+
+impl russh::server::Handler for SshConnection {
+    type Error = anyhow::Error;
+
+    async fn auth_publickey(
+        &mut self,
+        _user: &str,
+        _key: &russh::keys::PublicKey,
+    ) -> Result<russh::server::Auth, Self::Error> {
+        self.app
+            .metrics
+            .ssh_auth_denied
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(russh::server::Auth::reject())
     }
-    let service = request.uri().query().and_then(|q| {
-        url::form_urlencoded::parse(q.as_bytes())
-            .find(|(k, _)| k == "service")
-            .map(|(_, v)| v.into_owned())
-    });
-    let operation =
-        match crate::git::model::classify(request.method().as_str(), &endpoint, service.as_deref())
-        {
-            Ok(v) => v,
-            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+
+    async fn auth_openssh_certificate(
+        &mut self,
+        user: &str,
+        certificate: &russh::keys::Certificate,
+    ) -> Result<russh::server::Auth, Self::Error> {
+        let Some(_keys) = self.app.ssh_keys.as_ref() else {
+            return Ok(russh::server::Auth::reject());
         };
-    if !a.lease.is_live() {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    }
-    let token = match crate::git::auth::credential(request.headers()) {
-        Some(v) => v,
-        None => {
-            a.metrics.git_auth_denied.fetch_add(1, Ordering::Relaxed);
-            return git_auth_failure(AuthFailure::Missing);
+        let result = (|| -> anyhow::Result<crate::git::ssh::Binding> {
+            anyhow::ensure!(user == "git", "SSH username must be git");
+            anyhow::ensure!(
+                self._connection_permit.is_some(),
+                "SSH connection limit exceeded"
+            );
+            self.app.lease.assert_live()?;
+            let encoded = certificate.to_openssh()?;
+            let subject =
+                russh::keys::PublicKey::new(certificate.public_key().clone(), "").to_openssh()?;
+            let subject = crate::git::ssh::parse_public_key(&subject)?;
+            crate::git::ssh::verify_certificate_with_durable_cas(
+                &encoded,
+                &self.app.db,
+                &subject,
+                chrono::Utc::now().timestamp(),
+            )
+        })();
+        match result {
+            Ok(binding) => {
+                self.binding = Some(binding.clone());
+                self.app
+                    .metrics
+                    .ssh_auth_success
+                    .fetch_add(1, Ordering::Relaxed);
+                self.app
+                    .metrics
+                    .ssh_active_sessions
+                    .fetch_add(1, Ordering::Relaxed);
+                let _ = self.app.db.record_audit(
+                    Some(&binding.user_id),
+                    "git.ssh_authentication",
+                    Some(&binding.repository_id),
+                    "success",
+                    &json!({"identity_id":binding.identity_id,"agent_id":binding.agent_id,"client_id":binding.client_id,"integration_id":binding.integration_id,"permission":binding.permission,"fingerprint":binding.fingerprint,"issuance_id":binding.issuance_id}),
+                );
+                Ok(russh::server::Auth::Accept)
+            }
+            Err(_) => {
+                self.app
+                    .metrics
+                    .ssh_auth_denied
+                    .fetch_add(1, Ordering::Relaxed);
+                Ok(russh::server::Auth::reject())
+            }
         }
-    };
-    let now = chrono::Utc::now().timestamp();
-    if request
-        .body()
-        .size_hint()
-        .upper()
-        .is_some_and(|size| size > a.config.git_max_request_bytes)
-    {
-        a.metrics
-            .git_limit_rejections
-            .fetch_add(1, Ordering::Relaxed);
-        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     }
-    let context = match a
-        .db
-        .git_credential_context(&token, &repository, now)
-        .ok()
-        .flatten()
-    {
-        Some(v) => v,
-        None => {
-            return git_auth_failure(AuthFailure::Invalid);
-        }
-    };
-    let repo = match a.db.git_repository(&repository).ok().flatten() {
-        Some(v) if v.user_id == context.user_id => v,
-        _ => return StatusCode::NOT_FOUND.into_response(),
-    };
-    if !a.auth_rate_limit.allow(
-        format!("git:{}:{}", context.client_id, repository),
-        300,
-        Duration::from_secs(60),
-    ) {
-        a.metrics
-            .git_limit_rejections
-            .fetch_add(1, Ordering::Relaxed);
-        return StatusCode::TOO_MANY_REQUESTS.into_response();
-    }
-    if !context.integration_ids.contains(&repo.integration_id) {
-        return git_auth_failure(AuthFailure::Insufficient);
-    }
-    let Some(client_permit) = a
-        .git_client_streams
-        .try_acquire(&context.client_id, a.config.git_max_streams_per_client)
-    else {
-        a.metrics
-            .git_client_limit_rejections
-            .fetch_add(1, Ordering::Relaxed);
-        return StatusCode::TOO_MANY_REQUESTS.into_response();
-    };
-    let integration = match a
-        .db
-        .integration(&repo.integration_id, &context.user_id)
-        .ok()
-        .flatten()
-    {
-        Some(v) if v.enabled => v,
-        _ => return StatusCode::FORBIDDEN.into_response(),
-    };
-    let provider = match git_provider(&a, &integration).await {
-        Ok(v) => v,
-        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
-    };
-    let resolved = ResolvedRepository {
-        provider_repository_id: repo.provider_repository_id.clone(),
-        display_name: repo.display_name.clone(),
-        upstream_url: match url::Url::parse(&repo.upstream_url) {
-            Ok(v) => v,
-            Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
-        },
-        metadata: repo.metadata.clone(),
-    };
-    let authorization = match provider.authorize_upstream(&resolved, operation).await {
-        Ok(v) => v,
-        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
-    };
-    let mut upstream = match provider.upstream_url(&resolved) {
-        Ok(v) => v,
-        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
-    };
-    upstream.set_path(&format!(
-        "{}.git/{}",
-        upstream.path().trim_end_matches(".git"),
-        endpoint
-    ));
-    upstream.set_query(request.uri().query());
-    let (parts, body) = request.into_parts();
-    let client = match reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(a.config.git_timeout_secs))
-        .build()
-    {
-        Ok(v) => v,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-    let request_metrics = a.metrics.clone();
-    let request_max = a.config.git_max_request_bytes;
-    let idle = Duration::from_secs(a.config.git_idle_timeout_secs);
-    let mut incoming = Box::pin(body.into_data_stream());
-    let request_stream = async_stream::stream! {let mut seen=0_u64;loop{match tokio::time::timeout(idle,incoming.next()).await{Err(_)=>{yield Err::<bytes::Bytes,std::io::Error>(std::io::Error::new(std::io::ErrorKind::TimedOut,"Git request idle timeout"));break},Ok(None)=>break,Ok(Some(Err(_)))=>{yield Err::<bytes::Bytes,std::io::Error>(std::io::Error::new(std::io::ErrorKind::InvalidData,"invalid Git request body"));break},Ok(Some(Ok(bytes)))=>{seen=seen.saturating_add(bytes.len() as u64);if seen>request_max{yield Err::<bytes::Bytes,std::io::Error>(std::io::Error::new(std::io::ErrorKind::FileTooLarge,"Git request byte limit exceeded"));break}request_metrics.git_request_bytes.fetch_add(bytes.len() as u64,Ordering::Relaxed);yield Ok::<bytes::Bytes,std::io::Error>(bytes);}}}};
-    let mut outgoing = client
-        .request(parts.method, upstream)
-        .headers(crate::git::headers::request_headers(&parts.headers))
-        .body(reqwest::Body::wrap_stream(request_stream));
-    outgoing = match authorization {
-        UpstreamAuthorization::Basic { username, password } => {
-            outgoing.basic_auth(username.expose(), Some(password.expose()))
-        }
-        UpstreamAuthorization::Bearer { token } => outgoing.bearer_auth(token.expose()),
-        UpstreamAuthorization::Anonymous => outgoing,
-    };
-    let response = match tokio::time::timeout(
-        Duration::from_secs(a.config.git_timeout_secs),
-        outgoing.send(),
-    )
-    .await
-    {
-        Ok(Ok(v)) => v,
-        _ => {
-            a.metrics
-                .git_upstream_failures
+
+    async fn channel_open_session(
+        &mut self,
+        _channel: Channel<SshMsg>,
+        _session: &mut SshSession,
+    ) -> Result<bool, Self::Error> {
+        if self.binding.is_none() || self.opened_channel {
+            self.app
+                .metrics
+                .ssh_limit_rejections
                 .fetch_add(1, Ordering::Relaxed);
-            return StatusCode::BAD_GATEWAY.into_response();
+            return Ok(false);
         }
-    };
-    if response.status().is_redirection() {
-        return StatusCode::BAD_GATEWAY.into_response();
+        self.opened_channel = true;
+        Ok(true)
     }
-    let status = response.status();
-    let action = match operation {
-        GitOperation::Write => "git.push",
-        GitOperation::Read if endpoint == "info/refs" => "git.fetch",
-        GitOperation::Read => "git.clone",
-    };
-    let _=a.db.record_audit(Some(&context.user_id),action,Some(&repository),if status.is_success(){"success"}else{"upstream_denied"},&json!({"identity_id":context.identity_id,"agent_id":context.agent_id,"client_id":context.client_id,"integration_id":repo.integration_id,"operation":format!("{operation:?}"),"upstream_status":status.as_u16()}));
-    if !status.is_success() {
-        a.metrics
-            .git_upstream_failures
-            .fetch_add(1, Ordering::Relaxed);
-        return (
-            StatusCode::BAD_GATEWAY,
-            "upstream Git provider rejected the request",
-        )
-            .into_response();
+
+    async fn env_request(
+        &mut self,
+        channel: ChannelId,
+        variable_name: &str,
+        variable_value: &str,
+        session: &mut SshSession,
+    ) -> Result<(), Self::Error> {
+        if variable_name == "GIT_PROTOCOL"
+            && crate::git::ssh::parse_git_protocol(variable_value).is_ok()
+            && !self.protocols.contains_key(&channel)
+        {
+            self.protocols.insert(channel, variable_value.to_owned());
+            let _ = session.channel_success(channel);
+        } else {
+            let _ = session.channel_failure(channel);
+        }
+        Ok(())
     }
-    let headers = crate::git::headers::response_headers(response.headers());
-    let metrics = a.metrics.clone();
-    let maximum = a.config.git_max_response_bytes;
-    let idle = Duration::from_secs(a.config.git_idle_timeout_secs);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(a.config.git_timeout_secs);
-    let mut incoming = Box::pin(response.bytes_stream());
-    let stream = async_stream::stream! {let _active=active;let _client_permit=client_permit;let mut seen=0_u64;loop{let remaining=deadline.saturating_duration_since(tokio::time::Instant::now());if remaining.is_zero(){yield Err::<bytes::Bytes,std::io::Error>(std::io::Error::new(std::io::ErrorKind::TimedOut,"Git response duration limit exceeded"));break}match tokio::time::timeout(idle.min(remaining),incoming.next()).await{Err(_)=>{yield Err::<bytes::Bytes,std::io::Error>(std::io::Error::new(std::io::ErrorKind::TimedOut,"Git response timeout"));break},Ok(None)=>break,Ok(Some(Err(_)))=>{yield Err::<bytes::Bytes,std::io::Error>(std::io::Error::other("Git upstream stream failed"));break},Ok(Some(Ok(bytes)))=>{seen=seen.saturating_add(bytes.len() as u64);if seen>maximum{yield Err::<bytes::Bytes,std::io::Error>(std::io::Error::new(std::io::ErrorKind::FileTooLarge,"Git response byte limit exceeded"));break}metrics.git_response_bytes.fetch_add(bytes.len() as u64,Ordering::Relaxed);yield Ok::<bytes::Bytes,std::io::Error>(bytes);}}}};
-    let mut downstream = Response::new(Body::from_stream(stream));
-    *downstream.status_mut() = status;
-    *downstream.headers_mut() = headers;
-    downstream
+
+    async fn exec_request(
+        &mut self,
+        channel: ChannelId,
+        command: &[u8],
+        session: &mut SshSession,
+    ) -> Result<(), Self::Error> {
+        if self.executed_channel.is_some() {
+            let _ = session.channel_failure(channel);
+            return Ok(());
+        }
+        let result = std::str::from_utf8(command)
+            .map_err(anyhow::Error::from)
+            .and_then(crate::git::ssh::parse_command);
+        let Ok((service, repository_id)) = result else {
+            let _ = session.channel_failure(channel);
+            return Ok(());
+        };
+        let Some(binding) = self.binding.clone() else {
+            let _ = session.channel_failure(channel);
+            return Ok(());
+        };
+        if binding.repository_id != repository_id
+            || (service.permission() == "write" && binding.permission != "write")
+        {
+            let _ = session.channel_failure(channel);
+            return Ok(());
+        }
+        let (sender, receiver) = tokio::sync::mpsc::channel(8);
+        self.inputs.insert(channel, sender);
+        self.executed_channel = Some(channel);
+        let _ = session.channel_success(channel);
+        let app = self.app.clone();
+        let protocol = self.protocols.get(&channel).cloned();
+        let handle = session.handle();
+        tokio::spawn(async move {
+            let result = tokio::time::timeout(
+                Duration::from_secs(app.config.git_timeout_secs),
+                run_ssh_git(
+                    app.clone(),
+                    binding.clone(),
+                    service,
+                    repository_id.clone(),
+                    protocol,
+                    SshGitIo {
+                        input: receiver,
+                        output: handle.clone(),
+                        channel,
+                    },
+                ),
+            )
+            .await;
+            let status = if matches!(result, Ok(Ok(()))) { 0 } else { 1 };
+            if result.is_err() {
+                app.metrics.ssh_timeouts.fetch_add(1, Ordering::Relaxed);
+            }
+            if status != 0 {
+                app.metrics
+                    .ssh_upstream_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                let _ = app.db.record_audit(
+                    Some(&binding.user_id),
+                    "git.ssh_operation",
+                    Some(&repository_id),
+                    "failure",
+                    &json!({"identity_id":binding.identity_id,"agent_id":binding.agent_id,"client_id":binding.client_id,"integration_id":binding.integration_id,"permission":binding.permission,"transport":"ssh"}),
+                );
+                let message = match &result {
+                    Ok(Err(error)) => {
+                        format!("COG Git operation failed: {}\n", safe_error(error.as_ref()))
+                    }
+                    Err(_) => "COG Git operation timed out\n".to_owned(),
+                    Ok(Ok(())) => String::new(),
+                };
+                let _ = handle.extended_data(channel, 1, message).await;
+            }
+            let _ = handle.exit_status_request(channel, status).await;
+            let _ = handle.eof(channel).await;
+            let _ = handle.close(channel).await;
+        });
+        Ok(())
+    }
+
+    async fn data(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+        _session: &mut SshSession,
+    ) -> Result<(), Self::Error> {
+        if let Some(sender) = self.inputs.get(&channel) {
+            sender
+                .send(Ok(bytes::Bytes::copy_from_slice(data)))
+                .await
+                .map_err(|_| anyhow::anyhow!("SSH Git input closed"))?;
+        }
+        Ok(())
+    }
+
+    async fn channel_eof(
+        &mut self,
+        channel: ChannelId,
+        _session: &mut SshSession,
+    ) -> Result<(), Self::Error> {
+        self.inputs.remove(&channel);
+        Ok(())
+    }
+
+    async fn channel_close(
+        &mut self,
+        channel: ChannelId,
+        _session: &mut SshSession,
+    ) -> Result<(), Self::Error> {
+        self.inputs.remove(&channel);
+        Ok(())
+    }
+
+    async fn shell_request(
+        &mut self,
+        channel: ChannelId,
+        session: &mut SshSession,
+    ) -> Result<(), Self::Error> {
+        let _ = session.channel_failure(channel);
+        Ok(())
+    }
+
+    async fn subsystem_request(
+        &mut self,
+        channel: ChannelId,
+        _name: &str,
+        session: &mut SshSession,
+    ) -> Result<(), Self::Error> {
+        let _ = session.channel_failure(channel);
+        Ok(())
+    }
+
+    async fn pty_request(
+        &mut self,
+        channel: ChannelId,
+        _term: &str,
+        _col_width: u32,
+        _row_height: u32,
+        _pix_width: u32,
+        _pix_height: u32,
+        _modes: &[(russh::Pty, u32)],
+        session: &mut SshSession,
+    ) -> Result<(), Self::Error> {
+        let _ = session.channel_failure(channel);
+        Ok(())
+    }
+
+    async fn agent_request(
+        &mut self,
+        channel: ChannelId,
+        session: &mut SshSession,
+    ) -> Result<bool, Self::Error> {
+        let _ = session.channel_failure(channel);
+        Ok(false)
+    }
+}
+
+struct SshGitIo {
+    input: tokio::sync::mpsc::Receiver<anyhow::Result<bytes::Bytes>>,
+    output: russh::server::Handle,
+    channel: ChannelId,
+}
+
+async fn run_ssh_git(
+    app: App,
+    binding: crate::git::ssh::Binding,
+    service: crate::git::ssh::Service,
+    repository_id: String,
+    git_protocol: Option<String>,
+    io: SshGitIo,
+) -> anyhow::Result<()> {
+    let SshGitIo {
+        input,
+        output,
+        channel,
+    } = io;
+    let operation = match service {
+        crate::git::ssh::Service::UploadPack => GitOperation::Read,
+        crate::git::ssh::Service::ReceivePack => GitOperation::Write,
+    };
+    match operation {
+        GitOperation::Read => app
+            .metrics
+            .ssh_read_operations
+            .fetch_add(1, Ordering::Relaxed),
+        GitOperation::Write => app
+            .metrics
+            .ssh_write_operations
+            .fetch_add(1, Ordering::Relaxed),
+    };
+    let _global = app
+        .git_streams
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| anyhow::anyhow!("global Git stream limit exceeded"))?;
+    let _client = app
+        .git_client_streams
+        .try_acquire(&binding.client_id, app.config.git_max_streams_per_client)
+        .ok_or_else(|| anyhow::anyhow!("client Git stream limit exceeded"))?;
+    app.lease.assert_live()?;
+    let repository = app
+        .db
+        .git_repository(&repository_id)?
+        .filter(|repository| {
+            repository.user_id == binding.user_id
+                && repository.integration_id == binding.integration_id
+        })
+        .ok_or_else(|| anyhow::anyhow!("repository is no longer available"))?;
+    let grant = app
+        .db
+        .git_grant_permission(&binding.user_id, &binding.client_id, &repository_id)?
+        .ok_or_else(|| anyhow::anyhow!("repository grant has been revoked"))?;
+    anyhow::ensure!(
+        crate::git::grants::permits(&grant, operation),
+        "repository grant does not permit the operation"
+    );
+    let integration = app
+        .db
+        .integration(&binding.integration_id, &binding.user_id)?
+        .filter(|integration| integration.enabled && integration.identity_id == binding.identity_id)
+        .ok_or_else(|| anyhow::anyhow!("integration is disabled or revoked"))?;
+    let provider = git_provider(&app, &integration).await?;
+    let resolved = ResolvedRepository {
+        provider_repository_id: repository.provider_repository_id.clone(),
+        display_name: repository.display_name.clone(),
+        upstream_url: url::Url::parse(&repository.upstream_url)?,
+        metadata: repository.metadata.clone(),
+    };
+    let authorization = provider.authorize_upstream(&resolved, operation).await?;
+    let upstream = provider.upstream_url(&resolved)?;
+    let service_name = match service {
+        crate::git::ssh::Service::UploadPack => "git-upload-pack",
+        crate::git::ssh::Service::ReceivePack => "git-receive-pack",
+    };
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(app.config.git_timeout_secs))
+        .build()?;
+    let mut discovery_url = upstream.clone();
+    discovery_url.set_path(&format!(
+        "{}.git/info/refs",
+        upstream.path().trim_end_matches(".git")
+    ));
+    discovery_url.set_query(Some(&format!("service={service_name}")));
+    let mut discovery = client.get(discovery_url);
+    if let Some(protocol) = &git_protocol {
+        discovery = discovery.header("Git-Protocol", protocol);
+    }
+    discovery = crate::git::service::apply_authorization(discovery, &authorization);
+    let response = discovery.send().await?;
+    anyhow::ensure!(response.status().is_success(), "upstream discovery failed");
+    let advertisement = response.bytes().await?;
+    let advertisement = crate::git::service::strip_service_preamble(&advertisement, service_name)?;
+    output
+        .data(channel, bytes::Bytes::copy_from_slice(advertisement))
+        .await
+        .map_err(|_| anyhow::anyhow!("SSH client disconnected"))?;
+
+    // Revalidate immediately before the RPC begins. Certificate validity alone
+    // never authorizes an operation after a grant, integration, or lease change.
+    app.lease.assert_live()?;
+    anyhow::ensure!(
+        app.db
+            .git_grant_permission(&binding.user_id, &binding.client_id, &repository_id)?
+            .is_some_and(|permission| crate::git::grants::permits(&permission, operation)),
+        "repository grant has been revoked"
+    );
+    anyhow::ensure!(
+        app.db
+            .integration(&binding.integration_id, &binding.user_id)?
+            .is_some_and(|integration| integration.enabled),
+        "integration is disabled"
+    );
+    let maximum = app.config.git_max_request_bytes;
+    let idle = Duration::from_secs(app.config.git_idle_timeout_secs);
+    let upload_pack_rounds = matches!(service, crate::git::ssh::Service::UploadPack);
+    let receive_pack = matches!(service, crate::git::ssh::Service::ReceivePack);
+    let input = Arc::new(tokio::sync::Mutex::new(input));
+    let mut rpc_url = upstream;
+    rpc_url.set_path(&format!(
+        "{}.git/{service_name}",
+        rpc_url.path().trim_end_matches(".git")
+    ));
+    let mut seen = 0_u64;
+    loop {
+        let round_input = input.clone();
+        let request_metrics = app.metrics.clone();
+        let request_stream = async_stream::stream! {
+            let mut round_seen = 0_u64;
+            let mut tail = Vec::with_capacity(9);
+            let mut pack_boundary = crate::git::pack::ReceivePackBoundary::default();
+            loop {
+                let next = {
+                    let mut input = round_input.lock().await;
+                    tokio::time::timeout(idle, input.recv()).await
+                };
+                match next {
+                    Err(_) => {
+                        yield Err::<bytes::Bytes, std::io::Error>(std::io::Error::new(std::io::ErrorKind::TimedOut, "SSH Git request idle timeout"));
+                        break;
+                    }
+                    Ok(None) => break,
+                    Ok(Some(Err(error))) => {
+                        yield Err(std::io::Error::other(safe_error(error.as_ref())));
+                        break;
+                    }
+                    Ok(Some(Ok(bytes))) => {
+                        round_seen = round_seen.saturating_add(bytes.len() as u64);
+                        if round_seen > maximum {
+                            yield Err(std::io::Error::new(std::io::ErrorKind::FileTooLarge, "SSH Git request byte limit exceeded"));
+                            break;
+                        }
+                        request_metrics.ssh_request_bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                        if upload_pack_rounds {
+                            tail.extend_from_slice(&bytes);
+                            if tail.len() > 9 {
+                                tail.drain(..tail.len() - 9);
+                            }
+                        }
+                        let pack_complete = if receive_pack {
+                            match pack_boundary.push(&bytes) {
+                                Ok(complete) => complete,
+                                Err(error) => {
+                                    yield Err(std::io::Error::new(std::io::ErrorKind::InvalidData, safe_error(error.as_ref())));
+                                    break;
+                                }
+                            }
+                        } else {
+                            false
+                        };
+                        yield Ok(bytes);
+                        if (upload_pack_rounds && (tail.ends_with(b"0000") || tail.ends_with(b"0009done\n"))) || pack_complete {
+                            break;
+                        }
+                    }
+                }
+            }
+        };
+        let mut request = client
+            .post(rpc_url.clone())
+            .header(
+                header::CONTENT_TYPE,
+                format!("application/x-{service_name}-request"),
+            )
+            .header(
+                header::ACCEPT,
+                format!("application/x-{service_name}-result"),
+            )
+            .body(reqwest::Body::wrap_stream(request_stream));
+        if let Some(protocol) = &git_protocol {
+            request = request.header("Git-Protocol", protocol);
+        }
+        request = crate::git::service::apply_authorization(request, &authorization);
+        let response = request.send().await?;
+        anyhow::ensure!(response.status().is_success(), "upstream Git RPC failed");
+        let mut body = response.bytes_stream();
+        let mut marker = Vec::new();
+        let mut saw_packfile = false;
+        while let Some(chunk) = tokio::time::timeout(idle, body.next())
+            .await
+            .map_err(|_| anyhow::anyhow!("SSH Git response idle timeout"))?
+        {
+            let chunk = chunk?;
+            seen = seen.saturating_add(chunk.len() as u64);
+            anyhow::ensure!(
+                seen <= app.config.git_max_response_bytes,
+                "SSH Git response byte limit exceeded"
+            );
+            marker.extend_from_slice(&chunk);
+            saw_packfile |= marker.windows(9).any(|window| window == b"packfile\n")
+                || marker.windows(4).any(|window| window == b"PACK");
+            if marker.len() > 64 {
+                marker.drain(..marker.len() - 64);
+            }
+            app.metrics
+                .ssh_response_bytes
+                .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+            output
+                .data(channel, chunk)
+                .await
+                .map_err(|_| anyhow::anyhow!("SSH client disconnected"))?;
+        }
+        let final_round = receive_pack || saw_packfile;
+        if final_round {
+            break;
+        }
+    }
+    app.db.record_audit(
+        Some(&binding.user_id),
+        match operation {
+            GitOperation::Read => "git.ssh_read",
+            GitOperation::Write => "git.ssh_write",
+        },
+        Some(&repository_id),
+        "success",
+        &json!({"identity_id":binding.identity_id,"agent_id":binding.agent_id,"client_id":binding.client_id,"integration_id":binding.integration_id,"permission":binding.permission,"issuance_id":binding.issuance_id,"transport":"ssh","protocol":git_protocol.as_deref().unwrap_or("version=0")}),
+    )?;
+    Ok(())
 }
 
 fn build_store(c: &Config) -> anyhow::Result<Arc<dyn ObjectStore>> {
@@ -1545,7 +2155,9 @@ async fn health() -> Json<Value> {
 async fn readiness(State(a): State<App>) -> impl IntoResponse {
     let live = a.lease.is_live();
     let pending = a.replicator.pending_txids();
-    let status = if live && pending == 0 {
+    let ssh_configured = a.config.ssh_listen.is_some();
+    let ssh_ready = a.ssh_ready.load(Ordering::Acquire);
+    let status = if live && pending == 0 && (!ssh_configured || ssh_ready) {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
@@ -1562,6 +2174,15 @@ async fn readiness(State(a): State<App>) -> impl IntoResponse {
             "replication": {
                 "durable_txid": a.replicator.durable_txid(),
                 "pending_txids": pending
+            },
+            "ssh": {
+                "configured": ssh_configured,
+                "ready": ssh_ready,
+                "listen": a.config.ssh_listen.map(|address| address.to_string()),
+                "publicHost": a.config.ssh_public_host,
+                "publicPort": a.config.ssh_public_port.or_else(|| a.config.ssh_listen.map(|address| address.port())),
+                "hostKeyFingerprint": a.ssh_keys.as_ref().and_then(|keys| keys.read().ok().map(|keys| crate::git::ssh::fingerprint(keys.host.public_key()))),
+                "userCaFingerprint": a.ssh_keys.as_ref().and_then(|keys| keys.read().ok().map(|keys| crate::git::ssh::fingerprint(keys.user_ca.public_key())))
             }
         })),
     )
@@ -1586,14 +2207,15 @@ async fn metrics(State(a): State<App>) -> impl IntoResponse {
             "# TYPE cog_v8_limit_hits_total counter\ncog_v8_limit_hits_total {}\n",
             "# TYPE cog_upstream_calls_total counter\ncog_upstream_calls_total {}\n",
             "# TYPE cog_upstream_failures_total counter\ncog_upstream_failures_total {}\n",
-            "# TYPE cog_git_active_streams gauge\ncog_git_active_streams {}\n",
-            "# TYPE cog_git_operations_total counter\ncog_git_operations_total {}\n",
-            "# TYPE cog_git_auth_denied_total counter\ncog_git_auth_denied_total {}\n",
-            "# TYPE cog_git_upstream_failures_total counter\ncog_git_upstream_failures_total {}\n",
-            "# TYPE cog_git_request_bytes_total counter\ncog_git_request_bytes_total {}\n",
-            "# TYPE cog_git_response_bytes_total counter\ncog_git_response_bytes_total {}\n",
-            "# TYPE cog_git_limit_rejections_total counter\ncog_git_limit_rejections_total {}\n",
-            "# TYPE cog_git_client_limit_rejections_total counter\ncog_git_client_limit_rejections_total {}\n"
+            "# TYPE cog_ssh_handshakes_total counter\ncog_ssh_handshakes_total {}\n",
+            "# TYPE cog_ssh_auth_total counter\ncog_ssh_auth_total{{result=\"success\"}} {}\ncog_ssh_auth_total{{result=\"denied\"}} {}\n",
+            "# TYPE cog_ssh_active_sessions gauge\ncog_ssh_active_sessions {}\n",
+            "# TYPE cog_ssh_operations_total counter\ncog_ssh_operations_total{{operation=\"read\"}} {}\ncog_ssh_operations_total{{operation=\"write\"}} {}\n",
+            "# TYPE cog_ssh_bytes_total counter\ncog_ssh_bytes_total{{direction=\"request\"}} {}\ncog_ssh_bytes_total{{direction=\"response\"}} {}\n",
+            "# TYPE cog_ssh_timeouts_total counter\ncog_ssh_timeouts_total {}\n",
+            "# TYPE cog_ssh_limit_rejections_total counter\ncog_ssh_limit_rejections_total {}\n",
+            "# TYPE cog_ssh_upstream_failures_total counter\ncog_ssh_upstream_failures_total {}\n",
+            "# TYPE cog_ssh_certificates_total counter\ncog_ssh_certificates_total{{result=\"issued\"}} {}\ncog_ssh_certificates_total{{result=\"denied\"}} {}\n"
         ),
         u8::from(a.lease.is_live()),
         a.lease.generation(),
@@ -1604,16 +2226,19 @@ async fn metrics(State(a): State<App>) -> impl IntoResponse {
         a.metrics.v8_limit_hits.load(Ordering::Relaxed),
         a.metrics.upstream_calls.load(Ordering::Relaxed),
         a.metrics.upstream_failures.load(Ordering::Relaxed),
-        a.metrics.git_active_streams.load(Ordering::Relaxed),
-        a.metrics.git_operations.load(Ordering::Relaxed),
-        a.metrics.git_auth_denied.load(Ordering::Relaxed),
-        a.metrics.git_upstream_failures.load(Ordering::Relaxed),
-        a.metrics.git_request_bytes.load(Ordering::Relaxed),
-        a.metrics.git_response_bytes.load(Ordering::Relaxed),
-        a.metrics.git_limit_rejections.load(Ordering::Relaxed),
-        a.metrics
-            .git_client_limit_rejections
-            .load(Ordering::Relaxed),
+        a.metrics.ssh_handshakes.load(Ordering::Relaxed),
+        a.metrics.ssh_auth_success.load(Ordering::Relaxed),
+        a.metrics.ssh_auth_denied.load(Ordering::Relaxed),
+        a.metrics.ssh_active_sessions.load(Ordering::Relaxed),
+        a.metrics.ssh_read_operations.load(Ordering::Relaxed),
+        a.metrics.ssh_write_operations.load(Ordering::Relaxed),
+        a.metrics.ssh_request_bytes.load(Ordering::Relaxed),
+        a.metrics.ssh_response_bytes.load(Ordering::Relaxed),
+        a.metrics.ssh_timeouts.load(Ordering::Relaxed),
+        a.metrics.ssh_limit_rejections.load(Ordering::Relaxed),
+        a.metrics.ssh_upstream_failures.load(Ordering::Relaxed),
+        a.metrics.ssh_certificates_issued.load(Ordering::Relaxed),
+        a.metrics.ssh_certificates_denied.load(Ordering::Relaxed),
     );
     (
         [(http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
@@ -1918,6 +2543,15 @@ async fn ui_bootstrap(State(a): State<App>, headers: HeaderMap) -> impl IntoResp
         let grants=a.db.identity_grants(&user,&identity.id).unwrap_or_default();
         json!({"id":identity.id,"name":identity.name,"created_at":identity.created_at,"updated_at":identity.updated_at,"connections":connections,"agents":agents,"grants":grants})
     }).collect::<Vec<_>>();
+    let ssh_keys = a.db.ssh_keys().unwrap_or_default().into_iter().map(|key| json!({
+        "id":key.id,
+        "purpose":key.purpose,
+        "algorithm":key.algorithm,
+        "fingerprint":ssh_key::PublicKey::from_openssh(&key.public_key).ok().map(|key| crate::git::ssh::fingerprint(&key)),
+        "created_at":key.created_at,
+        "active":key.active,
+        "retirement_time":key.retirement_time
+    })).collect::<Vec<_>>();
     Json(json!({
         "mode": "admin",
         "user": user,
@@ -1926,6 +2560,17 @@ async fn ui_bootstrap(State(a): State<App>, headers: HeaderMap) -> impl IntoResp
         "clients": clients,
         "tokens": tokens,
         "identities": identities,
+        "ssh": {
+            "configured": a.config.ssh_listen.is_some(),
+            "ready": a.ssh_ready.load(Ordering::Acquire),
+            "public_host": a.config.ssh_public_host,
+            "public_port": a.config.ssh_public_port.or_else(|| a.config.ssh_listen.map(|address| address.port())),
+            "certificate_ttl_seconds": a.config.ssh_certificate_ttl_secs,
+            "keys": ssh_keys
+        },
+        "git_transport_usage": {
+            "ssh_operations": a.metrics.ssh_read_operations.load(Ordering::Relaxed) + a.metrics.ssh_write_operations.load(Ordering::Relaxed)
+        }
     }))
     .into_response()
 }
@@ -1940,6 +2585,156 @@ struct UiIntegrationForm {
 struct UiNameForm {
     name: String,
     csrf_token: String,
+}
+
+async fn ui_prepare_ssh_key(
+    State(a): State<App>,
+    Path(purpose): Path<String>,
+    headers: HeaderMap,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    let _mutation = a.mutations.lock().await;
+    let user = match ui_user(&a, &headers, &form.csrf_token) {
+        Ok(user) => user,
+        Err(error) => return (StatusCode::FORBIDDEN, error).into_response(),
+    };
+    let result = (|| -> anyhow::Result<crate::db::SshKeyRecord> {
+        a.lease.assert_live()?;
+        anyhow::ensure!(
+            matches!(purpose.as_str(), "host" | "user_ca"),
+            "invalid SSH key purpose"
+        );
+        let key = crate::git::ssh::generate_key()?;
+        let public = key.public_key().to_openssh()?;
+        let encrypted = a.secrets.seal(&crate::git::ssh::encode_private(&key)?)?;
+        a.db.prepare_ssh_key(&purpose, &public, &encrypted)
+    })();
+    match result {
+        Ok(key) => {
+            let fingerprint = ssh_key::PublicKey::from_openssh(&key.public_key)
+                .map(|key| crate::git::ssh::fingerprint(&key))
+                .unwrap_or_else(|_| "invalid".into());
+            if let Err(error) = a.db.record_audit(
+                Some(&user),
+                "git.ssh_key.prepare",
+                Some(&key.id),
+                "success",
+                &json!({"purpose":purpose,"fingerprint":fingerprint}),
+            ) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    safe_error(error.as_ref()),
+                )
+                    .into_response();
+            }
+            if let Err(error) = persist(&a).await {
+                return (StatusCode::SERVICE_UNAVAILABLE, safe_error(error.as_ref()))
+                    .into_response();
+            }
+            Redirect::to("/ui").into_response()
+        }
+        Err(error) => (StatusCode::BAD_REQUEST, safe_error(error.as_ref())).into_response(),
+    }
+}
+
+async fn ui_activate_ssh_key(
+    State(a): State<App>,
+    Path((purpose, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    let _mutation = a.mutations.lock().await;
+    let user = match ui_user(&a, &headers, &form.csrf_token) {
+        Ok(user) => user,
+        Err(error) => return (StatusCode::FORBIDDEN, error).into_response(),
+    };
+    if purpose == "host" && a.ssh_ready.load(Ordering::Acquire) {
+        return (
+            StatusCode::CONFLICT,
+            "disable SSH and restart COG before activating a prepared host key",
+        )
+            .into_response();
+    }
+    let overlap = if purpose == "user_ca" {
+        a.config.ssh_certificate_max_ttl_secs as i64 + 60
+    } else {
+        86_400
+    };
+    let result =
+        a.db.activate_ssh_key(&id, &purpose, chrono::Utc::now().timestamp() + overlap);
+    if let Err(error) = result {
+        return (StatusCode::BAD_REQUEST, safe_error(error.as_ref())).into_response();
+    }
+    if let Err(error) = a.db.record_audit(
+        Some(&user),
+        "git.ssh_key.activate",
+        Some(&id),
+        "success",
+        &json!({"purpose":purpose,"overlap_until":chrono::Utc::now().timestamp()+overlap}),
+    ) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            safe_error(error.as_ref()),
+        )
+            .into_response();
+    }
+    if let Err(error) = persist(&a).await {
+        return (StatusCode::SERVICE_UNAVAILABLE, safe_error(error.as_ref())).into_response();
+    }
+    if purpose == "user_ca" {
+        match crate::git::ssh::KeySet::load_or_create(&a.db, &a.secrets) {
+            Ok(loaded) => {
+                if let Some(keys) = &a.ssh_keys {
+                    match keys.write() {
+                        Ok(mut keys) => keys.user_ca = loaded.user_ca,
+                        Err(_) => {
+                            return (StatusCode::INTERNAL_SERVER_ERROR, "SSH key lock poisoned")
+                                .into_response();
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    safe_error(error.as_ref()),
+                )
+                    .into_response();
+            }
+        }
+    }
+    Redirect::to("/ui").into_response()
+}
+
+async fn ui_retire_ssh_key(
+    State(a): State<App>,
+    Path((purpose, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    let _mutation = a.mutations.lock().await;
+    let user = match ui_user(&a, &headers, &form.csrf_token) {
+        Ok(user) => user,
+        Err(error) => return (StatusCode::FORBIDDEN, error).into_response(),
+    };
+    match a.db.retire_ssh_key(&id, chrono::Utc::now().timestamp()) {
+        Ok(()) => {
+            let _ = a.db.record_audit(
+                Some(&user),
+                "git.ssh_key.retire",
+                Some(&id),
+                "success",
+                &json!({"purpose":purpose}),
+            );
+            match persist(&a).await {
+                Ok(()) => Redirect::to("/ui").into_response(),
+                Err(error) => {
+                    (StatusCode::SERVICE_UNAVAILABLE, safe_error(error.as_ref())).into_response()
+                }
+            }
+        }
+        Err(error) => (StatusCode::BAD_REQUEST, safe_error(error.as_ref())).into_response(),
+    }
 }
 async fn ui_create_identity(
     State(a): State<App>,
@@ -3262,23 +4057,6 @@ fn auth_failure(a: &App, failure: AuthFailure, scope: &str) -> axum::response::R
     (
         status,
         [(http::header::WWW_AUTHENTICATE, challenge)],
-        "unauthorized",
-    )
-        .into_response()
-}
-
-fn git_auth_failure(failure: AuthFailure) -> axum::response::Response {
-    if matches!(failure, AuthFailure::Internal) {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-    let status = if matches!(failure, AuthFailure::Insufficient) {
-        StatusCode::FORBIDDEN
-    } else {
-        StatusCode::UNAUTHORIZED
-    };
-    (
-        status,
-        [(http::header::WWW_AUTHENTICATE, "Basic realm=\"cog-git\"")],
         "unauthorized",
     )
         .into_response()
@@ -5507,103 +6285,15 @@ mod tests {
     use super::*;
     use axum::{
         Router,
+        body::Body,
         extract::State,
+        http::Request,
         routing::{get, post},
     };
     use http_body_util::BodyExt;
     use object_store::memory::InMemory;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tower::ServiceExt;
-
-    #[derive(Clone)]
-    struct FakeGitProvider {
-        upstream: url::Url,
-        authorizations: Arc<std::sync::Mutex<Vec<GitOperation>>>,
-    }
-    #[async_trait::async_trait]
-    impl GitProvider for FakeGitProvider {
-        async fn resolve_repository(
-            &self,
-            reference: &RepositoryReference,
-        ) -> anyhow::Result<ResolvedRepository> {
-            Ok(ResolvedRepository {
-                provider_repository_id: reference.0.clone(),
-                display_name: reference.0.clone(),
-                upstream_url: self.upstream.clone(),
-                metadata: json!({}),
-            })
-        }
-        async fn authorize_upstream(
-            &self,
-            _: &ResolvedRepository,
-            operation: GitOperation,
-        ) -> anyhow::Result<UpstreamAuthorization> {
-            self.authorizations.lock().unwrap().push(operation);
-            Ok(UpstreamAuthorization::Basic {
-                username: crate::git::SecretValue::new("provider-user"),
-                password: crate::git::SecretValue::new("provider-secret"),
-            })
-        }
-        fn upstream_url(&self, _: &ResolvedRepository) -> anyhow::Result<url::Url> {
-            Ok(self.upstream.clone())
-        }
-    }
-
-    type GitUpstreamCalls = Vec<(String, HeaderMap, Vec<u8>)>;
-    #[derive(Clone, Default)]
-    struct GitUpstreamFixture(Arc<std::sync::Mutex<GitUpstreamCalls>>);
-    async fn fake_git_upstream(
-        State(state): State<GitUpstreamFixture>,
-        request: Request<Body>,
-    ) -> Response {
-        let (parts, body) = request.into_parts();
-        let call_index = {
-            let mut calls = state.0.lock().unwrap();
-            let index = calls.len();
-            calls.push((parts.uri.to_string(), parts.headers, Vec::new()));
-            index
-        };
-        let bytes = body
-            .collect()
-            .await
-            .map(|body| body.to_bytes().to_vec())
-            .unwrap_or_default();
-        state.0.lock().unwrap()[call_index].2 = bytes;
-        if parts.uri.path().contains("redirect") {
-            return (
-                StatusCode::FOUND,
-                [(header::LOCATION, "https://example.com/")],
-            )
-                .into_response();
-        }
-        if parts.uri.path().contains("failure") {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "provider-secret oauth-token installation-secret",
-            )
-                .into_response();
-        }
-        if parts.uri.path().contains("slow-headers") {
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
-        if parts.uri.path().contains("slow-body") {
-            let body = Body::from_stream(async_stream::stream! {
-                yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"0008NAK\n"));
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                yield Ok(bytes::Bytes::from_static(b"0000"));
-            });
-            return Response::new(body);
-        }
-        let mut response = Response::new(Body::from("0008NAK\n"));
-        response.headers_mut().insert(
-            header::CONTENT_TYPE,
-            "application/x-git-upload-pack-result".parse().unwrap(),
-        );
-        response
-            .headers_mut()
-            .insert(header::SET_COOKIE, "secret=value".parse().unwrap());
-        response
-    }
 
     #[test]
     fn client_stream_limit_is_isolated_and_permits_release_on_drop() {
@@ -5615,741 +6305,6 @@ mod tests {
         assert!(limiter.try_acquire("client-a", 1).is_some());
         drop(other);
         assert!(limiter.active.lock().unwrap().get("client-b").is_none());
-    }
-
-    #[tokio::test]
-    async fn git_proxy_is_provider_neutral_filters_headers_and_authorizes_before_io() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let fixture = GitUpstreamFixture::default();
-        let server = tokio::spawn(
-            axum::serve(
-                listener,
-                Router::new()
-                    .route("/{*path}", axum::routing::any(fake_git_upstream))
-                    .with_state(fixture.clone()),
-            )
-            .into_future(),
-        );
-        let (app, _directory) = route_test_app().await;
-        let user = app.db.create_user("git-proxy@example.com", "hash").unwrap();
-        app.db
-            .register_client(
-                "git-client",
-                Some(&user),
-                "git client",
-                &["http://localhost/cb".into()],
-            )
-            .unwrap();
-        let integration = app
-            .db
-            .create_integration(&user, "fake git", "git", &json!({"kind":"git"}), None)
-            .unwrap();
-        let resolved = ResolvedRepository {
-            provider_repository_id: "repo-1".into(),
-            display_name: "owner/repo".into(),
-            upstream_url: format!("http://{address}/owner/repo").parse().unwrap(),
-            metadata: json!({}),
-        };
-        let repository = app
-            .db
-            .upsert_git_repository(&user, &integration, &resolved)
-            .unwrap();
-        let mcp_oauth = "oauth-secret";
-        app.db
-            .store_access_token(
-                &token_hash(mcp_oauth),
-                "git-client",
-                &user,
-                &format!("mcp git:write integration:{integration}"),
-                chrono::Utc::now().timestamp() + 300,
-                None,
-                None,
-            )
-            .unwrap();
-        let oauth: &'static str = Box::leak({
-            app.db
-                .set_git_grant(&user, "git-client", &repository.id, "write")
-                .unwrap();
-            app.db
-                .issue_git_credential(&user, "git-client", &repository.id, "write", 900)
-                .unwrap()
-                .into_boxed_str()
-        });
-        let authorizations = Arc::new(std::sync::Mutex::new(Vec::new()));
-        app.git_providers.lock().await.insert(
-            integration.clone(),
-            Arc::new(FakeGitProvider {
-                upstream: resolved.upstream_url.clone(),
-                authorizations: authorizations.clone(),
-            }),
-        );
-        let router = build_router(app.clone());
-        let request = |token: &str, endpoint: &str, service: Option<&str>, body: &'static str| {
-            let suffix = service.map(|v| format!("?service={v}")).unwrap_or_default();
-            Request::builder()
-                .method(if endpoint == "info/refs" {
-                    "GET"
-                } else {
-                    "POST"
-                })
-                .uri(format!("/git/{}.git/{endpoint}{suffix}", repository.id))
-                .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                .header("git-protocol", "version=2")
-                .header("x-forbidden", "drop-me")
-                .body(Body::from(body))
-                .unwrap()
-        };
-        let missing = router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(format!(
-                        "/git/{}.git/info/refs?service=git-upload-pack",
-                        repository.id
-                    ))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(
-            missing.headers()[header::WWW_AUTHENTICATE],
-            "Basic realm=\"cog-git\""
-        );
-        let read = router
-            .clone()
-            .oneshot(request(oauth, "info/refs", Some("git-upload-pack"), ""))
-            .await
-            .unwrap();
-        assert_eq!(read.status(), StatusCode::OK);
-        assert!(read.headers().get(header::SET_COOKIE).is_none());
-        read.into_body().collect().await.unwrap();
-        let write = router
-            .clone()
-            .oneshot(request(oauth, "git-receive-pack", None, "push-body"))
-            .await
-            .unwrap();
-        assert_eq!(write.status(), StatusCode::OK);
-        write.into_body().collect().await.unwrap();
-        {
-            let calls = fixture.0.lock().unwrap();
-            assert_eq!(calls.len(), 2);
-            assert_eq!(calls[1].2, b"push-body");
-            assert_eq!(calls[1].1["git-protocol"], "version=2");
-            assert!(calls[1].1.get("x-forbidden").is_none());
-            assert!(
-                calls[1].1[header::AUTHORIZATION]
-                    .to_str()
-                    .unwrap()
-                    .starts_with("Basic ")
-            );
-        }
-        assert_eq!(
-            *authorizations.lock().unwrap(),
-            vec![GitOperation::Read, GitOperation::Write]
-        );
-        app.db
-            .register_client(
-                "other-client",
-                Some(&user),
-                "other",
-                &["http://localhost/other".into()],
-            )
-            .unwrap();
-        let other = "other-oauth";
-        app.db
-            .store_access_token(
-                &token_hash(other),
-                "other-client",
-                &user,
-                "mcp",
-                chrono::Utc::now().timestamp() + 300,
-                None,
-                None,
-            )
-            .unwrap();
-        let before = fixture.0.lock().unwrap().len();
-        let wrong_client = router
-            .clone()
-            .oneshot(request(other, "git-upload-pack", None, "fetch"))
-            .await
-            .unwrap();
-        assert_eq!(wrong_client.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(fixture.0.lock().unwrap().len(), before);
-
-        app.db
-            .update_integration(&integration, &user, None, None, Some(false), None)
-            .unwrap();
-        let disabled = router
-            .clone()
-            .oneshot(request(oauth, "git-upload-pack", None, "fetch"))
-            .await
-            .unwrap();
-        assert_eq!(disabled.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(fixture.0.lock().unwrap().len(), before);
-        app.db
-            .update_integration(&integration, &user, None, None, Some(true), None)
-            .unwrap();
-
-        app.git_providers.lock().await.insert(
-            integration.clone(),
-            Arc::new(FakeGitProvider {
-                upstream: format!("http://{address}/redirect").parse().unwrap(),
-                authorizations: authorizations.clone(),
-            }),
-        );
-        let redirected = router
-            .clone()
-            .oneshot(request(oauth, "git-upload-pack", None, "fetch"))
-            .await
-            .unwrap();
-        assert_eq!(redirected.status(), StatusCode::BAD_GATEWAY);
-
-        app.git_providers.lock().await.insert(
-            integration.clone(),
-            Arc::new(FakeGitProvider {
-                upstream: format!("http://{address}/failure").parse().unwrap(),
-                authorizations: authorizations.clone(),
-            }),
-        );
-        let failed = router
-            .clone()
-            .oneshot(request(oauth, "git-upload-pack", None, "fetch"))
-            .await
-            .unwrap();
-        assert_eq!(failed.status(), StatusCode::BAD_GATEWAY);
-        let failure_body = failed.into_body().collect().await.unwrap().to_bytes();
-        let failure_text = String::from_utf8_lossy(&failure_body);
-        assert!(failure_text.contains("provider rejected"));
-        assert!(!failure_text.contains("provider-secret"));
-
-        let unused = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let unused_address = unused.local_addr().unwrap();
-        drop(unused);
-        app.git_providers.lock().await.insert(
-            integration.clone(),
-            Arc::new(FakeGitProvider {
-                upstream: format!("http://{unused_address}/unavailable")
-                    .parse()
-                    .unwrap(),
-                authorizations: authorizations.clone(),
-            }),
-        );
-        let unavailable = router
-            .clone()
-            .oneshot(request(oauth, "git-upload-pack", None, "fetch"))
-            .await
-            .unwrap();
-        assert_eq!(unavailable.status(), StatusCode::BAD_GATEWAY);
-
-        app.git_providers.lock().await.insert(
-            integration.clone(),
-            Arc::new(FakeGitProvider {
-                upstream: format!("http://{address}/slow-headers").parse().unwrap(),
-                authorizations: authorizations.clone(),
-            }),
-        );
-        let mut timeout_app = app.clone();
-        timeout_app.config.git_timeout_secs = 1;
-        let timed_out = build_router(timeout_app)
-            .oneshot(request(oauth, "git-upload-pack", None, "fetch"))
-            .await
-            .unwrap();
-        assert_eq!(timed_out.status(), StatusCode::BAD_GATEWAY);
-
-        app.git_providers.lock().await.insert(
-            integration.clone(),
-            Arc::new(FakeGitProvider {
-                upstream: format!("http://{address}/slow-body").parse().unwrap(),
-                authorizations: authorizations.clone(),
-            }),
-        );
-        let mut duration_app = app.clone();
-        duration_app.config.git_timeout_secs = 1;
-        let duration_limited = build_router(duration_app)
-            .oneshot(request(oauth, "git-upload-pack", None, "fetch"))
-            .await
-            .unwrap();
-        assert_eq!(duration_limited.status(), StatusCode::OK);
-        assert!(duration_limited.into_body().collect().await.is_err());
-
-        let mut limited_app = app.clone();
-        limited_app.config.git_max_request_bytes = 3;
-        let limited = build_router(limited_app)
-            .oneshot(request(oauth, "git-receive-pack", None, "oversized"))
-            .await
-            .unwrap();
-        assert_eq!(limited.status(), StatusCode::PAYLOAD_TOO_LARGE);
-
-        // Response limits are enforced while streaming and release both stream
-        // permits when the downstream observes the terminal body error.
-        app.git_providers.lock().await.insert(
-            integration.clone(),
-            Arc::new(FakeGitProvider {
-                upstream: resolved.upstream_url.clone(),
-                authorizations: authorizations.clone(),
-            }),
-        );
-        let mut response_limited_app = app.clone();
-        response_limited_app.config.git_max_response_bytes = 3;
-        let response_limited = build_router(response_limited_app)
-            .oneshot(request(oauth, "git-upload-pack", None, "fetch"))
-            .await
-            .unwrap();
-        assert_eq!(response_limited.status(), StatusCode::OK);
-        assert!(response_limited.into_body().collect().await.is_err());
-
-        let mut cancellation_app = app.clone();
-        cancellation_app.config.git_max_streams_per_client = 1;
-        let cancellation_router = build_router(cancellation_app);
-        let abandoned = cancellation_router
-            .clone()
-            .oneshot(request(oauth, "git-upload-pack", None, "fetch"))
-            .await
-            .unwrap();
-        let backpressured = cancellation_router
-            .clone()
-            .oneshot(request(oauth, "git-upload-pack", None, "fetch"))
-            .await
-            .unwrap();
-        assert_eq!(backpressured.status(), StatusCode::TOO_MANY_REQUESTS);
-        drop(abandoned);
-        let after_cancellation = cancellation_router
-            .oneshot(request(oauth, "git-upload-pack", None, "fetch"))
-            .await
-            .unwrap();
-        assert_eq!(after_cancellation.status(), StatusCode::OK);
-        after_cancellation.into_body().collect().await.unwrap();
-
-        // A request body that fails after the first push chunk is sent exactly
-        // once. The gateway never retries a non-idempotent receive-pack.
-        let calls_before_partial = fixture.0.lock().unwrap().len();
-        let partial_body = Body::from_stream(async_stream::stream! {
-            yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"first-push-chunk"));
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            yield Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionReset,
-                "downstream cancelled",
-            ));
-        });
-        let partial = Request::builder()
-            .method("POST")
-            .uri(format!("/git/{}.git/git-receive-pack", repository.id))
-            .header(header::AUTHORIZATION, format!("Bearer {oauth}"))
-            .body(partial_body)
-            .unwrap();
-        let partial_response = router.clone().oneshot(partial).await.unwrap();
-        let _ = partial_response.into_body().collect().await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert_eq!(fixture.0.lock().unwrap().len(), calls_before_partial + 1);
-
-        // Missing provider credentials fail before any provider network call.
-        app.git_providers.lock().await.remove(&integration);
-        let before_disconnected = fixture.0.lock().unwrap().len();
-        let disconnected = router
-            .clone()
-            .oneshot(request(oauth, "git-upload-pack", None, "fetch"))
-            .await
-            .unwrap();
-        assert_eq!(disconnected.status(), StatusCode::BAD_GATEWAY);
-        assert_eq!(fixture.0.lock().unwrap().len(), before_disconnected);
-        app.git_providers.lock().await.insert(
-            integration.clone(),
-            Arc::new(FakeGitProvider {
-                upstream: resolved.upstream_url.clone(),
-                authorizations: authorizations.clone(),
-            }),
-        );
-
-        // Expired OAuth access is rejected before repository/provider lookup.
-        let expired = "expired-oauth";
-        app.db
-            .store_access_token(
-                &token_hash(expired),
-                "git-client",
-                &user,
-                &format!("mcp git:write integration:{integration}"),
-                chrono::Utc::now().timestamp() - 1,
-                None,
-                None,
-            )
-            .unwrap();
-        let before_expired = fixture.0.lock().unwrap().len();
-        let expired_response = router
-            .clone()
-            .oneshot(request(expired, "git-upload-pack", None, "fetch"))
-            .await
-            .unwrap();
-        assert_eq!(expired_response.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(fixture.0.lock().unwrap().len(), before_expired);
-
-        let control = GitControlProvider {
-            app: app.clone(),
-            auth: AuthContext {
-                user: user.clone(),
-                agent: "test-agent".into(),
-                identity: "test-identity".into(),
-                client: "git-client".into(),
-                scopes: HashSet::from([format!("integration:{integration}")]),
-                integrations: HashSet::from([integration.clone()]),
-            },
-        };
-        let tools = control.tools().await.unwrap();
-        assert_eq!(tools.len(), 2);
-        assert!(tools.iter().any(|tool| tool.name == "repository_access"));
-        assert!(tools.iter().any(|tool| tool.name == "sealed_credentials"));
-        let allowed = control
-            .call(
-                "repository_access",
-                json!({"integrationId":integration,"repository":"owner/pending"}),
-            )
-            .await
-            .unwrap();
-        let pending_repo = app
-            .db
-            .git_repository_by_provider(&user, &integration, "owner/pending")
-            .unwrap()
-            .unwrap();
-        assert!(
-            allowed["remoteUrl"]
-                .as_str()
-                .unwrap()
-                .contains(&pending_repo.id)
-        );
-        assert_eq!(allowed["credential"]["source"], "sealed_credentials");
-        assert_eq!(
-            app.db
-                .git_grant_permission(&user, "git-client", &pending_repo.id)
-                .unwrap()
-                .as_deref(),
-            Some("write")
-        );
-        let (recipient_secret, recipient_public_key) = crate::git::sealed::new_recipient();
-        let sealed_request = crate::git::sealed::SealedCredentialRequest {
-            repository_id: pending_repo.id.clone(),
-            recipient_public_key,
-            request_nonce: crate::crypto::random_token(32),
-        };
-        let sealed = control
-            .call(
-                "sealed_credentials",
-                serde_json::to_value(&sealed_request).unwrap(),
-            )
-            .await
-            .unwrap();
-        let visible = serde_json::to_string(&sealed).unwrap();
-        assert!(!visible.contains("password"));
-        assert!(!visible.contains("cog_git_"));
-        let payload =
-            crate::git::sealed::open(&serde_json::from_value(sealed).unwrap(), &recipient_secret)
-                .unwrap();
-        assert_eq!(payload.repository_id, pending_repo.id);
-        assert!(payload.password.starts_with("cog_git_"));
-        assert!(control.call("unknown", json!({})).await.is_err());
-        if let Authority::S3(lease) = &app.lease {
-            lease.relinquish().await.unwrap();
-        }
-        let stale = router
-            .oneshot(request(oauth, "git-upload-pack", None, "fetch"))
-            .await
-            .unwrap();
-        assert_eq!(stale.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let stale_control = GitControlProvider {
-            app: app.clone(),
-            auth: AuthContext {
-                user: user.clone(),
-                agent: "test-agent".into(),
-                identity: "test-identity".into(),
-                client: "git-client".into(),
-                scopes: HashSet::from([format!("integration:{integration}")]),
-                integrations: HashSet::from([integration.clone()]),
-            },
-        };
-        assert!(
-            stale_control
-                .call(
-                    "repository_access",
-                    json!({"integrationId":integration,"repository":"owner/repo"})
-                )
-                .await
-                .is_err()
-        );
-        server.abort();
-    }
-
-    #[derive(Clone)]
-    struct GitHttpBackendFixture {
-        project_root: std::path::PathBuf,
-        protocol_v2: Arc<AtomicBool>,
-    }
-
-    async fn git_http_backend(
-        State(state): State<GitHttpBackendFixture>,
-        request: Request<Body>,
-    ) -> Response {
-        let (parts, body) = request.into_parts();
-        let body = match body.collect().await {
-            Ok(body) => body.to_bytes(),
-            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
-        };
-        let method = parts.method.to_string();
-        let path = parts.uri.path().to_owned();
-        let query = parts.uri.query().unwrap_or_default().to_owned();
-        let content_type = parts
-            .headers
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .to_owned();
-        let git_protocol = parts
-            .headers
-            .get("git-protocol")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        if git_protocol.as_deref() == Some("version=2") {
-            state.protocol_v2.store(true, Ordering::SeqCst);
-        }
-        let root = state.project_root;
-        let output = tokio::task::spawn_blocking(move || {
-            let mut command = std::process::Command::new("git");
-            command
-                .arg("http-backend")
-                .env("GIT_PROJECT_ROOT", root)
-                .env("GIT_HTTP_EXPORT_ALL", "1")
-                .env("REQUEST_METHOD", method)
-                .env("PATH_INFO", path)
-                .env("QUERY_STRING", query)
-                .env("CONTENT_TYPE", content_type)
-                .env("CONTENT_LENGTH", body.len().to_string())
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped());
-            if let Some(protocol) = git_protocol {
-                command.env("HTTP_GIT_PROTOCOL", protocol);
-            }
-            let mut child = command.spawn()?;
-            use std::io::Write;
-            child.stdin.take().unwrap().write_all(&body)?;
-            child.wait_with_output()
-        })
-        .await;
-        let Ok(Ok(output)) = output else {
-            return StatusCode::BAD_GATEWAY.into_response();
-        };
-        if !output.status.success() {
-            return StatusCode::BAD_GATEWAY.into_response();
-        }
-        let Some(split) = output
-            .stdout
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-        else {
-            return StatusCode::BAD_GATEWAY.into_response();
-        };
-        let raw_headers = &output.stdout[..split];
-        let payload = output.stdout[split + 4..].to_vec();
-        let mut response = Response::new(Body::from(payload));
-        for line in String::from_utf8_lossy(raw_headers).lines() {
-            let Some((name, value)) = line.split_once(": ") else {
-                continue;
-            };
-            if name.eq_ignore_ascii_case("status") {
-                if let Some(code) = value.split_whitespace().next().and_then(|v| v.parse().ok()) {
-                    *response.status_mut() = StatusCode::from_u16(code).unwrap();
-                }
-            } else if let (Ok(name), Ok(value)) = (
-                http::HeaderName::from_bytes(name.as_bytes()),
-                http::HeaderValue::from_str(value),
-            ) {
-                response.headers_mut().append(name, value);
-            }
-        }
-        response
-    }
-
-    fn git(directory: &std::path::Path, arguments: &[&str]) {
-        git_with_bearer(directory, arguments, None)
-    }
-
-    fn git_with_bearer(directory: &std::path::Path, arguments: &[&str], bearer: Option<&str>) {
-        let mut command = std::process::Command::new("git");
-        if let Some(token) = bearer {
-            command
-                .arg("-c")
-                .arg(format!("http.extraHeader=Authorization: Bearer {token}"));
-        }
-        let output = command
-            .args(arguments)
-            .current_dir(directory)
-            .env("GIT_AUTHOR_NAME", "Cog Test")
-            .env("GIT_AUTHOR_EMAIL", "cog@example.test")
-            .env("GIT_COMMITTER_NAME", "Cog Test")
-            .env("GIT_COMMITTER_EMAIL", "cog@example.test")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git {arguments:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn real_git_clone_fetch_pull_push_and_set_upstream_use_smart_http_v2() {
-        if std::process::Command::new("git")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            return;
-        }
-        let directory = tempfile::tempdir().unwrap();
-        let bare = directory.path().join("owner/repo.git");
-        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
-        git(
-            directory.path(),
-            &["init", "--bare", bare.to_str().unwrap()],
-        );
-        let seed = directory.path().join("seed");
-        git(directory.path(), &["init", seed.to_str().unwrap()]);
-        std::fs::write(seed.join("README.md"), "initial\n").unwrap();
-        git(&seed, &["add", "README.md"]);
-        git(&seed, &["commit", "-m", "initial"]);
-        git(&seed, &["branch", "-M", "main"]);
-        git(&seed, &["remote", "add", "origin", bare.to_str().unwrap()]);
-        git(&seed, &["push", "origin", "main"]);
-        git(&bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
-        git(&bare, &["config", "http.receivepack", "true"]);
-
-        let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let backend_address = backend_listener.local_addr().unwrap();
-        let protocol_v2 = Arc::new(AtomicBool::new(false));
-        let backend = tokio::spawn(
-            axum::serve(
-                backend_listener,
-                Router::new()
-                    .route("/{*path}", axum::routing::any(git_http_backend))
-                    .with_state(GitHttpBackendFixture {
-                        project_root: directory.path().to_path_buf(),
-                        protocol_v2: protocol_v2.clone(),
-                    }),
-            )
-            .into_future(),
-        );
-
-        let (app, _app_directory) = route_test_app().await;
-        let user = app.db.create_user("real-git@example.com", "hash").unwrap();
-        app.db
-            .register_client(
-                "real-git",
-                Some(&user),
-                "git",
-                &["http://localhost/cb".into()],
-            )
-            .unwrap();
-        let integration = app
-            .db
-            .create_integration(&user, "git", "git", &json!({"kind":"git"}), None)
-            .unwrap();
-        let resolved = ResolvedRepository {
-            provider_repository_id: "fixture-repo".into(),
-            display_name: "owner/repo".into(),
-            upstream_url: format!("http://{backend_address}/owner/repo")
-                .parse()
-                .unwrap(),
-            metadata: json!({}),
-        };
-        let repository = app
-            .db
-            .upsert_git_repository(&user, &integration, &resolved)
-            .unwrap();
-        let mcp_oauth = "real-git-oauth";
-        app.db
-            .store_access_token(
-                &token_hash(mcp_oauth),
-                "real-git",
-                &user,
-                &format!("mcp git:write integration:{integration}"),
-                chrono::Utc::now().timestamp() + 300,
-                None,
-                None,
-            )
-            .unwrap();
-        app.db
-            .set_git_grant(&user, "real-git", &repository.id, "write")
-            .unwrap();
-        let oauth = app
-            .db
-            .issue_git_credential(&user, "real-git", &repository.id, "write", 900)
-            .unwrap();
-        app.git_providers.lock().await.insert(
-            integration,
-            Arc::new(FakeGitProvider {
-                upstream: resolved.upstream_url,
-                authorizations: Default::default(),
-            }),
-        );
-        let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let gateway_address = gateway_listener.local_addr().unwrap();
-        let gateway = tokio::spawn(
-            axum::serve(gateway_listener, build_router(app).into_make_service()).into_future(),
-        );
-        let remote = format!("http://{gateway_address}/git/{}.git", repository.id);
-        let clone = directory.path().join("clone");
-        git_with_bearer(
-            directory.path(),
-            &[
-                "-c",
-                "protocol.version=2",
-                "clone",
-                &remote,
-                clone.to_str().unwrap(),
-            ],
-            Some(&oauth),
-        );
-        let fallback = directory.path().join("fallback-clone");
-        git_with_bearer(
-            directory.path(),
-            &[
-                "-c",
-                "protocol.version=0",
-                "clone",
-                &remote,
-                fallback.to_str().unwrap(),
-            ],
-            Some(&oauth),
-        );
-        assert!(fallback.join("README.md").exists());
-        std::fs::write(clone.join("from-clone.txt"), "push\n").unwrap();
-        git(&clone, &["add", "from-clone.txt"]);
-        git(&clone, &["commit", "-m", "push"]);
-        git(&clone, &["checkout", "-b", "fixture-branch"]);
-        git_with_bearer(
-            &clone,
-            &["push", "--set-upstream", "origin", "fixture-branch"],
-            Some(&oauth),
-        );
-        git(&clone, &["checkout", "main"]);
-        git(&clone, &["reset", "--hard", "origin/main"]);
-        std::fs::write(seed.join("README.md"), "initial\nupstream\n").unwrap();
-        git(&seed, &["add", "README.md"]);
-        git(&seed, &["commit", "-m", "upstream"]);
-        git(&seed, &["push", "origin", "main"]);
-        git_with_bearer(&clone, &["fetch", "origin"], Some(&oauth));
-        std::fs::write(seed.join("README.md"), "initial\nupstream\npull\n").unwrap();
-        git(&seed, &["add", "README.md"]);
-        git(&seed, &["commit", "-m", "pull"]);
-        git(&seed, &["push", "origin", "main"]);
-        git_with_bearer(
-            &clone,
-            &["pull", "--ff-only", "origin", "main"],
-            Some(&oauth),
-        );
-        assert!(protocol_v2.load(Ordering::SeqCst));
-        gateway.abort();
-        backend.abort();
     }
 
     struct PolicyFixture;
@@ -6549,6 +6504,16 @@ mod tests {
                 git_idle_timeout_secs: 10,
                 git_max_streams: 4,
                 git_max_streams_per_client: 2,
+                ssh_listen: None,
+                ssh_public_host: None,
+                ssh_public_port: None,
+                ssh_certificate_ttl_secs: 900,
+                ssh_certificate_max_ttl_secs: 900,
+                ssh_handshake_timeout_secs: 15,
+                ssh_auth_timeout_secs: 15,
+                ssh_channel_timeout_secs: 30,
+                ssh_max_connections: 64,
+                ssh_max_channels_per_connection: 1,
                 server_local_callbacks: crate::config::ServerLocalCallbacks::Off,
             },
             db: db.clone(),
@@ -6563,6 +6528,9 @@ mod tests {
             git_providers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             git_streams: Arc::new(tokio::sync::Semaphore::new(4)),
             git_client_streams: Arc::new(ClientStreamLimiter::default()),
+            ssh_keys: None,
+            ssh_ready: Arc::new(AtomicBool::new(false)),
+            ssh_connections: Arc::new(tokio::sync::Semaphore::new(64)),
         };
         let user = db.create_user("owner@example.com", "hash").unwrap();
         let missing = auth_failure(&app, AuthFailure::Missing, "mcp");
@@ -6800,6 +6768,16 @@ mod tests {
                     git_idle_timeout_secs: 10,
                     git_max_streams: 4,
                     git_max_streams_per_client: 2,
+                    ssh_listen: None,
+                    ssh_public_host: None,
+                    ssh_public_port: None,
+                    ssh_certificate_ttl_secs: 900,
+                    ssh_certificate_max_ttl_secs: 900,
+                    ssh_handshake_timeout_secs: 15,
+                    ssh_auth_timeout_secs: 15,
+                    ssh_channel_timeout_secs: 30,
+                    ssh_max_connections: 64,
+                    ssh_max_channels_per_connection: 1,
                     server_local_callbacks: crate::config::ServerLocalCallbacks::Off,
                 },
                 db,
@@ -6814,6 +6792,9 @@ mod tests {
                 git_providers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 git_streams: Arc::new(tokio::sync::Semaphore::new(4)),
                 git_client_streams: Arc::new(ClientStreamLimiter::default()),
+                ssh_keys: None,
+                ssh_ready: Arc::new(AtomicBool::new(false)),
+                ssh_connections: Arc::new(tokio::sync::Semaphore::new(64)),
             },
             directory,
         )
@@ -9280,7 +9261,7 @@ mod tests {
         assert!(source.contains("all of its connections, agents, credentials, and grants"));
         assert!(source.contains("function Consent()"));
         assert!(source.contains("payload.identities[0]?.id"));
-        assert!(source.contains("identity===\"\""));
+        assert!(source.contains("identity === \"\""));
         assert!(source.contains("action=\"/api/oauth/consent\""));
         assert!(source.contains("function GitHubInstallationComplete()"));
         assert!(source.contains("/github/app/installation/complete"));

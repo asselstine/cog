@@ -1,0 +1,16 @@
+[advisories]
+# quick-xml 0.37 is locked by rustyriver -> object_store 0.11. COG does not
+# enable or parse Azure XML responses through that dependency; S3 operations
+# use the separately pinned object_store 0.14 tree, which carries quick-xml
+# 0.41. Remove these exceptions when rustyriver updates its dependency.
+ignore = [
+  "RUSTSEC-2026-0194",
+  "RUSTSEC-2026-0195",
+  # RSA is not enabled in COG's russh feature set (Ed25519-only) and neither
+  # version appears in the selected cargo tree, but optional lockfile packages
+  # are still scanned by cargo-audit.
+  "RUSTSEC-2023-0071",
+  # paste is a V8 build-time proc macro and has no runtime surface. This is an
+  # unmaintained warning, not a vulnerability; track removal with the V8 tree.
+  "RUSTSEC-2024-0436",
+]

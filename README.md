@@ -89,6 +89,14 @@ Important configuration:
 | `COG_MASTER_KEY` | generated | Optional explicit secret; otherwise stored in `<cog-home>/master.key`. |
 | `COG_BASE_URL` | `http://localhost:4788` | Public origin used for OAuth metadata and callbacks. Use HTTPS in production. |
 | `COG_LISTEN` | `127.0.0.1:4788` | HTTP listen address. Docker explicitly uses `0.0.0.0:4788`. |
+| `COG_SSH_LISTEN` | `127.0.0.1:2222` | Embedded Git-over-SSH TCP listener. Set `0.0.0.0:2222` for a directly published host/container port. This is not routed by an HTTP reverse proxy. |
+| `COG_SSH_PUBLIC_HOST` | `COG_BASE_URL` host | Public DNS host advertised to Git clients. |
+| `COG_SSH_PUBLIC_PORT` | listen port | Externally reachable SSH port when it differs from the listener port. |
+| `COG_SSH_CERTIFICATE_TTL_SECS` | `900` | User-certificate lifetime; cannot exceed the configured maximum or 15 minutes. |
+| `COG_SSH_HANDSHAKE_TIMEOUT_SECS` | `15` | Maximum SSH handshake interval. |
+| `COG_SSH_AUTH_TIMEOUT_SECS` | `15` | Maximum authentication interval. |
+| `COG_SSH_CHANNEL_TIMEOUT_SECS` | `30` | Idle unauthenticated/session-channel interval. |
+| `COG_SSH_MAX_CONNECTIONS` | `64` | Concurrent SSH connection ceiling. |
 | `COG_DATA_DIR` | `<cog-home>/data` | SQLite working-state directory. Docker explicitly uses `/data`. |
 | `COG_S3_PREFIX` | `cog/` | Object prefix reserved for cog. |
 | `COG_S3_ENDPOINT` | AWS endpoint | Custom S3-compatible endpoint. |
