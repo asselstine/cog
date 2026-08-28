@@ -24,7 +24,7 @@ http = "1"
 jsonwebtoken = "9"
 lz4_flex = { version = "0.11", features = ["frame"] }
 libc = "0.2"
-object_store = { version = "0.12", features = ["aws"] }
+object_store = { version = "0.14", features = ["aws"] }
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
 rust-embed = "8"

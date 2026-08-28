@@ -6,7 +6,7 @@
 //! and the remote position advances only after object-store writes complete.
 
 use futures_util::TryStreamExt;
-use object_store::{ObjectStore, PutMode, PutOptions, path::Path};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, path::Path};
 use rustyriver::{Db, ReplicaClient, TXID, ltx::FileInfo, restore};
 use std::{
     collections::HashSet,

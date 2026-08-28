@@ -1,0 +1,12 @@
+[advisories]
+# rustyriver 0.1.0 pins object_store 0.11, whose AWS feature pins the affected
+# quick-xml 0.37 line. COG's direct object_store dependency is on the fixed
+# 0.14/quick-xml 0.41 line; remove these exceptions when rustyriver updates.
+ignore = [
+  "RUSTSEC-2026-0194",
+  "RUSTSEC-2026-0195",
+
+  # paste is build-time-only here, through the latest published v8 crate.
+  # Remove this exception when v8 no longer depends on paste 1.0.15.
+  "RUSTSEC-2024-0436",
+]

@@ -1,6 +1,6 @@
 use crate::diagnostics::redacted_error;
 use bytes::Bytes;
-use object_store::{ObjectStore, PutMode, PutOptions, UpdateVersion, path::Path};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion, path::Path};
 use serde::{Deserialize, Serialize};
 use std::{
     sync::{

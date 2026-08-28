@@ -1,7 +1,9 @@
 use cog::lease::{LeaseError, LeaseGuard, probe_conditional_writes};
 use cog::{db::Database, ltx::Replicator};
 use futures_util::StreamExt;
-use object_store::{ObjectStore, aws::AmazonS3Builder, memory::InMemory, path::Path};
+use object_store::{
+    ObjectStore, ObjectStoreExt, aws::AmazonS3Builder, memory::InMemory, path::Path,
+};
 use std::{
     fs,
     process::{Child, Command, Stdio},
@@ -283,12 +285,7 @@ async fn two_process_takeover_restores_and_excludes_stale_owner() {
         &prefix,
         19188,
     )
-    .args([
-        "create-user",
-        "--email",
-        "owner@example.com",
-        "--password-stdin",
-    ])
+    .args(["create-user", "owner@example.com", "--password-stdin"])
     .stdin(Stdio::piped())
     .spawn()
     .and_then(|mut child| {
