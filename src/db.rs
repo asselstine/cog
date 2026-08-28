@@ -24,8 +24,8 @@ impl StorageMode {
 
 const MIGRATIONS: &str = r#"
 PRAGMA foreign_keys=ON;
-CREATE TABLE IF NOT EXISTS schema_meta(version INTEGER NOT NULL);
-INSERT INTO schema_meta(version) SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM schema_meta);
+CREATE TABLE IF NOT EXISTS schema_meta(version INTEGER NOT NULL CHECK(version = 2));
+INSERT INTO schema_meta(version) SELECT 2 WHERE NOT EXISTS (SELECT 1 FROM schema_meta);
 CREATE TABLE IF NOT EXISTS cog_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS users(
  id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
@@ -35,24 +35,49 @@ CREATE TABLE IF NOT EXISTS sessions(
  token_hash BLOB PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
  expires_at INTEGER NOT NULL, csrf_hash BLOB
 );
-CREATE TABLE IF NOT EXISTS integrations(
+CREATE TABLE IF NOT EXISTS identities(
  id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
- name TEXT NOT NULL, transport TEXT NOT NULL, config_json TEXT NOT NULL,
+ name TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+ UNIQUE(user_id,name)
+);
+CREATE TABLE IF NOT EXISTS integrations(
+ id TEXT PRIMARY KEY, identity_id TEXT NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
+ user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ display_name TEXT NOT NULL, provider_name TEXT, provider_account TEXT,
+ name TEXT NOT NULL,
+ transport TEXT NOT NULL, config_json TEXT NOT NULL,
  secret_ciphertext TEXT, enabled INTEGER NOT NULL DEFAULT 1,
- created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(user_id,name)
+ created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+ UNIQUE(identity_id,display_name)
 );
 CREATE TABLE IF NOT EXISTS oauth_clients(
  client_id TEXT PRIMARY KEY, user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
- redirect_uris TEXT NOT NULL, client_name TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+ redirect_uris TEXT NOT NULL, registered_name TEXT NOT NULL, client_name TEXT NOT NULL,
+ created_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+CREATE TABLE IF NOT EXISTS agents(
+ id TEXT PRIMARY KEY, identity_id TEXT NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
+ oauth_client_id TEXT NOT NULL UNIQUE REFERENCES oauth_clients(client_id) ON DELETE CASCADE,
+ display_name TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+ last_used_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS identity_grants(
+ identity_id TEXT NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
+ capability TEXT NOT NULL, resource_id TEXT NOT NULL DEFAULT '',
+ permission TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, revoked_at INTEGER,
+ PRIMARY KEY(identity_id,capability,resource_id)
 );
 CREATE TABLE IF NOT EXISTS oauth_codes(
  code_hash BLOB PRIMARY KEY, client_id TEXT NOT NULL REFERENCES oauth_clients(client_id) ON DELETE CASCADE,
- user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, redirect_uri TEXT NOT NULL,
+ agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+ identity_id TEXT NOT NULL REFERENCES identities(id) ON DELETE CASCADE, redirect_uri TEXT NOT NULL,
+ user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
  scope TEXT NOT NULL, challenge TEXT NOT NULL, expires_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS oauth_tokens(
  token_hash BLOB PRIMARY KEY, token_id TEXT UNIQUE, client_id TEXT NOT NULL REFERENCES oauth_clients(client_id) ON DELETE CASCADE,
- user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, scope TEXT NOT NULL,
+ agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE, scope TEXT NOT NULL,
+ user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
  issued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, refresh_hash BLOB UNIQUE, refresh_expires_at INTEGER,
  last_used_at INTEGER
 );
@@ -87,28 +112,34 @@ CREATE TABLE IF NOT EXISTS git_repositories(
  UNIQUE(integration_id,provider_repository_id)
 );
 CREATE TABLE IF NOT EXISTS git_repository_grants(
+ identity_id TEXT NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
  client_id TEXT NOT NULL REFERENCES oauth_clients(client_id) ON DELETE CASCADE,
  repository_id TEXT NOT NULL REFERENCES git_repositories(id) ON DELETE CASCADE,
  permission TEXT NOT NULL CHECK(permission IN ('read','write')), created_at INTEGER NOT NULL,
- revoked_at INTEGER, last_used_at INTEGER, PRIMARY KEY(client_id,repository_id)
+ revoked_at INTEGER, last_used_at INTEGER, PRIMARY KEY(identity_id,repository_id)
 );
 CREATE TABLE IF NOT EXISTS git_credentials(
- credential_hash BLOB PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ credential_hash BLOB PRIMARY KEY, identity_id TEXT NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
+ agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+ user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
  client_id TEXT NOT NULL REFERENCES oauth_clients(client_id) ON DELETE CASCADE,
  repository_id TEXT NOT NULL REFERENCES git_repositories(id) ON DELETE CASCADE,
  permission TEXT NOT NULL CHECK(permission IN ('read','write')), issued_at INTEGER NOT NULL,
  expires_at INTEGER NOT NULL, last_used_at INTEGER, revoked_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS git_credential_bootstraps(
- bootstrap_hash BLOB PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ bootstrap_hash BLOB PRIMARY KEY, identity_id TEXT NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
+ agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+ user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
  client_id TEXT NOT NULL REFERENCES oauth_clients(client_id) ON DELETE CASCADE,
  repository_id TEXT NOT NULL REFERENCES git_repositories(id) ON DELETE CASCADE,
  permission TEXT NOT NULL CHECK(permission IN ('read','write')), issued_at INTEGER NOT NULL,
  expires_at INTEGER NOT NULL, consumed_at INTEGER, revoked_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS git_pending_requests(
- id_hash BLOB PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ id_hash BLOB PRIMARY KEY, identity_id TEXT NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
+ user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
  client_id TEXT NOT NULL REFERENCES oauth_clients(client_id) ON DELETE CASCADE,
  integration_id TEXT NOT NULL REFERENCES integrations(id) ON DELETE CASCADE,
  repository_id TEXT NOT NULL REFERENCES git_repositories(id) ON DELETE CASCADE,
@@ -121,6 +152,11 @@ CREATE TABLE IF NOT EXISTS github_app_setups(
  integration_id TEXT NOT NULL UNIQUE REFERENCES integrations(id) ON DELETE CASCADE,
  expires_at INTEGER NOT NULL, app_slug TEXT, manifest_completed_at INTEGER
 );
+CREATE INDEX IF NOT EXISTS identities_user_id ON identities(user_id);
+CREATE INDEX IF NOT EXISTS agents_identity_id ON agents(identity_id);
+CREATE INDEX IF NOT EXISTS integrations_identity_id ON integrations(identity_id);
+CREATE INDEX IF NOT EXISTS identity_grants_active ON identity_grants(identity_id,revoked_at);
+CREATE INDEX IF NOT EXISTS oauth_tokens_client_id ON oauth_tokens(client_id);
 "#;
 
 #[derive(Clone)]
@@ -129,10 +165,34 @@ pub struct Database(Arc<Mutex<Connection>>);
 pub struct Integration {
     pub id: String,
     pub user_id: String,
+    pub identity_id: String,
     pub name: String,
+    pub provider_name: Option<String>,
+    pub provider_account: Option<String>,
     pub transport: String,
     pub config: serde_json::Value,
     pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Identity {
+    pub id: String,
+    pub user_id: String,
+    pub name: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Agent {
+    pub id: String,
+    pub identity_id: String,
+    pub oauth_client_id: String,
+    pub registered_name: String,
+    pub display_name: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub last_used_at: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -181,7 +241,7 @@ pub struct AgentClient {
     pub client_id: String,
     pub client_name: String,
     pub redirect_uris: Vec<String>,
-    pub created_at: String,
+    pub created_at: i64,
     pub scopes: Vec<String>,
     pub integration_ids: Vec<String>,
 }
@@ -200,7 +260,9 @@ pub struct AgentToken {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenContext {
     pub user_id: String,
+    pub agent_id: String,
     pub client_id: String,
+    pub identity_id: String,
     pub scopes: Vec<String>,
     pub integration_ids: Vec<String>,
 }
@@ -215,6 +277,45 @@ fn git_repo_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::git::GitRepo
         upstream_url: row.get(5)?,
         metadata: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
     })
+}
+
+fn normalize_display_name(value: &str) -> anyhow::Result<String> {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    anyhow::ensure!(!normalized.is_empty(), "name is required");
+    anyhow::ensure!(normalized.chars().count() <= 128, "name is too long");
+    anyhow::ensure!(
+        normalized.chars().all(|c| !c.is_control()),
+        "name contains control characters"
+    );
+    Ok(normalized)
+}
+fn split_grant(scope: &str) -> (String, String) {
+    if let Some(id) = scope.strip_prefix("integration:") {
+        ("integration".into(), id.into())
+    } else {
+        (scope.into(), String::new())
+    }
+}
+fn agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Agent> {
+    Ok(Agent {
+        id: row.get(0)?,
+        identity_id: row.get(1)?,
+        oauth_client_id: row.get(2)?,
+        registered_name: row.get(3)?,
+        display_name: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+        last_used_at: row.get(7)?,
+    })
+}
+fn agent_for_client_conn(conn: &Connection, client: &str) -> anyhow::Result<Option<Agent>> {
+    Ok(conn.query_row("SELECT a.id,a.identity_id,a.oauth_client_id,c.registered_name,a.display_name,a.created_at,a.updated_at,a.last_used_at FROM agents a JOIN oauth_clients c ON c.client_id=a.oauth_client_id WHERE a.oauth_client_id=?",[client],agent_row).optional()?)
+}
+fn agent_for_client_tx(
+    tx: &rusqlite::Transaction<'_>,
+    client: &str,
+) -> anyhow::Result<Option<Agent>> {
+    Ok(tx.query_row("SELECT a.id,a.identity_id,a.oauth_client_id,c.registered_name,a.display_name,a.created_at,a.updated_at,a.last_used_at FROM agents a JOIN oauth_clients c ON c.client_id=a.oauth_client_id WHERE a.oauth_client_id=?",[client],agent_row).optional()?)
 }
 
 impl Database {
@@ -261,7 +362,7 @@ impl Database {
             "invalid Git permission"
         );
         let now = chrono::Utc::now().timestamp();
-        self.transact(|tx|{let owned:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM git_repositories WHERE id=? AND user_id=?)",params![repository,user],|r|r.get(0))?;anyhow::ensure!(owned,"repository not found");tx.execute("INSERT INTO git_repository_grants(user_id,client_id,repository_id,permission,created_at,revoked_at) VALUES(?,?,?,?,?,NULL) ON CONFLICT(client_id,repository_id) DO UPDATE SET permission=excluded.permission,revoked_at=NULL",params![user,client,repository,permission,now])?;if permission=="read"{tx.execute("UPDATE git_credentials SET revoked_at=? WHERE user_id=? AND client_id=? AND repository_id=? AND permission='write' AND revoked_at IS NULL",params![now,user,client,repository])?;tx.execute("UPDATE git_credential_bootstraps SET revoked_at=? WHERE user_id=? AND client_id=? AND repository_id=? AND permission='write' AND revoked_at IS NULL",params![now,user,client,repository])?;}Ok(())})
+        self.transact(|tx|{let identity:String=tx.query_row("SELECT a.identity_id FROM agents a JOIN identities i ON i.id=a.identity_id JOIN git_repositories r ON r.id=? JOIN integrations n ON n.id=r.integration_id WHERE a.oauth_client_id=? AND i.user_id=? AND n.identity_id=a.identity_id",params![repository,client,user],|r|r.get(0))?;tx.execute("INSERT INTO git_repository_grants(identity_id,user_id,client_id,repository_id,permission,created_at,revoked_at) VALUES(?,?,?,?,?,?,NULL) ON CONFLICT(identity_id,repository_id) DO UPDATE SET permission=excluded.permission,revoked_at=NULL",params![identity,user,client,repository,permission,now])?;if permission=="read"{tx.execute("UPDATE git_credentials SET revoked_at=? WHERE identity_id=? AND repository_id=? AND permission='write' AND revoked_at IS NULL",params![now,identity,repository])?;tx.execute("UPDATE git_credential_bootstraps SET revoked_at=? WHERE identity_id=? AND repository_id=? AND permission='write' AND revoked_at IS NULL",params![now,identity,repository])?;}Ok(())})
     }
     pub fn revoke_git_grant(
         &self,
@@ -270,7 +371,7 @@ impl Database {
         repository: &str,
     ) -> anyhow::Result<bool> {
         let now = chrono::Utc::now().timestamp();
-        self.transact(|tx|{let changed=tx.execute("UPDATE git_repository_grants SET revoked_at=? WHERE user_id=? AND client_id=? AND repository_id=? AND revoked_at IS NULL",params![now,user,client,repository])?;tx.execute("UPDATE git_credentials SET revoked_at=? WHERE user_id=? AND client_id=? AND repository_id=? AND revoked_at IS NULL",params![now,user,client,repository])?;tx.execute("UPDATE git_credential_bootstraps SET revoked_at=? WHERE user_id=? AND client_id=? AND repository_id=? AND revoked_at IS NULL",params![now,user,client,repository])?;Ok(changed>0)})
+        self.transact(|tx|{let identity:Option<String>=tx.query_row("SELECT a.identity_id FROM agents a JOIN identities i ON i.id=a.identity_id WHERE a.oauth_client_id=? AND i.user_id=?",params![client,user],|r|r.get(0)).optional()?;let Some(identity)=identity else{return Ok(false)};let changed=tx.execute("UPDATE git_repository_grants SET revoked_at=? WHERE identity_id=? AND repository_id=? AND revoked_at IS NULL",params![now,identity,repository])?;tx.execute("UPDATE git_credentials SET revoked_at=? WHERE identity_id=? AND repository_id=? AND revoked_at IS NULL",params![now,identity,repository])?;tx.execute("UPDATE git_credential_bootstraps SET revoked_at=? WHERE identity_id=? AND repository_id=? AND revoked_at IS NULL",params![now,identity,repository])?;Ok(changed>0)})
     }
     pub fn git_grant_permission(
         &self,
@@ -282,7 +383,7 @@ impl Database {
             .0
             .lock()
             .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
-        Ok(conn.query_row("SELECT permission FROM git_repository_grants WHERE user_id=? AND client_id=? AND repository_id=? AND revoked_at IS NULL",params![user,client,repository],|r|r.get(0)).optional()?)
+        Ok(conn.query_row("SELECT g.permission FROM git_repository_grants g JOIN agents a ON a.identity_id=g.identity_id JOIN identities i ON i.id=a.identity_id WHERE i.user_id=? AND a.oauth_client_id=? AND g.repository_id=? AND g.revoked_at IS NULL",params![user,client,repository],|r|r.get(0)).optional()?)
     }
     pub fn touch_git_grant(
         &self,
@@ -291,7 +392,7 @@ impl Database {
         repository: &str,
         now: i64,
     ) -> anyhow::Result<()> {
-        self.transact(|tx|{tx.execute("UPDATE git_repository_grants SET last_used_at=? WHERE user_id=? AND client_id=? AND repository_id=? AND revoked_at IS NULL",params![now,user,client,repository])?;Ok(())})
+        self.transact(|tx|{tx.execute("UPDATE git_repository_grants SET last_used_at=? WHERE repository_id=? AND identity_id IN(SELECT a.identity_id FROM agents a JOIN identities i ON i.id=a.identity_id WHERE a.oauth_client_id=? AND i.user_id=?) AND revoked_at IS NULL",params![now,repository,client,user])?;Ok(())})
     }
     pub fn list_git_grants(
         &self,
@@ -302,7 +403,7 @@ impl Database {
             .0
             .lock()
             .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
-        let mut s=conn.prepare("SELECT r.id,r.user_id,r.integration_id,r.provider_repository_id,r.display_name,r.upstream_url,r.metadata_json,g.permission,g.last_used_at FROM git_repository_grants g JOIN git_repositories r ON r.id=g.repository_id WHERE g.user_id=? AND g.client_id=? AND g.revoked_at IS NULL ORDER BY r.display_name")?;
+        let mut s=conn.prepare("SELECT r.id,r.user_id,r.integration_id,r.provider_repository_id,r.display_name,r.upstream_url,r.metadata_json,g.permission,g.last_used_at FROM git_repository_grants g JOIN git_repositories r ON r.id=g.repository_id JOIN agents a ON a.identity_id=g.identity_id JOIN identities i ON i.id=a.identity_id WHERE i.user_id=? AND a.oauth_client_id=? AND g.revoked_at IS NULL ORDER BY r.display_name")?;
         let rows = s.query_map(params![user, client], |r| {
             Ok(crate::git::model::RepositoryGrant {
                 repository: crate::git::GitRepository {
@@ -339,7 +440,7 @@ impl Database {
     ) -> anyhow::Result<String> {
         let token = format!("cog_git_{}", crate::crypto::random_token(32));
         let now = chrono::Utc::now().timestamp();
-        self.transact(|tx|{tx.execute("INSERT INTO git_credentials(credential_hash,user_id,client_id,repository_id,permission,issued_at,expires_at) VALUES(?,?,?,?,?,?,?)",params![crate::crypto::token_hash(&token).as_slice(),user,client,repository,permission,now,now+ttl])?;Ok(())})?;
+        self.transact(|tx|{let(agent,identity):(String,String)=tx.query_row("SELECT a.id,a.identity_id FROM agents a JOIN identities i ON i.id=a.identity_id WHERE a.oauth_client_id=? AND i.user_id=?",params![client,user],|r|Ok((r.get(0)?,r.get(1)?)))?;tx.execute("INSERT INTO git_credentials(credential_hash,identity_id,agent_id,user_id,client_id,repository_id,permission,issued_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?)",params![crate::crypto::token_hash(&token).as_slice(),identity,agent,user,client,repository,permission,now,now+ttl])?;Ok(())})?;
         Ok(token)
     }
     pub fn issue_git_bootstrap(
@@ -363,7 +464,8 @@ impl Database {
         let now = chrono::Utc::now().timestamp();
         self.transact(|tx| {
             tx.execute("DELETE FROM git_credential_bootstraps WHERE expires_at<=? OR consumed_at IS NOT NULL OR revoked_at IS NOT NULL", [now])?;
-            tx.execute("INSERT INTO git_credential_bootstraps(bootstrap_hash,user_id,client_id,repository_id,permission,issued_at,expires_at) VALUES(?,?,?,?,?,?,?)", params![hash.as_slice(),user,client,repository,permission,now,now+ttl])?;
+            let(agent,identity):(String,String)=tx.query_row("SELECT a.id,a.identity_id FROM agents a JOIN identities i ON i.id=a.identity_id WHERE a.oauth_client_id=? AND i.user_id=?",params![client,user],|r|Ok((r.get(0)?,r.get(1)?)))?;
+            tx.execute("INSERT INTO git_credential_bootstraps(bootstrap_hash,identity_id,agent_id,user_id,client_id,repository_id,permission,issued_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?)", params![hash.as_slice(),identity,agent,user,client,repository,permission,now,now+ttl])?;
             Ok(())
         })?;
         Ok(capability)
@@ -392,7 +494,8 @@ impl Database {
             let changed = tx.execute("UPDATE git_credential_bootstraps SET consumed_at=? WHERE bootstrap_hash=? AND consumed_at IS NULL", params![now,hash.as_slice()])?;
             anyhow::ensure!(changed == 1, "Git bootstrap was already consumed");
             let token = format!("cog_git_{}", crate::crypto::random_token(32));
-            tx.execute("INSERT INTO git_credentials(credential_hash,user_id,client_id,repository_id,permission,issued_at,expires_at) VALUES(?,?,?,?,?,?,?)", params![crate::crypto::token_hash(&token).as_slice(),user,client,repository,requested_permission,now,now+900])?;
+            let(agent,identity):(String,String)=tx.query_row("SELECT a.id,a.identity_id FROM agents a JOIN identities i ON i.id=a.identity_id WHERE a.oauth_client_id=? AND i.user_id=?",params![client,user],|r|Ok((r.get(0)?,r.get(1)?)))?;
+            tx.execute("INSERT INTO git_credentials(credential_hash,identity_id,agent_id,user_id,client_id,repository_id,permission,issued_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?)", params![crate::crypto::token_hash(&token).as_slice(),identity,agent,user,client,repository,requested_permission,now,now+900])?;
             Ok(Some(token))
         })
     }
@@ -422,7 +525,7 @@ impl Database {
         let hash = crate::crypto::token_hash(&capability);
         let id = hex::encode(hash);
         let now = chrono::Utc::now().timestamp();
-        self.transact(|tx|{tx.execute("DELETE FROM git_pending_requests WHERE expires_at<=? OR consumed_at IS NOT NULL",[now])?;tx.execute("INSERT INTO git_pending_requests(id_hash,user_id,client_id,integration_id,repository_id,permission,expires_at) VALUES(?,?,?,?,?,?,?)",params![hash.as_slice(),user,client,integration,repository,permission,now+ttl])?;Ok(())})?;
+        self.transact(|tx|{tx.execute("DELETE FROM git_pending_requests WHERE expires_at<=? OR consumed_at IS NOT NULL",[now])?;let identity:String=tx.query_row("SELECT a.identity_id FROM agents a JOIN identities i ON i.id=a.identity_id JOIN integrations n ON n.identity_id=a.identity_id WHERE a.oauth_client_id=? AND i.user_id=? AND n.id=?",params![client,user,integration],|r|r.get(0))?;tx.execute("INSERT INTO git_pending_requests(id_hash,identity_id,user_id,client_id,integration_id,repository_id,permission,expires_at) VALUES(?,?,?,?,?,?,?,?)",params![hash.as_slice(),identity,user,client,integration,repository,permission,now+ttl])?;Ok(())})?;
         Ok(id)
     }
     pub fn git_pending_requests(
@@ -455,7 +558,7 @@ impl Database {
         approved: &[String],
         now: i64,
     ) -> anyhow::Result<Vec<(String, String)>> {
-        self.transact(|tx|{let mut grants=Vec::new();for id in approved{let hash=hex::decode(id)?;let row:Option<(String,String)>=tx.query_row("SELECT repository_id,permission FROM git_pending_requests WHERE id_hash=? AND user_id=? AND client_id=? AND expires_at>? AND consumed_at IS NULL",params![hash,user,client,now],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;if let Some((repository,permission))=row{tx.execute("INSERT INTO git_repository_grants(user_id,client_id,repository_id,permission,created_at,revoked_at) VALUES(?,?,?,?,?,NULL) ON CONFLICT(client_id,repository_id) DO UPDATE SET permission=CASE WHEN git_repository_grants.permission='write' OR excluded.permission='write' THEN 'write' ELSE 'read' END,revoked_at=NULL",params![user,client,repository,permission,now])?;tx.execute("UPDATE git_pending_requests SET consumed_at=? WHERE id_hash=?",params![now,hash])?;grants.push((repository,permission));}}
+        self.transact(|tx|{let mut grants=Vec::new();for id in approved{let hash=hex::decode(id)?;let row:Option<(String,String,String)>=tx.query_row("SELECT repository_id,permission,identity_id FROM git_pending_requests WHERE id_hash=? AND user_id=? AND client_id=? AND expires_at>? AND consumed_at IS NULL",params![hash,user,client,now],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;if let Some((repository,permission,identity))=row{tx.execute("INSERT INTO git_repository_grants(identity_id,user_id,client_id,repository_id,permission,created_at,revoked_at) VALUES(?,?,?,?,?,?,NULL) ON CONFLICT(identity_id,repository_id) DO UPDATE SET permission=CASE WHEN git_repository_grants.permission='write' OR excluded.permission='write' THEN 'write' ELSE 'read' END,revoked_at=NULL",params![identity,user,client,repository,permission,now])?;tx.execute("UPDATE git_pending_requests SET consumed_at=? WHERE id_hash=?",params![now,hash])?;grants.push((repository,permission));}}
         tx.execute("UPDATE git_pending_requests SET consumed_at=? WHERE user_id=? AND client_id=? AND consumed_at IS NULL",params![now,user,client])?;Ok(grants)})
     }
     pub fn git_credential_context(
@@ -465,7 +568,7 @@ impl Database {
         now: i64,
     ) -> anyhow::Result<Option<TokenContext>> {
         let hash = crate::crypto::token_hash(token);
-        self.transact(|tx|{let row=tx.query_row("SELECT c.user_id,c.client_id,c.permission,r.integration_id FROM git_credentials c JOIN git_repositories r ON r.id=c.repository_id WHERE c.credential_hash=? AND c.repository_id=? AND c.expires_at>? AND c.revoked_at IS NULL AND EXISTS(SELECT 1 FROM oauth_tokens t WHERE t.client_id=c.client_id AND t.user_id=c.user_id AND t.expires_at>? AND (' '||t.scope||' ') LIKE ('% integration:'||r.integration_id||' %'))",params![hash.as_slice(),repository,now,now],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()?;if let Some((user,client,permission,integration))=row{tx.execute("UPDATE git_credentials SET last_used_at=? WHERE credential_hash=?",params![now,hash.as_slice()])?;Ok(Some(TokenContext{user_id:user,client_id:client,scopes:vec![format!("git:{permission}"),format!("integration:{integration}")],integration_ids:vec![integration]}))}else{Ok(None)}})
+        self.transact(|tx|{let row=tx.query_row("SELECT i.user_id,a.oauth_client_id,c.permission,r.integration_id,a.id,i.id FROM git_credentials c JOIN agents a ON a.id=c.agent_id AND a.identity_id=c.identity_id JOIN identities i ON i.id=a.identity_id JOIN git_repositories r ON r.id=c.repository_id JOIN integrations n ON n.id=r.integration_id AND n.identity_id=i.id AND n.enabled=1 JOIN git_repository_grants g ON g.identity_id=i.id AND g.repository_id=r.id AND g.revoked_at IS NULL WHERE c.credential_hash=? AND c.repository_id=? AND c.expires_at>? AND c.revoked_at IS NULL AND (g.permission='write' OR c.permission='read')",params![hash.as_slice(),repository,now],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?))).optional()?;if let Some((user,client,permission,integration,agent,identity))=row{tx.execute("UPDATE git_credentials SET last_used_at=? WHERE credential_hash=?",params![now,hash.as_slice()])?;Ok(Some(TokenContext{user_id:user,agent_id:agent,client_id:client,identity_id:identity,scopes:vec![format!("git:{permission}"),format!("integration:{integration}")],integration_ids:vec![integration]}))}else{Ok(None)}})
     }
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         Self::open_with_mode(path, StorageMode::S3)
@@ -511,7 +614,25 @@ impl Database {
         if mode == StorageMode::S3 {
             conn.pragma_update(None, "wal_autocheckpoint", 0)?;
         }
+        let has_schema_meta: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_meta')",
+            [],
+            |row| row.get(0),
+        )?;
+        let has_legacy_tables:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name!='schema_meta')",[],|row|row.get(0))?;
+        anyhow::ensure!(
+            has_schema_meta || !has_legacy_tables,
+            "legacy database detected; back up and explicitly initialize a clean identity schema"
+        );
         conn.execute_batch(MIGRATIONS)?;
+        let schema_version: i64 =
+            conn.query_row("SELECT version FROM schema_meta LIMIT 1", [], |row| {
+                row.get(0)
+            })?;
+        anyhow::ensure!(
+            schema_version == 2,
+            "unsupported database schema version {schema_version}; back up and explicitly initialize a clean identity schema"
+        );
         let existing_mode = conn
             .query_row(
                 "SELECT value FROM cog_meta WHERE key='storage_mode'",
@@ -653,6 +774,148 @@ impl Database {
             .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
         Ok(conn.query_row("SELECT count(*) FROM users", [], |r| r.get(0))?)
     }
+    pub fn create_identity(&self, user: &str, name: &str) -> anyhow::Result<String> {
+        let name = normalize_display_name(name)?;
+        let id = Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp();
+        self.transact(|tx| {
+            tx.execute(
+                "INSERT INTO identities(id,user_id,name,created_at,updated_at) VALUES(?,?,?,?,?)",
+                params![id, user, name, now, now],
+            )?;
+            tx.execute(
+                "INSERT INTO identity_grants(identity_id,capability,created_at) VALUES(?,'mcp',?)",
+                params![id, now],
+            )?;
+            Ok(())
+        })?;
+        Ok(id)
+    }
+    pub fn list_identities(&self, user: &str) -> anyhow::Result<Vec<Identity>> {
+        let conn = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+        let mut statement = conn.prepare("SELECT id,user_id,name,created_at,updated_at FROM identities WHERE user_id=? ORDER BY name,id")?;
+        Ok(statement
+            .query_map([user], |row| {
+                Ok(Identity {
+                    id: row.get(0)?,
+                    user_id: row.get(1)?,
+                    name: row.get(2)?,
+                    created_at: row.get(3)?,
+                    updated_at: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+    pub fn identity(&self, user: &str, id: &str) -> anyhow::Result<Option<Identity>> {
+        let conn = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+        Ok(conn.query_row("SELECT id,user_id,name,created_at,updated_at FROM identities WHERE id=? AND user_id=?",params![id,user],|row|Ok(Identity{id:row.get(0)?,user_id:row.get(1)?,name:row.get(2)?,created_at:row.get(3)?,updated_at:row.get(4)?})).optional()?)
+    }
+    pub fn rename_identity(&self, user: &str, id: &str, name: &str) -> anyhow::Result<bool> {
+        let name = normalize_display_name(name)?;
+        self.transact(|tx| {
+            Ok(tx.execute(
+                "UPDATE identities SET name=?,updated_at=? WHERE id=? AND user_id=?",
+                params![name, chrono::Utc::now().timestamp(), id, user],
+            )? > 0)
+        })
+    }
+    pub fn delete_identity(&self, user: &str, id: &str) -> anyhow::Result<bool> {
+        self.transact(|tx| {
+            Ok(tx.execute(
+                "DELETE FROM identities WHERE id=? AND user_id=?",
+                params![id, user],
+            )? > 0)
+        })
+    }
+    pub fn bind_agent(&self, user: &str, identity: &str, client: &str) -> anyhow::Result<Agent> {
+        let now = chrono::Utc::now().timestamp();
+        self.transact(|tx| {
+            let owned: bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM identities WHERE id=? AND user_id=?)",params![identity,user],|row|row.get(0))?;
+            anyhow::ensure!(owned,"identity not found");
+            if let Some(existing)=agent_for_client_tx(tx,client)? {
+                anyhow::ensure!(existing.identity_id==identity,"agent is already bound to another identity");
+                return Ok(existing);
+            }
+            let registered: String=tx.query_row("SELECT registered_name FROM oauth_clients WHERE client_id=?",[client],|row|row.get(0))?;
+            let display=normalize_display_name(&registered)?;
+            let id=Uuid::new_v4().to_string();
+            tx.execute("INSERT INTO agents(id,identity_id,oauth_client_id,display_name,created_at,updated_at) VALUES(?,?,?,?,?,?)",params![id,identity,client,display,now,now])?;
+            agent_for_client_tx(tx,client)?.ok_or_else(||anyhow::anyhow!("agent binding failed"))
+        })
+    }
+    pub fn agent_for_client(&self, client: &str) -> anyhow::Result<Option<Agent>> {
+        let conn = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+        agent_for_client_conn(&conn, client)
+    }
+    pub fn agents_for_identity(&self, user: &str, identity: &str) -> anyhow::Result<Vec<Agent>> {
+        let conn = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+        let mut statement=conn.prepare("SELECT a.id,a.identity_id,a.oauth_client_id,c.registered_name,a.display_name,a.created_at,a.updated_at,a.last_used_at FROM agents a JOIN oauth_clients c ON c.client_id=a.oauth_client_id JOIN identities i ON i.id=a.identity_id WHERE i.user_id=? AND i.id=? ORDER BY a.display_name,a.id")?;
+        Ok(statement
+            .query_map(params![user, identity], agent_row)?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+    pub fn rename_agent(&self, user: &str, agent: &str, name: &str) -> anyhow::Result<bool> {
+        let name = normalize_display_name(name)?;
+        self.transact(|tx|Ok(tx.execute("UPDATE agents SET display_name=?,updated_at=? WHERE id=? AND identity_id IN (SELECT id FROM identities WHERE user_id=?)",params![name,chrono::Utc::now().timestamp(),agent,user])?>0))
+    }
+    pub fn rename_self(&self, agent: &str, name: &str) -> anyhow::Result<bool> {
+        let name = normalize_display_name(name)?;
+        self.transact(|tx| {
+            Ok(tx.execute(
+                "UPDATE agents SET display_name=?,updated_at=? WHERE id=?",
+                params![name, chrono::Utc::now().timestamp(), agent],
+            )? > 0)
+        })
+    }
+    pub fn identity_grants(&self, user: &str, identity: &str) -> anyhow::Result<Vec<String>> {
+        let conn = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+        let mut statement=conn.prepare("SELECT capability,resource_id,permission FROM identity_grants WHERE identity_id=? AND revoked_at IS NULL AND EXISTS(SELECT 1 FROM identities WHERE id=? AND user_id=?) ORDER BY capability,resource_id")?;
+        Ok(statement
+            .query_map(params![identity, identity, user], |row| {
+                let c: String = row.get(0)?;
+                let r: String = row.get(1)?;
+                let p: String = row.get(2)?;
+                Ok(if r.is_empty() {
+                    c
+                } else if p.is_empty() {
+                    format!("{c}:{r}")
+                } else {
+                    format!("{c}:{r}:{p}")
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+    pub fn set_identity_grants(
+        &self,
+        user: &str,
+        identity: &str,
+        scopes: &[String],
+    ) -> anyhow::Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.transact(|tx|{
+            let owned:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM identities WHERE id=? AND user_id=?)",params![identity,user],|row|row.get(0))?;
+            anyhow::ensure!(owned,"identity not found");
+            tx.execute("UPDATE identity_grants SET revoked_at=? WHERE identity_id=? AND revoked_at IS NULL",params![now,identity])?;
+            let mut values=scopes.to_vec(); if !values.iter().any(|v|v=="mcp"){values.push("mcp".into());}
+            for scope in values { let (capability,resource)=split_grant(&scope); tx.execute("INSERT INTO identity_grants(identity_id,capability,resource_id,created_at,revoked_at) VALUES(?,?,?,?,NULL) ON CONFLICT(identity_id,capability,resource_id) DO UPDATE SET revoked_at=NULL,created_at=excluded.created_at",params![identity,capability,resource,now])?; }
+            Ok(())
+        })
+    }
     pub fn create_session(
         &self,
         token_hash: &[u8],
@@ -761,12 +1024,15 @@ impl Database {
             .0
             .lock()
             .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
-        let mut stmt=conn.prepare("SELECT id,user_id,name,transport,config_json,enabled FROM integrations WHERE user_id=? ORDER BY name")?;
+        let mut stmt=conn.prepare("SELECT id,user_id,display_name,transport,config_json,enabled,identity_id,provider_name,provider_account FROM integrations WHERE user_id=? ORDER BY display_name")?;
         let rows = stmt.query_map([user], |r| {
             Ok(Integration {
                 id: r.get(0)?,
                 user_id: r.get(1)?,
+                identity_id: r.get(6)?,
                 name: r.get(2)?,
+                provider_name: r.get(7)?,
+                provider_account: r.get(8)?,
                 transport: r.get(3)?,
                 config: serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or_default(),
                 enabled: r.get(5)?,
@@ -804,8 +1070,25 @@ impl Database {
         config: &serde_json::Value,
         secret: Option<&str>,
     ) -> anyhow::Result<String> {
+        let identity = match self.list_identities(user)?.into_iter().next() {
+            Some(identity) => identity.id,
+            None => self.create_identity(user, "Default")?,
+        };
+        self.create_connection(user, &identity, name, transport, config, secret)
+    }
+    pub fn create_connection(
+        &self,
+        user: &str,
+        identity: &str,
+        name: &str,
+        transport: &str,
+        config: &Value,
+        secret: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let name = normalize_display_name(name)?;
         let id = Uuid::new_v4().to_string();
-        self.transact(|tx|{tx.execute("INSERT INTO integrations(id,user_id,name,transport,config_json,secret_ciphertext) VALUES(?,?,?,?,?,?)",params![id,user,name,transport,config.to_string(),secret])?;Ok(())})?;
+        let now = chrono::Utc::now().timestamp();
+        self.transact(|tx|{let owned:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM identities WHERE id=? AND user_id=?)",params![identity,user],|row|row.get(0))?;anyhow::ensure!(owned,"identity not found");tx.execute("INSERT INTO integrations(id,identity_id,user_id,display_name,name,transport,config_json,secret_ciphertext,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",params![id,identity,user,name,name,transport,config.to_string(),secret,now,now])?;Ok(())})?;
         Ok(id)
     }
 
@@ -817,6 +1100,11 @@ impl Database {
         expires_at: i64,
     ) -> anyhow::Result<String> {
         let id = Uuid::new_v4().to_string();
+        let identity = match self.list_identities(user)?.into_iter().next() {
+            Some(identity) => identity.id,
+            None => self.create_identity(user, "Default")?,
+        };
+        let now = chrono::Utc::now().timestamp();
         let config = serde_json::json!({
             "kind": "git",
             "provider": "github",
@@ -830,8 +1118,8 @@ impl Database {
                 [chrono::Utc::now().timestamp()],
             )?;
             tx.execute(
-                "INSERT INTO integrations(id,user_id,name,transport,config_json,enabled) VALUES(?,?,?,?,?,0)",
-                params![id, user, name, "git", config.to_string()],
+                "INSERT INTO integrations(id,identity_id,user_id,display_name,name,transport,config_json,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,0,?,?)",
+                params![id,identity,user,name,name,"git",config.to_string(),now,now],
             )?;
             tx.execute(
                 "INSERT INTO github_app_setups(state_hash,user_id,integration_id,expires_at) VALUES(?,?,?,?)",
@@ -972,7 +1260,15 @@ impl Database {
         name: &str,
         redirects: &[String],
     ) -> anyhow::Result<()> {
-        self.transact(|tx|{tx.execute("INSERT INTO oauth_clients(client_id,user_id,redirect_uris,client_name) VALUES(?,?,?,?)",params![client_id,user,serde_json::to_string(redirects)?,name])?;Ok(())})
+        self.transact(|tx|{tx.execute("INSERT INTO oauth_clients(client_id,user_id,redirect_uris,registered_name,client_name) VALUES(?,?,?,?,?)",params![client_id,user,serde_json::to_string(redirects)?,name,name])?;Ok(())})?;
+        if let Some(user) = user {
+            let identity = match self.list_identities(user)?.into_iter().next() {
+                Some(identity) => identity.id,
+                None => self.create_identity(user, "Default")?,
+            };
+            self.bind_agent(user, &identity, client_id)?;
+        }
+        Ok(())
     }
     pub fn register_or_reuse_public_client(
         &self,
@@ -986,21 +1282,21 @@ impl Database {
             let deleted = tx.execute(
                 "DELETE FROM oauth_clients
                  WHERE user_id IS NULL
-                   AND created_at < datetime('now', '-1 day')
+                   AND created_at < ? - 86400
                    AND NOT EXISTS (SELECT 1 FROM oauth_tokens t WHERE t.client_id=oauth_clients.client_id)
                    AND NOT EXISTS (SELECT 1 FROM oauth_codes c WHERE c.client_id=oauth_clients.client_id AND c.expires_at>?)",
-                [now],
+                params![now,now],
             )?;
             let redirects = serde_json::to_string(redirects)?;
             let existing: Option<String> = tx
                 .query_row(
                     "SELECT client_id FROM oauth_clients c
                      WHERE c.user_id IS NULL AND c.client_name=? AND c.redirect_uris=?
-                       AND c.created_at >= datetime('now', '-1 day')
+                       AND c.created_at >= ? - 86400
                        AND NOT EXISTS (SELECT 1 FROM oauth_tokens t WHERE t.client_id=c.client_id)
                        AND NOT EXISTS (SELECT 1 FROM oauth_codes o WHERE o.client_id=c.client_id AND o.expires_at>?)
                      ORDER BY c.created_at DESC LIMIT 1",
-                    params![name, redirects, now],
+                    params![name, redirects, now,now],
                     |row| row.get(0),
                 )
                 .optional()?;
@@ -1020,8 +1316,8 @@ impl Database {
                 "too many unused client registrations; retry later"
             );
             tx.execute(
-                "INSERT INTO oauth_clients(client_id,user_id,redirect_uris,client_name) VALUES(?,NULL,?,?)",
-                params![client_id, redirects, name],
+                "INSERT INTO oauth_clients(client_id,user_id,redirect_uris,registered_name,client_name,created_at) VALUES(?,NULL,?,?,?,?)",
+                params![client_id, redirects, name,name,now],
             )?;
             Ok((client_id.to_owned(), true, true))
         })
@@ -1073,7 +1369,7 @@ impl Database {
         challenge: &str,
         expires: i64,
     ) -> anyhow::Result<()> {
-        self.transact(|tx|{tx.execute("INSERT INTO oauth_codes(code_hash,client_id,user_id,redirect_uri,scope,challenge,expires_at) VALUES(?,?,?,?,?,?,?)",params![hash,client,user,redirect,scope,challenge,expires])?;Ok(())})
+        self.transact(|tx|{let changed=tx.execute("INSERT INTO oauth_codes(code_hash,client_id,agent_id,identity_id,user_id,redirect_uri,scope,challenge,expires_at) SELECT ?,?,a.id,a.identity_id,i.user_id,?,?,?,? FROM agents a JOIN identities i ON i.id=a.identity_id WHERE a.oauth_client_id=? AND i.user_id=?",params![hash,client,redirect,scope,challenge,expires,client,user])?;anyhow::ensure!(changed==1,"OAuth client is not an authorized agent");Ok(())})
     }
     pub fn redeem_code(&self, hash: &[u8]) -> anyhow::Result<Option<AuthorizationCodeRow>> {
         self.transact(|tx|{let row=tx.query_row("SELECT client_id,user_id,redirect_uri,scope,challenge,expires_at FROM oauth_codes WHERE code_hash=?",[hash],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;tx.execute("DELETE FROM oauth_codes WHERE code_hash=?",[hash])?;Ok(row)})
@@ -1091,7 +1387,7 @@ impl Database {
     ) -> anyhow::Result<()> {
         let token_id = Uuid::new_v4().to_string();
         let issued_at = chrono::Utc::now().timestamp();
-        self.transact(|tx|{tx.execute("INSERT INTO oauth_tokens(token_hash,token_id,client_id,user_id,scope,issued_at,expires_at,refresh_hash,refresh_expires_at) VALUES(?,?,?,?,?,?,?,?,?)",params![hash,token_id,client,user,scope,issued_at,expires,refresh,refresh_expires])?;Ok(())})
+        self.transact(|tx|{let changed=tx.execute("INSERT INTO oauth_tokens(token_hash,token_id,client_id,agent_id,user_id,scope,issued_at,expires_at,refresh_hash,refresh_expires_at) SELECT ?,?,?,a.id,i.user_id,?,?,?,?,? FROM agents a JOIN identities i ON i.id=a.identity_id WHERE a.oauth_client_id=? AND i.user_id=?",params![hash,token_id,client,scope,issued_at,expires,refresh,refresh_expires,client,user])?;anyhow::ensure!(changed==1,"OAuth client is not an authorized agent");let trusted:bool=tx.query_row("SELECT user_id IS NOT NULL FROM oauth_clients WHERE client_id=?",[client],|r|r.get(0))?;if trusted{let identity:String=tx.query_row("SELECT identity_id FROM agents WHERE oauth_client_id=?",[client],|r|r.get(0))?;for value in scope.split_ascii_whitespace(){let(capability,resource)=split_grant(value);tx.execute("INSERT INTO identity_grants(identity_id,capability,resource_id,created_at,revoked_at) VALUES(?,?,?,?,NULL) ON CONFLICT(identity_id,capability,resource_id) DO UPDATE SET revoked_at=NULL",params![identity,capability,resource,issued_at])?;}}Ok(())})
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1113,7 +1409,7 @@ impl Database {
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
                 )
                 .optional()?;
-            let Some((old_access, stored_client, user, scope, expires)) = row else {
+            let Some((old_access, stored_client, user, _scope, expires)) = row else {
                 return Ok(None);
             };
             if stored_client != client || expires.unwrap_or(0) <= now {
@@ -1121,9 +1417,13 @@ impl Database {
                 return Ok(None);
             }
             tx.execute("DELETE FROM oauth_tokens WHERE token_hash=?", [old_access])?;
+            let agent:String=tx.query_row("SELECT id FROM agents WHERE oauth_client_id=?",[client],|row|row.get(0))?;
+            let identity:String=tx.query_row("SELECT identity_id FROM agents WHERE id=?",[&agent],|row|row.get(0))?;
+            let mut statement=tx.prepare("SELECT capability,resource_id,permission FROM identity_grants WHERE identity_id=? AND revoked_at IS NULL ORDER BY capability,resource_id")?;
+            let scope=statement.query_map([identity],|row|{let c:String=row.get(0)?;let r:String=row.get(1)?;let p:String=row.get(2)?;Ok(if r.is_empty(){c}else if p.is_empty(){format!("{c}:{r}")}else{format!("{c}:{r}:{p}")})})?.collect::<Result<Vec<_>,_>>()?.join(" ");
             tx.execute(
-                "INSERT INTO oauth_tokens(token_hash,token_id,client_id,user_id,scope,issued_at,expires_at,refresh_hash,refresh_expires_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                params![access_hash,Uuid::new_v4().to_string(),client,user,scope,now,access_expires,refresh_hash,refresh_expires],
+                "INSERT INTO oauth_tokens(token_hash,token_id,client_id,agent_id,user_id,scope,issued_at,expires_at,refresh_hash,refresh_expires_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                params![access_hash,Uuid::new_v4().to_string(),client,agent,user,scope,now,access_expires,refresh_hash,refresh_expires],
             )?;
             Ok(Some((user, scope)))
         })
@@ -1196,27 +1496,52 @@ impl Database {
             .0
             .lock()
             .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
-        let row: Option<(String, String, String)> = conn
+        let row: Option<(String, String, String, String, String)> = conn
             .query_row(
-                "SELECT user_id,client_id,scope FROM oauth_tokens WHERE token_hash=? AND expires_at>?",
+                "SELECT i.user_id,t.client_id,t.scope,a.id,i.id
+                 FROM oauth_tokens t JOIN agents a ON a.id=t.agent_id
+                 JOIN identities i ON i.id=a.identity_id
+                 WHERE t.token_hash=? AND t.expires_at>?",
                 params![hash, now],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()?;
-        let Some((user_id, client_id, scope)) = row else {
+        let Some((user_id, client_id, _snapshot_scope, agent_id, identity_id)) = row else {
             return Ok(None);
         };
-        let scopes = scope
-            .split_ascii_whitespace()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        let integration_ids = scopes
-            .iter()
-            .filter_map(|scope| scope.strip_prefix("integration:").map(str::to_owned))
-            .collect();
+        let mut grants = conn.prepare("SELECT capability,resource_id,permission FROM identity_grants WHERE identity_id=? AND revoked_at IS NULL")?;
+        let scopes = grants
+            .query_map([&identity_id], |row| {
+                let capability: String = row.get(0)?;
+                let resource: String = row.get(1)?;
+                let permission: String = row.get(2)?;
+                Ok(if resource.is_empty() {
+                    capability
+                } else if permission.is_empty() {
+                    format!("{capability}:{resource}")
+                } else {
+                    format!("{capability}:{resource}:{permission}")
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut connections = conn
+            .prepare("SELECT id FROM integrations WHERE identity_id=? AND enabled=1 ORDER BY id")?;
+        let integration_ids = connections
+            .query_map([&identity_id], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Some(TokenContext {
             user_id,
+            agent_id,
             client_id,
+            identity_id,
             scopes,
             integration_ids,
         }))
@@ -1260,19 +1585,25 @@ impl Database {
             .0
             .lock()
             .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
-        let mut statement =
-            conn.prepare("SELECT scope FROM oauth_tokens WHERE user_id=? AND client_id=?")?;
-        let scopes = statement
-            .query_map(params![user, client_id], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut granted = scopes
-            .iter()
-            .flat_map(|scope| scope.split_ascii_whitespace())
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        granted.sort();
-        granted.dedup();
-        Ok(granted)
+        let identity:Option<String>=conn.query_row("SELECT a.identity_id FROM agents a JOIN identities i ON i.id=a.identity_id WHERE a.oauth_client_id=? AND i.user_id=?",params![client_id,user],|row|row.get(0)).optional()?;
+        let Some(identity) = identity else {
+            return Ok(Vec::new());
+        };
+        let mut statement=conn.prepare("SELECT capability,resource_id,permission FROM identity_grants WHERE identity_id=? AND revoked_at IS NULL ORDER BY capability,resource_id")?;
+        Ok(statement
+            .query_map([identity], |row| {
+                let c: String = row.get(0)?;
+                let r: String = row.get(1)?;
+                let p: String = row.get(2)?;
+                Ok(if r.is_empty() {
+                    c
+                } else if p.is_empty() {
+                    format!("{c}:{r}")
+                } else {
+                    format!("{c}:{r}:{p}")
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
     }
     pub fn agent_tokens(&self, user: &str) -> anyhow::Result<Vec<AgentToken>> {
         let conn = self
@@ -1520,7 +1851,7 @@ impl Database {
             .0
             .lock()
             .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
-        Ok(conn.query_row("SELECT id,user_id,name,transport,config_json,enabled FROM integrations WHERE id=? AND user_id=?",params![id,user],|r|Ok(Integration{id:r.get(0)?,user_id:r.get(1)?,name:r.get(2)?,transport:r.get(3)?,config:serde_json::from_str(&r.get::<_,String>(4)?).unwrap_or_default(),enabled:r.get(5)?})).optional()?)
+        Ok(conn.query_row("SELECT id,user_id,name,transport,config_json,enabled,identity_id,provider_name,provider_account FROM integrations WHERE id=? AND user_id=?",params![id,user],|r|Ok(Integration{id:r.get(0)?,user_id:r.get(1)?,name:r.get(2)?,transport:r.get(3)?,config:serde_json::from_str(&r.get::<_,String>(4)?).unwrap_or_default(),enabled:r.get(5)?,identity_id:r.get(6)?,provider_name:r.get(7)?,provider_account:r.get(8)?})).optional()?)
     }
     pub fn set_integration_secret(&self, id: &str, user: &str, secret: &str) -> anyhow::Result<()> {
         self.transact(|tx| {
@@ -1550,9 +1881,10 @@ impl Database {
             )?;
             anyhow::ensure!(exists, "integration not found");
             if let Some(name) = name {
+                let name=normalize_display_name(name)?;
                 tx.execute(
-                    "UPDATE integrations SET name=? WHERE id=? AND user_id=?",
-                    params![name, id, user],
+                    "UPDATE integrations SET name=?,display_name=?,updated_at=? WHERE id=? AND user_id=?",
+                    params![name,name,chrono::Utc::now().timestamp(),id,user],
                 )?;
             }
             if let Some(config) = config {
@@ -1586,6 +1918,7 @@ impl Database {
             if !deleted {
                 return Ok(false);
             }
+            tx.execute("UPDATE identity_grants SET revoked_at=? WHERE capability='integration' AND resource_id=? AND revoked_at IS NULL",params![chrono::Utc::now().timestamp(),id])?;
 
             let target = format!("integration:{id}");
             let mut statement = tx.prepare("SELECT token_hash,scope FROM oauth_tokens")?;
@@ -1665,8 +1998,8 @@ mod tests {
         db.0.lock()
             .unwrap()
             .execute(
-                "UPDATE oauth_clients SET created_at=datetime('now', '-2 days') WHERE client_id='first'",
-                [],
+                "UPDATE oauth_clients SET created_at=? WHERE client_id='first'",
+                [now - 172800],
             )
             .unwrap();
         let second = db
@@ -1702,7 +2035,7 @@ mod tests {
     }
 
     #[test]
-    fn immutable_integration_grants_are_immediately_constrained() {
+    fn token_scope_cannot_authorize_connections_outside_the_identity() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(&dir.path().join("grants.db")).unwrap();
         let user = db.create_user("grants@example.com", "hash").unwrap();
@@ -1723,24 +2056,8 @@ mod tests {
             Some(2000),
         )
         .unwrap();
-        assert_eq!(
-            db.token_context(b"access", 1)
-                .unwrap()
-                .unwrap()
-                .integration_ids,
-            vec!["stable-id"]
-        );
-        assert!(
-            db.revoke_client_integration_grant(&user, "client", "stable-id")
-                .unwrap()
-        );
-        let after = db.token_context(b"access", 2).unwrap().unwrap();
-        assert!(after.scopes.contains(&"mcp".into()));
-        assert!(after.integration_ids.is_empty());
-        assert!(
-            !db.revoke_client_integration_grant(&user, "client", "stable-id")
-                .unwrap()
-        );
+        let context = db.token_context(b"access", 1).unwrap().unwrap();
+        assert!(context.integration_ids.is_empty());
     }
 
     #[test]
@@ -1980,7 +2297,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_schema_and_token_edge_cases_are_supported() {
+    fn legacy_schema_requires_explicit_clean_initialization() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("legacy.sqlite");
         {
@@ -1992,84 +2309,10 @@ mod tests {
                 )
                 .unwrap();
         }
-        let db = Database::open(&path).unwrap();
-        let user = db.create_user("legacy@example.com", "hash").unwrap();
-        db.register_client(
-            "legacy-client",
-            None,
-            "Legacy",
-            &["http://localhost/cb".into()],
-        )
-        .unwrap();
-        let now = chrono::Utc::now().timestamp();
-        db.store_access_token(
-            b"access",
-            "legacy-client",
-            &user,
-            "mcp admin",
-            now + 60,
-            Some(b"refresh"),
-            Some(now + 60),
-        )
-        .unwrap();
-        assert_eq!(
-            db.token_user_for_scope(b"access", now, "admin").unwrap(),
-            Some(user.clone())
-        );
-        assert_eq!(
-            db.token_user_for_scope(b"access", now, "missing").unwrap(),
-            None
-        );
-        assert_eq!(
-            db.token_user_for_scope(b"missing", now, "admin").unwrap(),
-            None
-        );
-        assert!(
-            db.rotate_refresh_token(
-                b"refresh",
-                "wrong-client",
-                now,
-                b"new",
-                now + 60,
-                b"new-refresh",
-                now + 60
-            )
-            .unwrap()
-            .is_none()
-        );
-        assert!(!db.revoke_agent_client(&user, "legacy-client").unwrap());
-
-        let integration = db
-            .create_integration(
-                &user,
-                "before",
-                "http",
-                &serde_json::json!({"url":"http://localhost"}),
-                None,
-            )
-            .unwrap();
-        db.update_integration(
-            &integration,
-            &user,
-            Some("after"),
-            Some(&serde_json::json!({"url":"http://localhost/new"})),
-            Some(false),
-            Some("sealed"),
-        )
-        .unwrap();
-        let updated = db.integration(&integration, &user).unwrap().unwrap();
-        assert_eq!(updated.name, "after");
-        assert!(!updated.enabled);
-        assert_eq!(
-            db.integration_secret(&integration, &user)
-                .unwrap()
-                .as_deref(),
-            Some("sealed")
-        );
-        assert!(
-            db.update_integration("missing", &user, None, None, None, None)
-                .is_err()
-        );
+        let error = Database::open(&path)
+            .err()
+            .expect("legacy schema must fail closed");
+        assert!(error.to_string().contains("explicitly initialize"));
     }
 
     #[test]

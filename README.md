@@ -2,7 +2,7 @@
 
 ## Brief description
 
-Clanker Operations Gateway (`cog`) is a self-hosted agentic tool gateway distributed as one Rust executable. Each user can connect multiple MCP servers, authorize agents with OAuth 2.1, and expose those integrations through one small, code-mode MCP surface.
+Clanker Operations Gateway (`cog`) is a self-hosted agentic tool gateway distributed as one Rust executable. Each user owns named identities; every identity independently owns its provider connections, shared grants, and OAuth-authorized agents.
 
 Agents receive an `execute` tool for code-mode access to upstream integrations. Code running in an isolated V8 runtime can progressively discover integrations with `codemode.search()`, inspect a tool with `codemode.describe()`, and compose calls with `codemode.call()`. Clanker Operations Gateway administration is also exposed as purpose-specific native MCP tools so hosts can apply accurate safety policy and request incremental OAuth consent for administrative scopes.
 
@@ -99,7 +99,7 @@ Important configuration:
 
 ### Add an integration
 
-The admin API uses granular OAuth scopes. Integration reads require `integrations:read` and mutations require `integrations:write`; client/token reads and mutations require `clients:read` and `clients:write`, and audit reads require `audit:read`. The legacy `admin` scope remains a compatibility alias for existing clients but is not granted by default:
+The admin API uses granular OAuth scopes. Connection reads require `integrations:read` and mutations require `integrations:write`; agent/token reads and mutations require `agents:read` and `agents:write`, and audit reads require `audit:read`. A new identity receives only the mandatory `mcp` capability by default:
 
 ```sh
 curl -X POST "$COG_URL/api/integrations" \
@@ -126,7 +126,7 @@ records the installation ID, and enables the integration. Progress is available
 through `cog.github_app_setup_status`; neither tool returns App credentials.
 See [Git smart HTTP](docs/git.md) for the complete flow and manual fallback.
 
-Agent-to-cog authorization and cog-to-upstream authorization are separate trust relationships. A successful provider browser callback only connects cog to that upstream; downstream OAuth consent separately grants an agent the exact `integration:<id>` scope. Verify the complete path with an authenticated MCP `initialize` and tool discovery request. Every enabled integration remains visible in code-mode discovery, including disconnected, expired, and temporarily unavailable upstreams, with explicit `upstreamConnected`, `upstreamStatus`, `clientAccessGranted`, and `requiredScope` fields.
+Agent-to-cog authorization and cog-to-upstream authorization are separate trust relationships. A successful provider browser callback only connects one identity to that upstream. Every agent in the identity can use its enabled connections; durable capabilities and exact repository permissions are evaluated from current identity grants on every request.
 
 ## Development
 
@@ -170,7 +170,7 @@ the `execute` tool. COG administration tools remain available with their
 their `integration:<id>` OAuth scope and use the same incremental-consent flow
 as code mode.
 
-An agent discovers cog's OAuth metadata, dynamically registers a client, and obtains a PKCE-bound bearer token. The token selects one user and its scopes. The `/mcp` endpoint exposes only `execute`, rather than forwarding a large upstream tool catalog.
+An agent discovers cog's OAuth metadata and dynamically registers an untrusted OAuth client. During PKCE authorization the user selects or creates an identity; approval creates the durable agent binding. Tokens identify that agent, while current identity grants and connections determine access.
 
 Dynamic client registration remains automatic and requires no registration credential. Clanker Operations Gateway limits registrations to 128-byte client names, 10 unique redirect URIs of at most 2,048 bytes each, and 16 KiB of metadata. It accepts at most 20 registration attempts per minute, reuses an identical recent unused registration, removes unused registrations after 24 hours, and retains at most 1,000 unused clients. Clients with retained tokens or a live authorization code are never removed by this cleanup.
 
@@ -186,7 +186,7 @@ The isolate has a configurable heap limit. A watchdog uses V8's termination hand
 
 ### Users, OAuth, and credentials
 
-Data is isolated per user. Downstream tokens use `mcp`, granular administration scopes (`integrations:read`, `integrations:write`, `clients:read`, `clients:write`, and `audit:read`), and explicit `integration:<uuid>` grants. The legacy `admin` scope remains a compatibility alias during migration and gives existing `mcp admin` tokens their prior integrations; new clients receive only requested, consented scopes.
+Data is isolated first by user and then by identity. Downstream capabilities include `mcp`, `integrations:read`, `integrations:write`, `agents:read`, `agents:write`, `audit:read`, `git:read`, and `git:write`. Access-token scope is a protocol snapshot; authentication always joins token → agent → identity and reads live identity grants and enabled connections.
 
 For progressive consent, protected-resource metadata advertises only the baseline `mcp` scope. Clanker Operations Gateway returns an HTTP 403 `insufficient_scope` challenge containing `mcp` and the exact newly required administration or `integration:<uuid>` scope. Retain the same MCP client registration, reauthorize with the accumulated scope set, and refresh that client's credential. A new process that creates a new dynamic registration is a different client, so grants do not transfer. Never use `integration_reconnect` to obtain downstream access; reconnect replaces cog's upstream provider credentials and cannot grant the calling client access.
 

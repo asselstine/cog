@@ -146,8 +146,8 @@ pub fn issue_code(
                 | "admin"
                 | "integrations:read"
                 | "integrations:write"
-                | "clients:read"
-                | "clients:write"
+                | "agents:read"
+                | "agents:write"
                 | "audit:read"
                 | "git:read"
                 | "git:write"
@@ -325,6 +325,8 @@ mod tests {
             },
         )
         .unwrap();
+        let identity = db.create_identity(&user, "Personal").unwrap();
+        db.bind_agent(&user, &identity, &reg.client_id).unwrap();
         let verifier = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~";
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier));
         let code = issue_code(
@@ -496,6 +498,8 @@ mod tests {
                 None,
             )
             .unwrap();
+        let identity = db.list_identities(&owner).unwrap()[0].id.clone();
+        db.bind_agent(&owner, &identity, "client").unwrap();
         let scope = format!("mcp integrations:read integration:{integration}");
         assert!(
             issue_code(

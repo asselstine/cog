@@ -154,14 +154,38 @@ impl GitHubProvider {
                 .map(|v| v.token.clone())
                 .ok_or_else(|| anyhow::anyhow!("GitHub credential refresh failed"));
         }
-        let result=async{
-   validate_resolved_network(&self.api_base,self.api_base.scheme()=="http").await?;
-   let id=repo.provider_repository_id.parse::<u64>()?;
-   let endpoint=self.api_base.join(&format!("app/installations/{}/access_tokens",self.installation_id))?;
-   let response=self.client.post(endpoint).bearer_auth(self.jwt()?).json(&json!({"repository_ids":[id],"permissions":{"contents":if op==GitOperation::Write{"write"}else{"read"}}})).send().await?;
-   anyhow::ensure!(response.status().is_success(),"GitHub installation token request failed with status {}",response.status());
-   let value:InstallationToken=response.json().await?;let cached=CachedToken{token:SecretValue::new(value.token),expires_at:value.expires_at.timestamp()};self.cache.lock().await.insert(key.clone(),cached.clone());Ok(cached.token)
-  }.await;
+        let result = async {
+            validate_resolved_network(&self.api_base, self.api_base.scheme() == "http").await?;
+            let id = repo.provider_repository_id.parse::<u64>()?;
+            let endpoint = self.api_base.join(&format!(
+                "app/installations/{}/access_tokens",
+                self.installation_id
+            ))?;
+            let permissions = match op {
+                GitOperation::Read => json!({"contents":"read"}),
+                GitOperation::Write => json!({"contents":"write","workflows":"write"}),
+            };
+            let response = self
+                .client
+                .post(endpoint)
+                .bearer_auth(self.jwt()?)
+                .json(&json!({"repository_ids":[id],"permissions":permissions}))
+                .send()
+                .await?;
+            anyhow::ensure!(
+                response.status().is_success(),
+                "GitHub installation token request failed with status {}",
+                response.status()
+            );
+            let value: InstallationToken = response.json().await?;
+            let cached = CachedToken {
+                token: SecretValue::new(value.token),
+                expires_at: value.expires_at.timestamp(),
+            };
+            self.cache.lock().await.insert(key.clone(), cached.clone());
+            Ok(cached.token)
+        }
+        .await;
         self.refresh.lock().await.remove(&key);
         notify.notify_waiters();
         result
@@ -324,7 +348,9 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         let bodies = fixture.bodies.lock().await;
         assert_eq!(bodies[0]["repository_ids"], json!([42]));
         assert_eq!(bodies[0]["permissions"]["contents"], "read");
+        assert!(bodies[0]["permissions"].get("workflows").is_none());
         assert_eq!(bodies[1]["permissions"]["contents"], "write");
+        assert_eq!(bodies[1]["permissions"]["workflows"], "write");
         drop(bodies);
         provider.clear_cache().await;
         provider

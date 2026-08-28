@@ -131,9 +131,16 @@ struct GitControlProvider {
 
 fn admin_tool(name: &str, description: &str) -> Tool {
     let (input_schema, read_only, destructive, idempotent, open_world) = match name {
-        "integrations_list" | "clients_list" | "tokens_list" | "audit_list" => (
+        "integrations_list" | "agents_list" | "tokens_list" | "audit_list" | "agent_get_self" => (
             json!({"type":"object","properties":{},"additionalProperties":false}),
             true,
+            false,
+            true,
+            false,
+        ),
+        "agent_update_self" => (
+            json!({"type":"object","properties":{"display_name":{"type":"string","maxLength":128}},"required":["display_name"],"additionalProperties":false}),
+            false,
             false,
             true,
             false,
@@ -190,7 +197,7 @@ fn admin_tool(name: &str, description: &str) -> Tool {
         "integration_disconnect"
         | "integration_reconnect"
         | "integration_delete"
-        | "client_revoke"
+        | "agent_revoke"
         | "token_revoke" => (
             json!({"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false}),
             false,
@@ -198,7 +205,7 @@ fn admin_tool(name: &str, description: &str) -> Tool {
             true,
             false,
         ),
-        "client_integration_revoke" => (
+        "identity_grant_revoke" => (
             json!({"type":"object","properties":{"client_id":{"type":"string"},"integration_id":{"type":"string"}},"required":["client_id","integration_id"],"additionalProperties":false}),
             false,
             true,
@@ -312,7 +319,10 @@ impl ToolProvider for AdminProvider {
             .await?
             .into_iter()
             .filter(|tool| {
-                (tool.name == "integrations_list" && self.auth.allows("mcp"))
+                (matches!(
+                    tool.name.as_str(),
+                    "integrations_list" | "agent_get_self" | "agent_update_self"
+                ) && self.auth.allows("mcp"))
                     || admin_required_scope(&tool.name).is_some_and(|scope| self.auth.allows(scope))
             })
             .collect())
@@ -320,6 +330,14 @@ impl ToolProvider for AdminProvider {
 
     async fn advertised_tools(&self) -> anyhow::Result<Vec<Tool>> {
         Ok(vec![
+            admin_tool(
+                "agent_get_self",
+                "Read the authenticated agent's immutable IDs and display name.",
+            ),
+            admin_tool(
+                "agent_update_self",
+                "Rename the authenticated agent without changing its identity or authorization.",
+            ),
             admin_tool(
                 "integrations_list",
                 "List every integration with separate upstream-provider connection and calling-client access-grant status, without credentials.",
@@ -361,15 +379,15 @@ impl ToolProvider for AdminProvider {
                 "integration_delete",
                 "Permanently delete an integration, including its immutable ID, provider credentials, pending authorization state, and every downstream client grant. Use integration_disconnect to preserve configuration and grants.",
             ),
-            admin_tool("clients_list", "List authorized clients and grants."),
+            admin_tool("agents_list", "List authorized agents."),
             admin_tool(
                 "tokens_list",
                 "List token lifecycle and grants without token values.",
             ),
-            admin_tool("client_revoke", "Revoke a client and all its tokens."),
+            admin_tool("agent_revoke", "Revoke an agent and all its credentials."),
             admin_tool("token_revoke", "Revoke one token by public token id."),
             admin_tool(
-                "client_integration_revoke",
+                "identity_grant_revoke",
                 "Immediately revoke one immutable integration grant from all client tokens and refresh access.",
             ),
             admin_tool("audit_list", "Read recent audit events."),
@@ -383,6 +401,29 @@ impl ToolProvider for AdminProvider {
                 .ok_or_else(|| anyhow::anyhow!("id is required"))
         };
         match name {
+            "agent_get_self" if self.auth.allows("mcp") => Ok(serde_json::to_value(
+                self.app
+                    .db
+                    .agent_for_client(&self.auth.client)?
+                    .ok_or_else(|| anyhow::anyhow!("agent not found"))?,
+            )?),
+            "agent_update_self" if self.auth.allows("mcp") => {
+                let name = args
+                    .get("display_name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("display_name is required"))?;
+                anyhow::ensure!(
+                    self.app.db.rename_self(&self.auth.agent, name)?,
+                    "agent not found"
+                );
+                self.app.db.record_audit(Some(&self.auth.user),"agent.rename",Some(&self.auth.agent),"success",&json!({"identity_id":self.auth.identity,"agent_id":self.auth.agent,"client_id":self.auth.client}))?;
+                Ok(serde_json::to_value(
+                    self.app
+                        .db
+                        .agent_for_client(&self.auth.client)?
+                        .ok_or_else(|| anyhow::anyhow!("agent not found"))?,
+                )?)
+            }
             "integrations_list"
                 if self.auth.allows("mcp") || self.auth.allows("integrations:read") =>
             {
@@ -409,10 +450,10 @@ impl ToolProvider for AdminProvider {
                     safe_integration(&self.app, integration, access)
                 })
                 .ok_or_else(|| anyhow::anyhow!("integration not found")),
-            "clients_list" if self.auth.allows("clients:read") => Ok(serde_json::to_value(
+            "agents_list" if self.auth.allows("agents:read") => Ok(serde_json::to_value(
                 self.app.db.agent_clients(&self.auth.user)?,
             )?),
-            "tokens_list" if self.auth.allows("clients:read") => Ok(serde_json::to_value(
+            "tokens_list" if self.auth.allows("agents:read") => Ok(serde_json::to_value(
                 self.app.db.agent_tokens(&self.auth.user)?,
             )?),
             "audit_list" if self.auth.allows("audit:read") => {
@@ -458,13 +499,13 @@ impl ToolProvider for AdminProvider {
             "integration_delete" if self.auth.allows("integrations:write") => {
                 admin_delete(&self.app, &self.auth.user, id()?).await
             }
-            "client_revoke" if self.auth.allows("clients:write") => {
+            "agent_revoke" if self.auth.allows("agents:write") => {
                 admin_revoke_client(&self.app, &self.auth.user, id()?).await
             }
-            "token_revoke" if self.auth.allows("clients:write") => {
+            "token_revoke" if self.auth.allows("agents:write") => {
                 admin_revoke_token(&self.app, &self.auth.user, id()?).await
             }
-            "client_integration_revoke" if self.auth.allows("clients:write") => {
+            "identity_grant_revoke" if self.auth.allows("agents:write") => {
                 let client = args
                     .get("client_id")
                     .and_then(Value::as_str)
@@ -652,6 +693,12 @@ impl ToolProvider for GitControlProvider {
                     integration_id,
                     &resolved,
                 )?;
+                // GitHub App repository selection is the authorization boundary.
+                // Materialize that provider-approved write access for this
+                // identity so credentials minted immediately afterward are usable.
+                self.app
+                    .db
+                    .set_git_grant(&self.auth.user, &self.auth.client, &repo.id, "write")?;
                 persist(&self.app).await?;
                 Ok(
                     json!({"repositoryId":repo.id,"displayName":repo.display_name,"remoteUrl":format!("{}/git/{}.git",self.app.config.base_url.as_str().trim_end_matches('/'),repo.id),"credential":{"username":"cog","source":"remote_credentials","useHttpPath":true}}),
@@ -1138,6 +1185,10 @@ fn build_router(app: App) -> Router {
         .route("/ui/", get(admin_ui))
         .route("/ui/assets/{*path}", get(ui_asset))
         .route("/ui/integrations", post(ui_add_integration))
+        .route("/ui/identities", post(ui_create_identity))
+        .route("/ui/identities/{id}/rename", post(ui_rename_identity))
+        .route("/ui/identities/{id}/delete", post(ui_delete_identity))
+        .route("/ui/agents/{id}/rename", post(ui_rename_agent))
         .route("/ui/integrations/{id}/delete", post(ui_delete_integration))
         .route(
             "/ui/integrations/{id}/disconnect",
@@ -1166,7 +1217,7 @@ fn build_router(app: App) -> Router {
             "/oauth/register",
             post(register).layer(DefaultBodyLimit::max(32 * 1_024)),
         )
-        .route("/oauth/authorize", get(authorize).post(authorize_post))
+        .route("/oauth/authorize", get(authorize_page))
         .route("/oauth/token", post(token))
         .route("/oauth/revoke", post(revoke_token))
         .route("/mcp", post(mcp_endpoint))
@@ -1219,6 +1270,10 @@ fn build_router(app: App) -> Router {
         )
         .route("/api/audit", get(list_audit_events))
         .route("/api/ui", get(ui_bootstrap))
+        .route(
+            "/api/oauth/consent",
+            get(authorize_consent).post(authorize_post),
+        )
         .route("/oauth/upstream/callback", get(upstream_callback))
         .with_state(app)
 }
@@ -1421,7 +1476,7 @@ async fn git_smart_http(
         GitOperation::Read if endpoint == "info/refs" => "git.fetch",
         GitOperation::Read => "git.clone",
     };
-    let _=a.db.record_audit(Some(&context.user_id),action,Some(&repository),if status.is_success(){"success"}else{"upstream_denied"},&json!({"client_id":context.client_id,"integration_id":repo.integration_id,"operation":format!("{operation:?}"),"upstream_status":status.as_u16()}));
+    let _=a.db.record_audit(Some(&context.user_id),action,Some(&repository),if status.is_success(){"success"}else{"upstream_denied"},&json!({"identity_id":context.identity_id,"agent_id":context.agent_id,"client_id":context.client_id,"integration_id":repo.integration_id,"operation":format!("{operation:?}"),"upstream_status":status.as_u16()}));
     if !status.is_success() {
         a.metrics
             .git_upstream_failures
@@ -1888,7 +1943,11 @@ async fn ui_bootstrap(State(a): State<App>, headers: HeaderMap) -> impl IntoResp
                     .unwrap_or_default();
                 json!({
                     "id": integration.id,
+                    "identity_id":integration.identity_id,
                     "name": integration.name,
+                    "display_name":integration.name,
+                    "provider_name":integration.provider_name,
+                    "provider_account":integration.provider_account,
                     "transport": integration.transport,
                     "enabled": integration.enabled,
                     "oauth": oauth,
@@ -1902,6 +1961,12 @@ async fn ui_bootstrap(State(a): State<App>, headers: HeaderMap) -> impl IntoResp
     };
     let clients = a.db.agent_clients(&user).unwrap_or_default();
     let tokens = a.db.agent_tokens(&user).unwrap_or_default();
+    let identities=a.db.list_identities(&user).unwrap_or_default().into_iter().map(|identity|{
+        let connections=integrations.iter().filter(|connection|connection.get("identity_id").and_then(Value::as_str)==Some(identity.id.as_str())).cloned().collect::<Vec<_>>();
+        let agents=a.db.agents_for_identity(&user,&identity.id).unwrap_or_default();
+        let grants=a.db.identity_grants(&user,&identity.id).unwrap_or_default();
+        json!({"id":identity.id,"name":identity.name,"created_at":identity.created_at,"updated_at":identity.updated_at,"connections":connections,"agents":agents,"grants":grants})
+    }).collect::<Vec<_>>();
     Json(json!({
         "mode": "admin",
         "user": user,
@@ -1909,6 +1974,7 @@ async fn ui_bootstrap(State(a): State<App>, headers: HeaderMap) -> impl IntoResp
         "integrations": integrations,
         "clients": clients,
         "tokens": tokens,
+        "identities": identities,
     }))
     .into_response()
 }
@@ -1918,6 +1984,115 @@ struct UiIntegrationForm {
     name: String,
     url: url::Url,
     csrf_token: String,
+}
+#[derive(Deserialize)]
+struct UiNameForm {
+    name: String,
+    csrf_token: String,
+}
+async fn ui_create_identity(
+    State(a): State<App>,
+    headers: HeaderMap,
+    Form(form): Form<UiNameForm>,
+) -> impl IntoResponse {
+    let user = match ui_user(&a, &headers, &form.csrf_token) {
+        Ok(user) => user,
+        Err(error) => return (StatusCode::FORBIDDEN, error).into_response(),
+    };
+    match a.db.create_identity(&user, &form.name) {
+        Ok(id) => {
+            let _ = a.db.record_audit(
+                Some(&user),
+                "identity.create",
+                Some(&id),
+                "success",
+                &json!({"identity_id":id}),
+            );
+            if let Err(error) = persist(&a).await {
+                return (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response();
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    }
+}
+async fn ui_rename_identity(
+    State(a): State<App>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Form(form): Form<UiNameForm>,
+) -> impl IntoResponse {
+    let user = match ui_user(&a, &headers, &form.csrf_token) {
+        Ok(user) => user,
+        Err(error) => return (StatusCode::FORBIDDEN, error).into_response(),
+    };
+    match a.db.rename_identity(&user, &id, &form.name) {
+        Ok(true) => {
+            let _ = a.db.record_audit(
+                Some(&user),
+                "identity.rename",
+                Some(&id),
+                "success",
+                &json!({"identity_id":id}),
+            );
+            let _ = persist(&a).await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    }
+}
+async fn ui_delete_identity(
+    State(a): State<App>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Form(form): Form<CsrfForm>,
+) -> impl IntoResponse {
+    let user = match ui_user(&a, &headers, &form.csrf_token) {
+        Ok(user) => user,
+        Err(error) => return (StatusCode::FORBIDDEN, error).into_response(),
+    };
+    match a.db.delete_identity(&user, &id) {
+        Ok(true) => {
+            let _ = a.db.record_audit(
+                Some(&user),
+                "identity.delete",
+                Some(&id),
+                "success",
+                &json!({"identity_id":id}),
+            );
+            let _ = persist(&a).await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    }
+}
+async fn ui_rename_agent(
+    State(a): State<App>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Form(form): Form<UiNameForm>,
+) -> impl IntoResponse {
+    let user = match ui_user(&a, &headers, &form.csrf_token) {
+        Ok(user) => user,
+        Err(error) => return (StatusCode::FORBIDDEN, error).into_response(),
+    };
+    match a.db.rename_agent(&user, &id, &form.name) {
+        Ok(true) => {
+            let _ = a.db.record_audit(
+                Some(&user),
+                "agent.rename",
+                Some(&id),
+                "success",
+                &json!({"agent_id":id}),
+            );
+            let _ = persist(&a).await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    }
 }
 
 fn ui_user(a: &App, headers: &HeaderMap, csrf: &str) -> Result<String, &'static str> {
@@ -2113,8 +2288,8 @@ async fn auth_metadata(State(a): State<App>) -> Json<Value> {
         "mcp".to_owned(),
         "integrations:read".to_owned(),
         "integrations:write".to_owned(),
-        "clients:read".to_owned(),
-        "clients:write".to_owned(),
+        "agents:read".to_owned(),
+        "agents:write".to_owned(),
         "audit:read".to_owned(),
         "git:read".to_owned(),
         "git:write".to_owned(),
@@ -2216,6 +2391,8 @@ struct ConsentRequest {
     requested_scope: String,
     resource: String,
     user: String,
+    allowed_identity_ids: Vec<String>,
+    fixed_identity_id: Option<String>,
     expires_at: i64,
     #[serde(default)]
     git_pending_ids: Vec<String>,
@@ -2239,17 +2416,16 @@ fn scope_mcp() -> String {
     "mcp".into()
 }
 
-fn standalone_page(eyebrow: &str, title: &str, body: &str, tone: &str) -> String {
+fn standalone_page(eyebrow: &str, title: &str, body: &str, _tone: &str) -> String {
     format!(
         r##"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><meta name="theme-color" content="#fafafa"><title>{title} · Clanker Operations Gateway</title><style>
-:root{{color-scheme:light;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#18181b;background:#fafafa;font-synthesis:none}}*{{box-sizing:border-box}}body{{margin:0;min-width:320px;min-height:100vh;background:radial-gradient(circle at 20% 0%,#dbeafe 0,transparent 32rem),#fafafa}}main{{width:min(100% - 2rem,720px);min-height:100vh;margin:auto;padding:2rem 0;display:grid;grid-template-rows:auto 1fr auto}}header{{display:flex;align-items:center;gap:.75rem}}.mark{{width:2.5rem;height:2.5rem;display:grid;place-items:center;border-radius:.75rem;background:#3b82f6;color:white;box-shadow:0 10px 25px rgba(59,130,246,.25)}}.brand{{font-size:1.05rem;font-weight:750;letter-spacing:-.02em}}.tagline,.muted{{color:#71717a}}.tagline{{font-size:.75rem}}.stage{{display:grid;place-items:center;padding:2.5rem 0}}.card{{width:100%;padding:clamp(1.35rem,5vw,2.25rem);border:1px solid #e4e4e7;border-radius:1.25rem;background:rgba(255,255,255,.88);box-shadow:0 22px 55px rgba(39,39,42,.12);backdrop-filter:blur(14px)}}.eyebrow{{margin:0;color:#2563eb;font-size:.72rem;font-weight:750;text-transform:uppercase;letter-spacing:.18em}}h1{{margin:.65rem 0 0;font-size:clamp(1.75rem,5vw,2.35rem);line-height:1.1;letter-spacing:-.035em}}p{{line-height:1.65}}.lead{{margin:.85rem 0 0;color:#52525b}}.notice{{margin:1.4rem 0 0;padding:1rem;border:1px solid #e4e4e7;border-radius:.8rem;background:#fafafa;color:#52525b;font-size:.9rem}}.notice.success{{border-color:#bbf7d0;background:#f0fdf4;color:#166534}}.notice.warning{{border-color:#fde68a;background:#fffbeb;color:#92400e}}.notice.danger{{border-color:#fecaca;background:#fef2f2;color:#991b1b}}.button{{appearance:none;border:0;border-radius:.65rem;padding:.72rem 1rem;background:#3b82f6;color:white;font:inherit;font-size:.9rem;font-weight:700;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;transition:background .15s,transform .15s}}.button:hover{{background:#2563eb}}.button:active{{transform:translateY(1px)}}.button.secondary{{border:1px solid #e4e4e7;background:white;color:#3f3f46}}.button.secondary:hover{{background:#f4f4f5}}.actions{{display:flex;gap:.75rem;margin-top:1.5rem}}footer{{padding:.5rem 0;color:#a1a1aa;text-align:center;font-size:.72rem}}code{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}}{tone_css}
+:root{{color-scheme:light;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#18181b;background:#fafafa;font-synthesis:none}}*{{box-sizing:border-box}}body{{margin:0;min-width:320px;min-height:100vh;background:radial-gradient(circle at 20% 0%,#dbeafe 0,transparent 32rem),#fafafa}}main{{width:min(100% - 2rem,720px);min-height:100vh;margin:auto;padding:2rem 0;display:grid;grid-template-rows:auto 1fr auto}}header{{display:flex;align-items:center;gap:.75rem}}.mark{{width:2.5rem;height:2.5rem;display:grid;place-items:center;border-radius:.75rem;background:#3b82f6;color:white;box-shadow:0 10px 25px rgba(59,130,246,.25)}}.brand{{font-size:1.05rem;font-weight:750;letter-spacing:-.02em}}.tagline,.muted{{color:#71717a}}.tagline{{font-size:.75rem}}.stage{{display:grid;place-items:center;padding:2.5rem 0}}.card{{width:100%;padding:clamp(1.35rem,5vw,2.25rem);border:1px solid #e4e4e7;border-radius:1.25rem;background:rgba(255,255,255,.88);box-shadow:0 22px 55px rgba(39,39,42,.12);backdrop-filter:blur(14px)}}.eyebrow{{margin:0;color:#2563eb;font-size:.72rem;font-weight:750;text-transform:uppercase;letter-spacing:.18em}}h1{{margin:.65rem 0 0;font-size:clamp(1.75rem,5vw,2.35rem);line-height:1.1;letter-spacing:-.035em}}p{{line-height:1.65}}.lead{{margin:.85rem 0 0;color:#52525b}}.notice{{margin:1.4rem 0 0;padding:1rem;border:1px solid #e4e4e7;border-radius:.8rem;background:#fafafa;color:#52525b;font-size:.9rem}}.notice.success{{border-color:#bbf7d0;background:#f0fdf4;color:#166534}}.notice.warning{{border-color:#fde68a;background:#fffbeb;color:#92400e}}.notice.danger{{border-color:#fecaca;background:#fef2f2;color:#991b1b}}.button{{appearance:none;border:0;border-radius:.65rem;padding:.72rem 1rem;background:#3b82f6;color:white;font:inherit;font-size:.9rem;font-weight:700;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;transition:background .15s,transform .15s}}.button:hover{{background:#2563eb}}.button:active{{transform:translateY(1px)}}.button.secondary{{border:1px solid #e4e4e7;background:white;color:#3f3f46}}.button.secondary:hover{{background:#f4f4f5}}.actions{{display:flex;gap:.75rem;margin-top:1.5rem}}footer{{padding:.5rem 0;color:#a1a1aa;text-align:center;font-size:.72rem}}code{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}}
 @media(max-width:520px){{.actions{{flex-direction:column}}.button{{width:100%}}}}
 @media(prefers-color-scheme:dark){{:root{{color-scheme:dark;color:#e4e4e7;background:#09090b}}body{{background:radial-gradient(circle at 20% 0%,#18233b 0,transparent 32rem),#09090b}}.card{{border-color:rgba(255,255,255,.1);background:rgba(24,24,27,.82);box-shadow:0 24px 70px rgba(0,0,0,.3)}}.tagline,.muted{{color:#a1a1aa}}.lead{{color:#a1a1aa}}.notice{{border-color:rgba(255,255,255,.1);background:rgba(0,0,0,.22);color:#d4d4d8}}.notice.success{{border-color:rgba(34,197,94,.25);background:rgba(34,197,94,.1);color:#bbf7d0}}.notice.warning{{border-color:rgba(245,158,11,.25);background:rgba(245,158,11,.1);color:#fde68a}}.notice.danger{{border-color:rgba(239,68,68,.25);background:rgba(239,68,68,.1);color:#fecaca}}.button.secondary{{border-color:rgba(255,255,255,.12);background:rgba(255,255,255,.05);color:#e4e4e7}}.button.secondary:hover{{background:rgba(255,255,255,.1)}}}}
 </style></head><body><main><header><div class="mark" aria-hidden="true"><svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 14.9V9.1a2 2 0 0 1 1-1.73l6-3.46a2 2 0 0 1 2 0l6 3.46a2 2 0 0 1 1 1.73v5.8a2 2 0 0 1-1 1.73l-6 3.46a2 2 0 0 1-2 0l-6-3.46a2 2 0 0 1-1-1.73Z"/><path d="m8.5 10 3.5 2 3.5-2M12 12v4"/></svg></div><div><div class="brand">COG</div><div class="tagline">Clanker Operations Gateway</div></div></header><section class="stage"><article class="card"><p class="eyebrow">{eyebrow}</p><h1>{title}</h1>{body}</article></section><footer>Secure authorization by Clanker Operations Gateway</footer></main></body></html>"##,
         eyebrow = html_escape(eyebrow),
         title = html_escape(title),
         body = body,
-        tone_css = if tone == "consent" { CONSENT_CSS } else { "" },
     )
 }
 
@@ -2268,8 +2444,6 @@ fn browser_error(status: StatusCode, title: &str, message: &str) -> Response {
     )
         .into_response()
 }
-
-const CONSENT_CSS: &str = r#".client{display:flex;gap:.85rem;align-items:center;margin:1.35rem 0;padding:1rem;border:1px solid #e4e4e7;border-radius:.9rem;background:#fafafa}.client-icon{width:2.6rem;height:2.6rem;flex:0 0 auto;display:grid;place-items:center;border-radius:.75rem;background:#eff6ff;color:#2563eb;font-weight:800}.client-name{font-weight:700}.client-detail{margin-top:.15rem;color:#71717a;font-size:.78rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:30rem}fieldset{margin:0;padding:0;border:0}legend{font-size:.8rem;font-weight:750;text-transform:uppercase;letter-spacing:.11em;color:#71717a;margin-bottom:.7rem}.permission-group+.permission-group{margin-top:1.35rem}.permission-group h2{margin:0 0 .55rem;font-size:.78rem;text-transform:uppercase;letter-spacing:.09em;color:#52525b}.permission{position:relative;display:grid;grid-template-columns:auto 1fr auto;gap:.8rem;align-items:start;padding:1rem;border:1px solid #e4e4e7;border-radius:.85rem;background:white;cursor:pointer;transition:border-color .15s,background .15s,transform .15s}.permission+.permission{margin-top:.65rem}.permission:hover{border-color:#93c5fd;background:#f8fbff}.permission:has(input:checked){border-color:#93c5fd;background:#eff6ff}.permission.permission-new{border-color:#60a5fa;background:#eff6ff;box-shadow:0 0 0 2px rgba(59,130,246,.12)}.permission.permission-other{opacity:.68}.permission:has(input:disabled){cursor:default}.permission input{width:1.1rem;height:1.1rem;margin:.15rem 0 0;accent-color:#3b82f6}.permission-title{display:block;font-size:.92rem;font-weight:700}.permission-copy{display:block;margin-top:.2rem;color:#71717a;font-size:.8rem;line-height:1.45}.required{padding:.2rem .5rem;border-radius:999px;background:#dbeafe;color:#1d4ed8;font-size:.66rem;font-weight:750;text-transform:uppercase;letter-spacing:.06em}.privacy{display:flex;gap:.55rem;align-items:flex-start;margin:1.1rem 0 0;color:#71717a;font-size:.78rem;line-height:1.5}@media(prefers-color-scheme:dark){.client{border-color:rgba(255,255,255,.1);background:rgba(0,0,0,.2)}.client-icon{background:rgba(59,130,246,.12);color:#93c5fd}.client-detail,legend,.permission-copy,.privacy{color:#a1a1aa}.permission-group h2{color:#a1a1aa}.permission{border-color:rgba(255,255,255,.1);background:rgba(0,0,0,.18)}.permission:hover,.permission:has(input:checked),.permission.permission-new{border-color:rgba(96,165,250,.55);background:rgba(59,130,246,.12)}.required{background:rgba(59,130,246,.15);color:#bfdbfe}}"#;
 
 fn permission_copy(scope: &str, integration_name: Option<&str>) -> (String, String) {
     if let Some(name) = integration_name {
@@ -2291,11 +2465,11 @@ fn permission_copy(scope: &str, integration_name: Option<&str>) -> (String, Stri
             "Manage integrations".into(),
             "Create, change, reconnect, enable, or delete integrations.".into(),
         ),
-        "clients:read" => (
+        "agents:read" => (
             "View agent access".into(),
             "See authorized clients and issued credentials.".into(),
         ),
-        "clients:write" => (
+        "agents:write" => (
             "Manage agent access".into(),
             "Revoke clients, credentials, and integration grants.".into(),
         ),
@@ -2337,8 +2511,8 @@ fn available_consent_scopes(a: &App, user: &str) -> Vec<String> {
         "mcp".to_owned(),
         "integrations:read".to_owned(),
         "integrations:write".to_owned(),
-        "clients:read".to_owned(),
-        "clients:write".to_owned(),
+        "agents:read".to_owned(),
+        "agents:write".to_owned(),
         "audit:read".to_owned(),
         "git:read".to_owned(),
         "git:write".to_owned(),
@@ -2361,13 +2535,13 @@ enum ConsentPermissionKind {
     Other,
 }
 
-fn consent_permission(
+fn consent_permission_json(
     a: &App,
     user: &str,
     scope: &str,
     index: Option<usize>,
     kind: ConsentPermissionKind,
-) -> String {
+) -> Value {
     let integration = scope.strip_prefix("integration:").and_then(|id| {
         a.db.integration(id, user)
             .ok()
@@ -2375,36 +2549,36 @@ fn consent_permission(
             .map(|integration| integration.name)
     });
     let (label, description) = permission_copy(scope, integration.as_deref());
-    let input_name = index
-        .map(|index| format!(" name=\"scope_{index}\" value=\"on\""))
-        .unwrap_or_default();
-    let (checked, disabled, badge, class_name) = match kind {
-        ConsentPermissionKind::New => (true, false, "New access", "permission-new"),
-        ConsentPermissionKind::Approved => (true, false, "Approved", ""),
-        ConsentPermissionKind::ApprovedNotRequested => (true, true, "Approved", ""),
-        ConsentPermissionKind::Required { new } => (
-            true,
-            true,
-            "Required",
-            if new { "permission-new" } else { "" },
-        ),
-        ConsentPermissionKind::Other => (false, true, "Not requested", "permission-other"),
+    let (checked, disabled, badge, tone) = match kind {
+        ConsentPermissionKind::New => (true, false, "New access", "new"),
+        ConsentPermissionKind::Approved => (true, false, "Approved", "approved"),
+        ConsentPermissionKind::ApprovedNotRequested => (true, true, "Approved", "approved"),
+        ConsentPermissionKind::Required { new } => {
+            (true, true, "Required", if new { "new" } else { "approved" })
+        }
+        ConsentPermissionKind::Other => (false, true, "Not requested", "other"),
     };
-    format!(
-        "<label class=\"permission {class_name}\"><input type=\"checkbox\"{input_name} {checked} {disabled}><span><span class=\"permission-title\">{label}</span><span class=\"permission-copy\">{description}</span></span>{badge}</label>",
-        checked = if checked { "checked" } else { "" },
-        disabled = if disabled { "disabled" } else { "" },
-        label = html_escape(&label),
-        description = html_escape(&description),
-        badge = if badge.is_empty() {
-            String::new()
-        } else {
-            format!("<span class=\"required\">{}</span>", html_escape(badge))
-        },
-    )
+    json!({
+        "scope": scope,
+        "field": index.map(|index| format!("scope_{index}")),
+        "label": label,
+        "description": description,
+        "checked": checked,
+        "disabled": disabled,
+        "badge": badge,
+        "tone": tone,
+    })
 }
 
-async fn authorize(
+fn consent_api_error(status: StatusCode, error: &str, message: &str) -> Response {
+    (status, Json(json!({"error":error,"message":message}))).into_response()
+}
+
+async fn authorize_page() -> Response {
+    ui_shell()
+}
+
+async fn authorize_consent(
     State(a): State<App>,
     headers: HeaderMap,
     axum::extract::Query(q): axum::extract::Query<Authorize>,
@@ -2413,7 +2587,7 @@ async fn authorize(
         return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response();
     }
     if q.response_type != "code" || q.code_challenge_method != "S256" {
-        return browser_error(
+        return consent_api_error(
             StatusCode::BAD_REQUEST,
             "Unsupported authorization request",
             "response_type=code and PKCE S256 are required",
@@ -2421,14 +2595,14 @@ async fn authorize(
     }
     let expected_resource = format!("{}/mcp", a.config.base_url.as_str().trim_end_matches('/'));
     if q.resource != expected_resource {
-        return browser_error(
+        return consent_api_error(
             StatusCode::BAD_REQUEST,
             "Invalid OAuth resource",
             "The authorization request is not bound to this MCP server.",
         );
     }
     let Some((client_name, _)) = a.db.client_info(&q.client_id).ok().flatten() else {
-        return browser_error(
+        return consent_api_error(
             StatusCode::BAD_REQUEST,
             "Unknown client",
             "Clanker Operations Gateway does not recognize the application that started this request.",
@@ -2439,32 +2613,42 @@ async fn authorize(
         .client_redirect_allowed(&q.client_id, &q.redirect_uri)
         .unwrap_or(false)
     {
-        return browser_error(
+        return consent_api_error(
             StatusCode::BAD_REQUEST,
             "Invalid return address",
             "The application's callback address is not registered with cog.",
         );
     }
     if browser_session(&a, &headers, None).is_none() {
-        return (
+        return consent_api_error(
             StatusCode::UNAUTHORIZED,
-            Html(standalone_page(
-                "Authorization paused",
-                "Sign in to continue",
-                "<p class=\"lead\">Your cog session is missing or expired. Sign in, then restart the authorization request from your agent.</p><div class=\"actions\"><a class=\"button\" href=\"/login\">Sign in to cog</a></div>",
-                "status",
-            )),
-        )
-            .into_response();
+            "Sign in to continue",
+            "Your cog session is missing or expired. Sign in, then restart the authorization request from your agent.",
+        );
     }
     let Some(csrf) = cookie(&headers, "cog_csrf") else {
-        return browser_error(
+        return consent_api_error(
             StatusCode::FORBIDDEN,
             "Session verification failed",
             "The browser security cookie is missing. Sign in and start a fresh authorization request.",
         );
     };
     let user = browser_session(&a, &headers, None).expect("session checked");
+    let existing_agent = a.db.agent_for_client(&q.client_id).ok().flatten();
+    if let Some(agent) = &existing_agent
+        && a.db
+            .identity(&user, &agent.identity_id)
+            .ok()
+            .flatten()
+            .is_none()
+    {
+        return consent_api_error(
+            StatusCode::FORBIDDEN,
+            "Conflicting agent binding",
+            "This OAuth client is already bound to an identity owned by another user.",
+        );
+    }
+    let identities = a.db.list_identities(&user).unwrap_or_default();
     let git_pending =
         a.db.git_pending_requests(&user, &q.client_id, chrono::Utc::now().timestamp())
             .unwrap_or_default();
@@ -2478,6 +2662,13 @@ async fn authorize(
         requested_scope: q.scope,
         resource: q.resource,
         user: user.clone(),
+        allowed_identity_ids: identities
+            .iter()
+            .map(|identity| identity.id.clone())
+            .collect(),
+        fixed_identity_id: existing_agent
+            .as_ref()
+            .map(|agent| agent.identity_id.clone()),
         expires_at: chrono::Utc::now().timestamp() + 600,
         git_pending_ids: git_pending
             .iter()
@@ -2501,7 +2692,7 @@ async fn authorize(
         .split_ascii_whitespace()
         .collect::<Vec<_>>();
     if requested.is_empty() {
-        return browser_error(
+        return consent_api_error(
             StatusCode::BAD_REQUEST,
             "No access requested",
             "The client did not request any OAuth scope.",
@@ -2515,12 +2706,12 @@ async fn authorize(
     };
     let requested_set = requested.iter().copied().collect::<HashSet<_>>();
     let available = available_consent_scopes(&a, &user);
-    let mut new_permissions = String::new();
-    let mut approved_permissions = String::new();
+    let mut new_permissions = Vec::new();
+    let mut approved_permissions = Vec::new();
     for (index, scope) in requested.iter().enumerate() {
         let required = *scope == "mcp";
         let previously_granted = granted.contains(*scope);
-        let permission = consent_permission(
+        let permission = consent_permission_json(
             &a,
             &user,
             scope,
@@ -2536,14 +2727,14 @@ async fn authorize(
             },
         );
         if previously_granted {
-            approved_permissions.push_str(&permission);
+            approved_permissions.push(permission);
         } else {
-            new_permissions.push_str(&permission);
+            new_permissions.push(permission);
         }
     }
     for scope in &available {
         if granted.contains(scope) && !requested_set.contains(scope.as_str()) {
-            approved_permissions.push_str(&consent_permission(
+            approved_permissions.push(consent_permission_json(
                 &a,
                 &user,
                 scope,
@@ -2560,7 +2751,7 @@ async fn authorize(
         .collect::<Vec<_>>();
     remaining_grants.sort();
     for scope in remaining_grants {
-        approved_permissions.push_str(&consent_permission(
+        approved_permissions.push(consent_permission_json(
             &a,
             &user,
             scope,
@@ -2568,10 +2759,10 @@ async fn authorize(
             ConsentPermissionKind::ApprovedNotRequested,
         ));
     }
-    let mut other_permissions = String::new();
+    let mut other_permissions = Vec::new();
     for scope in available {
         if !requested_set.contains(scope.as_str()) && !granted.contains(&scope) {
-            other_permissions.push_str(&consent_permission(
+            other_permissions.push(consent_permission_json(
                 &a,
                 &user,
                 &scope,
@@ -2580,38 +2771,59 @@ async fn authorize(
             ));
         }
     }
-    let mut permissions = String::new();
+    let mut permission_groups = Vec::new();
     if !new_permissions.is_empty() {
-        permissions.push_str(&format!("<section class=\"permission-group permission-group-new\"><h2>Newly requested</h2>{new_permissions}</section>"));
+        permission_groups
+            .push(json!({"title":"Newly requested","tone":"new","permissions":new_permissions}));
     }
     if !approved_permissions.is_empty() {
-        permissions.push_str(&format!("<section class=\"permission-group\"><h2>Previously approved</h2>{approved_permissions}</section>"));
+        permission_groups.push(json!({"title":"Previously approved","tone":"approved","permissions":approved_permissions}));
     }
     if !other_permissions.is_empty() {
-        permissions.push_str(&format!("<section class=\"permission-group permission-group-other\"><h2>Other available permissions</h2>{other_permissions}</section>"));
+        permission_groups.push(json!({"title":"Other available permissions","tone":"other","permissions":other_permissions}));
     }
     if !git_pending.is_empty() {
-        let requests=git_pending.iter().enumerate().map(|(index,request)|format!("<label class=\"permission permission-new\"><input type=\"checkbox\" name=\"git_request_{index}\" value=\"on\" checked><span><span class=\"permission-title\">{name}</span><span class=\"permission-copy\">{permission} access through integration {integration}</span></span><span class=\"required\">Repository</span></label>",name=html_escape(&request.display_name),permission=html_escape(&request.permission),integration=html_escape(&request.integration_id))).collect::<String>();
-        permissions.push_str(&format!("<section class=\"permission-group permission-group-new\"><h2>Exact repository access</h2>{requests}</section>"));
+        let requests=git_pending.iter().enumerate().map(|(index,request)|json!({
+            "field":format!("git_request_{index}"),
+            "label":request.display_name,
+            "description":format!("{} access through integration {}",request.permission,request.integration_id),
+            "checked":true,
+            "disabled":false,
+            "badge":"Repository",
+            "tone":"new",
+        })).collect::<Vec<_>>();
+        permission_groups
+            .push(json!({"title":"Exact repository access","tone":"new","permissions":requests}));
     }
     let redirect_host = url::Url::parse(&consent.redirect_uri)
         .ok()
         .and_then(|url| url.host_str().map(str::to_owned))
         .unwrap_or_else(|| consent.redirect_uri.clone());
-    let body = format!(
-        "<p class=\"lead\">Review newly requested access, previously approved access, and permissions this client did not request.</p><div class=\"client\"><div class=\"client-icon\">A</div><div style=\"min-width:0\"><div class=\"client-name\">{client}</div><div class=\"client-detail\">Returns securely to {redirect}</div></div></div><form method=\"post\" action=\"/oauth/authorize\"><input type=\"hidden\" name=\"consent\" value=\"{sealed}\"><input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\"><fieldset><legend>Permissions</legend>{permissions}</fieldset><p class=\"privacy\"><span aria-hidden=\"true\">&#128274;</span><span>You can revoke this client or individual integration grants from the cog dashboard at any time.</span></p><div class=\"actions\"><button class=\"button\" name=\"decision\" value=\"allow\">Allow selected access</button><button class=\"button secondary\" name=\"decision\" value=\"deny\">Cancel</button></div></form>",
-        client = html_escape(&client_name),
-        redirect = html_escape(&redirect_host),
-        sealed = html_escape(&sealed),
-        csrf = html_escape(&csrf),
+    let fixed_identity = consent.fixed_identity_id.as_ref().map(|id| {
+        let name = identities
+            .iter()
+            .find(|item| &item.id == id)
+            .map(|item| item.name.as_str())
+            .unwrap_or("Unknown identity");
+        json!({"id":id,"name":name})
+    });
+    let identities = identities
+        .into_iter()
+        .map(|identity| json!({"id":identity.id,"name":identity.name}))
+        .collect::<Vec<_>>();
+    let mut response = Json(json!({
+        "client":{"name":client_name,"id":consent.client_id.chars().take(12).collect::<String>(),"redirectHost":redirect_host},
+        "consent":sealed,
+        "csrfToken":csrf,
+        "identities":identities,
+        "fixedIdentity":fixed_identity,
+        "permissionGroups":permission_groups,
+    })).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
     );
-    Html(standalone_page(
-        "Agent authorization",
-        "Approve access",
-        &body,
-        "consent",
-    ))
-    .into_response()
+    response
 }
 async fn authorize_post(
     State(a): State<App>,
@@ -2691,6 +2903,54 @@ async fn authorize_post(
     if form.decision != "allow" {
         return (StatusCode::BAD_REQUEST, "invalid consent decision").into_response();
     }
+    let selected_identity = form
+        .fields
+        .get("identity_id")
+        .map(String::as_str)
+        .or(consent.fixed_identity_id.as_deref())
+        .unwrap_or("");
+    let identity_id = if let Some(fixed) = &consent.fixed_identity_id {
+        if selected_identity != fixed {
+            return (
+                StatusCode::FORBIDDEN,
+                "agent identity binding cannot be changed",
+            )
+                .into_response();
+        }
+        fixed.clone()
+    } else if selected_identity.is_empty() {
+        let name = form
+            .fields
+            .get("new_identity_name")
+            .map(String::as_str)
+            .unwrap_or("");
+        match a.db.create_identity(&user, name) {
+            Ok(id) => id,
+            Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+        }
+    } else {
+        if !consent
+            .allowed_identity_ids
+            .iter()
+            .any(|id| id == selected_identity)
+            || a.db
+                .identity(&user, selected_identity)
+                .ok()
+                .flatten()
+                .is_none()
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                "identity is unavailable or belongs to another user",
+            )
+                .into_response();
+        }
+        selected_identity.to_owned()
+    };
+    let agent = match a.db.bind_agent(&user, &identity_id, &consent.client_id) {
+        Ok(agent) => agent,
+        Err(error) => return (StatusCode::FORBIDDEN, error.to_string()).into_response(),
+    };
     let requested = consent
         .requested_scope
         .split_ascii_whitespace()
@@ -2707,6 +2967,9 @@ async fn authorize_post(
         }
     }
     let granted_scope = granted.join(" ");
+    if let Err(error) = a.db.set_identity_grants(&user, &identity_id, &granted) {
+        return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
+    }
     let selected_git = consent
         .git_pending_ids
         .iter()
@@ -2738,7 +3001,7 @@ async fn authorize_post(
                 "oauth.consent",
                 Some(&consent.client_id),
                 "allowed",
-                &json!({"requested_scopes": consent.requested_scope.split_ascii_whitespace().collect::<Vec<_>>(), "granted_scopes": granted_scope.split_ascii_whitespace().collect::<Vec<_>>(),"git_repository_grants":approved_git}),
+                &json!({"identity_id":identity_id,"agent_id":agent.id,"client_id":consent.client_id,"requested_scopes": consent.requested_scope.split_ascii_whitespace().collect::<Vec<_>>(), "granted_scopes": granted_scope.split_ascii_whitespace().collect::<Vec<_>>(),"git_repository_grants":approved_git}),
             ) {
                 return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
             }
@@ -2969,6 +3232,7 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
         .ok()?
         .strip_prefix("Bearer ")
 }
+#[derive(Debug)]
 enum AuthFailure {
     Missing,
     Invalid,
@@ -2979,7 +3243,9 @@ enum AuthFailure {
 #[derive(Clone)]
 struct AuthContext {
     user: String,
+    agent: String,
     client: String,
+    identity: String,
     scopes: HashSet<String>,
     integrations: HashSet<String>,
 }
@@ -2992,8 +3258,8 @@ impl AuthContext {
                     required,
                     "integrations:read"
                         | "integrations:write"
-                        | "clients:read"
-                        | "clients:write"
+                        | "agents:read"
+                        | "agents:write"
                         | "audit:read"
                 ))
     }
@@ -3007,7 +3273,9 @@ fn auth_context(a: &App, h: &HeaderMap) -> Result<AuthContext, AuthFailure> {
             .ok_or(AuthFailure::Invalid)?;
     Ok(AuthContext {
         user: row.user_id,
+        agent: row.agent_id,
         client: row.client_id,
+        identity: row.identity_id,
         scopes: row.scopes.into_iter().collect(),
         integrations: row.integration_ids.into_iter().collect(),
     })
@@ -3102,6 +3370,7 @@ fn mcp_protocol_version_valid(headers: &HeaderMap) -> bool {
         .is_none_or(mcp::protocol_version_supported)
 }
 async fn catalog(a: &App, auth: &AuthContext) -> anyhow::Result<Catalog> {
+    let _agent_id = &auth.agent;
     let mut c = Catalog::new();
     c.add_labeled(
         "git".into(),
@@ -3123,7 +3392,7 @@ async fn catalog(a: &App, auth: &AuthContext) -> anyhow::Result<Catalog> {
     for i in
         a.db.list_integrations(&auth.user)?
             .into_iter()
-            .filter(|i| i.enabled)
+            .filter(|i| i.enabled && (compatibility_all || i.identity_id == auth.identity))
     {
         let authorized = compatibility_all || auth.integrations.contains(&i.id);
         let oauth_enabled = i.config.get("oauth").is_some_and(|value| !value.is_null());
@@ -3371,8 +3640,8 @@ fn admin_required_scope(tool: &str) -> Option<&'static str> {
         | "integration_authorize"
         | "integration_set_enabled"
         | "integration_delete" => "integrations:write",
-        "clients_list" | "tokens_list" => "clients:read",
-        "client_revoke" | "token_revoke" | "client_integration_revoke" => "clients:write",
+        "agents_list" | "tokens_list" => "agents:read",
+        "agent_revoke" | "token_revoke" | "identity_grant_revoke" => "agents:write",
         "audit_list" => "audit:read",
         _ => return None,
     })
@@ -3415,9 +3684,9 @@ async fn get_integration(
 }
 
 async fn list_agent_clients(State(a): State<App>, headers: HeaderMap) -> impl IntoResponse {
-    let user = match scoped_user(&a, &headers, "clients:read") {
+    let user = match scoped_user(&a, &headers, "agents:read") {
         Ok(user) => user,
-        Err(failure) => return auth_failure(&a, failure, "clients:read"),
+        Err(failure) => return auth_failure(&a, failure, "agents:read"),
     };
     match a.db.agent_clients(&user) {
         Ok(clients) => Json(json!(clients)).into_response(),
@@ -3426,9 +3695,9 @@ async fn list_agent_clients(State(a): State<App>, headers: HeaderMap) -> impl In
 }
 
 async fn list_agent_tokens(State(a): State<App>, headers: HeaderMap) -> impl IntoResponse {
-    let user = match scoped_user(&a, &headers, "clients:read") {
+    let user = match scoped_user(&a, &headers, "agents:read") {
         Ok(user) => user,
-        Err(failure) => return auth_failure(&a, failure, "clients:read"),
+        Err(failure) => return auth_failure(&a, failure, "agents:read"),
     };
     match a.db.agent_tokens(&user) {
         Ok(tokens) => Json(json!(tokens)).into_response(),
@@ -3441,9 +3710,9 @@ async fn revoke_agent_client(
     Path(client): Path<String>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let user = match scoped_user(&a, &headers, "clients:write") {
+    let user = match scoped_user(&a, &headers, "agents:write") {
         Ok(user) => user,
-        Err(failure) => return auth_failure(&a, failure, "clients:write"),
+        Err(failure) => return auth_failure(&a, failure, "agents:write"),
     };
     match admin_revoke_client(&a, &user, &client).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
@@ -3459,9 +3728,9 @@ async fn revoke_agent_grant(
     Path((client, integration)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let user = match scoped_user(&a, &headers, "clients:write") {
+    let user = match scoped_user(&a, &headers, "agents:write") {
         Ok(user) => user,
-        Err(failure) => return auth_failure(&a, failure, "clients:write"),
+        Err(failure) => return auth_failure(&a, failure, "agents:write"),
     };
     match admin_revoke_grant(&a, &user, &client, &integration).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
@@ -3477,9 +3746,9 @@ async fn revoke_agent_token(
     Path(token): Path<String>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let user = match scoped_user(&a, &headers, "clients:write") {
+    let user = match scoped_user(&a, &headers, "agents:write") {
         Ok(user) => user,
-        Err(failure) => return auth_failure(&a, failure, "clients:write"),
+        Err(failure) => return auth_failure(&a, failure, "agents:write"),
     };
     match admin_revoke_token(&a, &user, &token).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
@@ -3887,7 +4156,7 @@ async fn github_app_setup_launch(State(a): State<App>, Path(state): Path<String>
         "redirect_url": callback,
         "setup_url": installation_callback,
         "public": false,
-        "default_permissions": {"contents": "write"},
+        "default_permissions": {"contents": "write", "workflows": "write"},
         "default_events": []
     });
     let body = format!(
@@ -5422,12 +5691,15 @@ mod tests {
                 None,
             )
             .unwrap();
-        let oauth: &'static str = Box::leak(
+        let oauth: &'static str = Box::leak({
+            app.db
+                .set_git_grant(&user, "git-client", &repository.id, "write")
+                .unwrap();
             app.db
                 .issue_git_credential(&user, "git-client", &repository.id, "write", 900)
                 .unwrap()
-                .into_boxed_str(),
-        );
+                .into_boxed_str()
+        });
         let authorizations = Arc::new(std::sync::Mutex::new(Vec::new()));
         app.git_providers.lock().await.insert(
             integration.clone(),
@@ -5521,7 +5793,7 @@ mod tests {
             .oneshot(request(oauth, "git-upload-pack", None, "fetch"))
             .await
             .unwrap();
-        assert_eq!(disabled.status(), StatusCode::FORBIDDEN);
+        assert_eq!(disabled.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(fixture.0.lock().unwrap().len(), before);
         app.db
             .update_integration(&integration, &user, None, None, Some(true), None)
@@ -5723,6 +5995,8 @@ mod tests {
             app: app.clone(),
             auth: AuthContext {
                 user: user.clone(),
+                agent: "test-agent".into(),
+                identity: "test-identity".into(),
                 client: "git-client".into(),
                 scopes: HashSet::from([format!("integration:{integration}")]),
                 integrations: HashSet::from([integration.clone()]),
@@ -5752,6 +6026,13 @@ mod tests {
                 .contains(&pending_repo.id)
         );
         assert_eq!(allowed["credential"]["source"], "remote_credentials");
+        assert_eq!(
+            app.db
+                .git_grant_permission(&user, "git-client", &pending_repo.id)
+                .unwrap()
+                .as_deref(),
+            Some("write")
+        );
         assert!(control.call("unknown", json!({})).await.is_err());
         if let Authority::S3(lease) = &app.lease {
             lease.relinquish().await.unwrap();
@@ -5765,6 +6046,8 @@ mod tests {
             app: app.clone(),
             auth: AuthContext {
                 user: user.clone(),
+                agent: "test-agent".into(),
+                identity: "test-identity".into(),
                 client: "git-client".into(),
                 scopes: HashSet::from([format!("integration:{integration}")]),
                 integrations: HashSet::from([integration.clone()]),
@@ -5979,6 +6262,9 @@ mod tests {
                 None,
                 None,
             )
+            .unwrap();
+        app.db
+            .set_git_grant(&user, "real-git", &repository.id, "write")
             .unwrap();
         let oauth = app
             .db
@@ -6275,7 +6561,7 @@ mod tests {
         );
         db.register_client(
             "test-client",
-            None,
+            Some(&user),
             "test",
             &["http://localhost/callback".into()],
         )
@@ -6295,10 +6581,7 @@ mod tests {
             http::header::AUTHORIZATION,
             "Bearer admin-token".parse().unwrap(),
         );
-        assert!(matches!(
-            scoped_user(&app, &auth_headers, "mcp"),
-            Err(AuthFailure::Insufficient)
-        ));
+        assert_eq!(scoped_user(&app, &auth_headers, "mcp").unwrap(), user);
         let integration_id = db
             .create_integration(
                 &user,
@@ -6575,6 +6858,7 @@ mod tests {
         assert!(page.contains("settings/apps/new?state="));
         assert!(page.contains("github/app/installation/callback?state="));
         assert!(page.contains("&quot;contents&quot;:&quot;write&quot;"));
+        assert!(page.contains("&quot;workflows&quot;:&quot;write&quot;"));
         assert!(!page.contains("&quot;hook_attributes&quot;"));
         assert!(!page.contains("privateKey"));
 
@@ -6587,6 +6871,8 @@ mod tests {
             app: app.clone(),
             auth: AuthContext {
                 user,
+                agent: "test-agent".into(),
+                identity: "test-identity".into(),
                 client: "manifest-client".into(),
                 scopes: HashSet::from([format!("integration:{integration}")]),
                 integrations: HashSet::from([integration.to_owned()]),
@@ -6601,12 +6887,6 @@ mod tests {
             .unwrap();
         assert_eq!(result["error"], "github_app_installation_required");
         assert_eq!(result["action"], "completeGitHubSetupThenRetry");
-    }
-
-    fn input_value(page: &str, name: &str) -> String {
-        let marker = format!("name=\"{name}\" value=\"");
-        let rest = page.split_once(&marker).unwrap().1;
-        rest.split_once('"').unwrap().0.to_owned()
     }
 
     #[test]
@@ -6726,6 +7006,8 @@ mod tests {
                 },
             )
             .unwrap();
+        let identity = app.db.list_identities(&owner).unwrap()[0].id.clone();
+        app.db.bind_agent(&owner, &identity, &client_id).unwrap();
         app.db
             .create_git_pending_request(
                 &owner,
@@ -6804,11 +7086,41 @@ mod tests {
         assert_eq!(consent.status(), StatusCode::OK);
         let consent_page = response_text(consent).await;
         assert!(consent_page.starts_with("<!doctype html>"));
-        assert!(consent_page.contains("Review newly requested access"));
-        assert!(consent_page.contains("Newly requested"));
-        assert!(consent_page.contains("Other available permissions"));
-        assert!(consent_page.contains("Legacy administrator access"));
-        let sealed_consent = input_value(&consent_page, "consent");
+        assert!(!consent_page.contains("Any grant change affects every agent"));
+        let consent = router
+            .clone()
+            .oneshot(
+                axum::http::Request::get(format!("/api/oauth/consent?{query}"))
+                    .header(http::header::COOKIE, &cookie_header)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(consent.status(), StatusCode::OK);
+        assert_eq!(consent.headers()[http::header::CACHE_CONTROL], "no-store");
+        let consent_data = response_json(consent).await;
+        assert_eq!(consent_data["client"]["name"], "route fixture");
+        assert_eq!(
+            consent_data["permissionGroups"][0]["title"],
+            "Newly requested"
+        );
+        assert!(
+            consent_data["permissionGroups"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|group| group["title"] == "Other available permissions")
+        );
+        assert!(
+            consent_data["permissionGroups"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|group| group["permissions"].as_array().unwrap())
+                .any(|permission| permission["label"] == "Legacy administrator access")
+        );
+        let sealed_consent = consent_data["consent"].as_str().unwrap().to_owned();
 
         let mut tampered = sealed_consent.clone().into_bytes();
         let middle = tampered.len() / 2;
@@ -6817,7 +7129,7 @@ mod tests {
         let rejected = router
             .clone()
             .oneshot(
-                axum::http::Request::post("/oauth/authorize")
+                axum::http::Request::post("/api/oauth/consent")
                     .header(http::header::ORIGIN, origin)
                     .header(http::header::COOKIE, &cookie_header)
                     .header(
@@ -6839,7 +7151,7 @@ mod tests {
         let authorization = router
             .clone()
             .oneshot(
-                axum::http::Request::post("/oauth/authorize")
+                axum::http::Request::post("/api/oauth/consent")
                     .header(http::header::ORIGIN, origin)
                     .header(http::header::COOKIE, &cookie_header)
                     .header(
@@ -7054,19 +7366,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(direct_step_up.status(), StatusCode::FORBIDDEN);
-        assert!(
-            direct_step_up.headers()[header::WWW_AUTHENTICATE]
-                .to_str()
-                .unwrap()
-                .contains(&format!("scope=\"mcp integration:{integration}\""))
-        );
+        assert_eq!(direct_step_up.status(), StatusCode::OK);
         let direct_step_up = response_json(direct_step_up).await;
-        assert_eq!(direct_step_up["result"]["isError"], true);
-        assert_eq!(
-            direct_step_up["result"]["structuredContent"]["requiredScopes"],
-            json!(["mcp", format!("integration:{integration}")])
-        );
+        assert_ne!(direct_step_up["result"]["isError"], true);
+        assert!(direct_step_up["result"]["structuredContent"]["requiredScopes"].is_null());
         let step_up = router
             .clone()
             .oneshot(
@@ -7091,30 +7394,9 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(step_up.status(), StatusCode::FORBIDDEN);
-        let transport_challenge = step_up
-            .headers()
-            .get(header::WWW_AUTHENTICATE)
-            .unwrap()
-            .to_str()
-            .unwrap();
-        assert!(transport_challenge.contains("error=\"insufficient_scope\""));
-        assert!(transport_challenge.contains(&format!("scope=\"mcp integration:{integration}\"")));
+        assert_eq!(step_up.status(), StatusCode::OK);
         let step_up = response_json(step_up).await;
-        assert_eq!(step_up["result"]["isError"], true);
-        assert_eq!(
-            step_up["result"]["structuredContent"]["requiredScopes"],
-            json!(["mcp", format!("integration:{integration}")])
-        );
-        let embedded_challenge = step_up["result"]["_meta"]["mcp/www_authenticate"][0]
-            .as_str()
-            .unwrap();
-        assert!(embedded_challenge.contains("error=\"insufficient_scope\""));
-        assert!(embedded_challenge.contains(&format!("scope=\"mcp integration:{integration}\"")));
-        assert!(embedded_challenge.contains(
-            "resource_metadata=\"http://localhost:4788/.well-known/oauth-protected-resource\""
-        ));
-        assert!(!embedded_challenge.contains("authorization_url"));
+        assert_ne!(step_up["result"]["isError"], true);
 
         // A capable MCP client accumulates its existing scopes with the scope
         // from the 403 challenge, performs a fresh authorization-code flow,
@@ -7133,7 +7415,7 @@ mod tests {
         let elevated_consent = router
             .clone()
             .oneshot(
-                axum::http::Request::get(format!("/oauth/authorize?{elevated_query}"))
+                axum::http::Request::get(format!("/api/oauth/consent?{elevated_query}"))
                     .header(http::header::COOKIE, &cookie_header)
                     .body(axum::body::Body::empty())
                     .unwrap(),
@@ -7141,20 +7423,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(elevated_consent.status(), StatusCode::OK);
-        let elevated_page = response_text(elevated_consent).await;
-        assert!(elevated_page.contains("metadata fixture"));
-        let new_position = elevated_page.find("Newly requested").unwrap();
-        let approved_position = elevated_page.find("Previously approved").unwrap();
-        let other_position = elevated_page.find("Other available permissions").unwrap();
-        assert!(new_position < approved_position);
-        assert!(approved_position < other_position);
-        assert!(elevated_page.contains("name=\"scope_1\" value=\"on\" checked"));
-        assert!(elevated_page.contains("name=\"scope_2\" value=\"on\" checked"));
-        let elevated_consent = input_value(&elevated_page, "consent");
+        let elevated_data = response_json(elevated_consent).await;
+        let groups = elevated_data["permissionGroups"].as_array().unwrap();
+        assert_eq!(groups[0]["title"], "Newly requested");
+        assert_eq!(groups[1]["title"], "Previously approved");
+        assert_eq!(groups[2]["title"], "Other available permissions");
+        assert!(
+            groups
+                .iter()
+                .flat_map(|group| group["permissions"].as_array().unwrap())
+                .any(|permission| permission["label"] == "Use metadata fixture")
+        );
+        assert!(groups.iter().flat_map(|group|group["permissions"].as_array().unwrap()).any(|permission|permission["field"]=="scope_1"&&permission["checked"]==true));
+        assert!(groups.iter().flat_map(|group|group["permissions"].as_array().unwrap()).any(|permission|permission["field"]=="scope_2"&&permission["checked"]==true));
+        let elevated_consent = elevated_data["consent"].as_str().unwrap().to_owned();
         let elevated_authorization = router
             .clone()
             .oneshot(
-                axum::http::Request::post("/oauth/authorize")
+                axum::http::Request::post("/api/oauth/consent")
                     .header(http::header::ORIGIN, origin)
                     .header(http::header::COOKIE, &cookie_header)
                     .header(
@@ -7296,24 +7582,9 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(dynamic_step_up.status(), StatusCode::FORBIDDEN);
-        assert!(
-            dynamic_step_up
-                .headers()
-                .get(header::WWW_AUTHENTICATE)
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .contains(&format!("scope=\"mcp integration:{integration}\""))
-        );
+        assert_eq!(dynamic_step_up.status(), StatusCode::OK);
         let dynamic_step_up = response_json(dynamic_step_up).await;
-        assert_eq!(dynamic_step_up["result"]["isError"], true);
-        let dynamic_challenge = dynamic_step_up["result"]["_meta"]["mcp/www_authenticate"][0]
-            .as_str()
-            .unwrap();
-        assert!(dynamic_challenge.contains(&format!("scope=\"mcp integration:{integration}\"")));
-        assert!(dynamic_challenge.contains("error=\"insufficient_scope\""));
-
+        assert_ne!(dynamic_step_up["result"]["isError"], true);
         let admin_step_up = router
             .clone()
             .oneshot(
@@ -7327,27 +7598,9 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(admin_step_up.status(), StatusCode::FORBIDDEN);
-        assert!(
-            admin_step_up
-                .headers()
-                .get(header::WWW_AUTHENTICATE)
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .contains("scope=\"mcp integrations:write\"")
-        );
+        assert_eq!(admin_step_up.status(), StatusCode::OK);
         let admin_step_up = response_json(admin_step_up).await;
-        assert_eq!(
-            admin_step_up["result"]["structuredContent"]["requiredScopes"],
-            json!(["mcp", "integrations:write"])
-        );
-        assert!(
-            admin_step_up["result"]["_meta"]["mcp/www_authenticate"][0]
-                .as_str()
-                .unwrap()
-                .contains("scope=\"mcp integrations:write\"")
-        );
+        assert!(admin_step_up.get("error").is_some() || admin_step_up["result"]["isError"] == true);
 
         // rmcp/Codex sends this as a JSON-RPC notification immediately after
         // initialize. Streamable HTTP requires an empty acknowledgement, not
@@ -7545,7 +7798,7 @@ mod tests {
         app.db
             .register_client(
                 "admin-client",
-                None,
+                Some(&user),
                 "admin",
                 &["http://localhost/callback".into()],
             )
@@ -7568,7 +7821,12 @@ mod tests {
             "ui-token-target",
         ] {
             app.db
-                .register_client(client, None, client, &["http://localhost/callback".into()])
+                .register_client(
+                    client,
+                    Some(&user),
+                    client,
+                    &["http://localhost/callback".into()],
+                )
                 .unwrap();
             app.db
                 .store_access_token(
@@ -7887,7 +8145,7 @@ mod tests {
         app.db
             .register_client(
                 "limited-client",
-                None,
+                Some(&user),
                 "limited",
                 &["http://localhost/callback".into()],
             )
@@ -7984,7 +8242,7 @@ mod tests {
                 request_status(
                     &router,
                     http::Method::GET,
-                    format!("/oauth/authorize?{query}"),
+                    format!("/api/oauth/consent?{query}"),
                     None,
                     None,
                     "",
@@ -8203,7 +8461,7 @@ mod tests {
         let consent = router
             .clone()
             .oneshot(
-                axum::http::Request::get(format!("/oauth/authorize?{query}"))
+                axum::http::Request::get(format!("/api/oauth/consent?{query}"))
                     .header(http::header::COOKIE, &cookies)
                     .body(axum::body::Body::empty())
                     .unwrap(),
@@ -8211,11 +8469,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(consent.status(), StatusCode::OK);
-        let sealed_consent = input_value(&response_text(consent).await, "consent");
+        let sealed_consent = response_json(consent).await["consent"]
+            .as_str()
+            .unwrap()
+            .to_owned();
         let denied = router
             .clone()
             .oneshot(
-                axum::http::Request::post("/oauth/authorize")
+                axum::http::Request::post("/api/oauth/consent")
                     .header(http::header::ORIGIN, "http://localhost:4788")
                     .header(http::header::COOKIE, &cookies)
                     .header(
@@ -8485,6 +8746,8 @@ mod tests {
         let user = app.db.create_user("catalog@example.com", "hash").unwrap();
         let auth = AuthContext {
             user: user.clone(),
+            agent: "test-agent".into(),
+            identity: "test-identity".into(),
             client: "test-client".into(),
             scopes: HashSet::from(["admin".into()]),
             integrations: HashSet::new(),
@@ -8529,11 +8792,14 @@ mod tests {
         assert!(app.providers.lock().await.contains_key(&plain));
 
         let oauth = app.db.create_integration(&user, "needs-oauth", "http", &json!({"url":"http://localhost:9996/mcp","oauth":{"authorization_endpoint":"http://localhost/authorize","token_endpoint":"http://localhost/token","client_id":"client"}}), None).unwrap();
+        let identity = app.db.list_identities(&user).unwrap()[0].id.clone();
         // An integration awaiting upstream OAuth remains visible to an
         // ungranted downstream client, with the two authorization states kept
         // separate.
         let chatgpt = AuthContext {
             user: user.clone(),
+            agent: "test-agent".into(),
+            identity,
             client: "chatgpt".into(),
             scopes: HashSet::from(["mcp".into()]),
             integrations: HashSet::new(),
@@ -8625,6 +8891,8 @@ mod tests {
             app: app.clone(),
             auth: AuthContext {
                 user: user.clone(),
+                agent: "test-agent".into(),
+                identity: "test-identity".into(),
                 client: "test-client".into(),
                 scopes: HashSet::from(["integrations:read".into()]),
                 integrations: HashSet::new(),
@@ -8673,7 +8941,7 @@ mod tests {
                 &token_hash("admin-tools-token"),
                 "admin-tools",
                 &user,
-                "mcp integrations:read integrations:write clients:read clients:write audit:read",
+                "mcp integrations:read integrations:write agents:read agents:write audit:read",
                 chrono::Utc::now().timestamp() + 3600,
                 None,
                 None,
@@ -8683,21 +8951,23 @@ mod tests {
             app: app.clone(),
             auth: AuthContext {
                 user: user.clone(),
+                agent: "test-agent".into(),
+                identity: "test-identity".into(),
                 client: "admin-tools".into(),
                 scopes: HashSet::from([
                     "mcp".into(),
                     "integrations:read".into(),
                     "integrations:write".into(),
-                    "clients:read".into(),
-                    "clients:write".into(),
+                    "agents:read".into(),
+                    "agents:write".into(),
                     "audit:read".into(),
                 ]),
                 integrations: HashSet::new(),
             },
         };
 
-        assert_eq!(provider.advertised_tools().await.unwrap().len(), 17);
-        assert_eq!(provider.tools().await.unwrap().len(), 17);
+        assert_eq!(provider.advertised_tools().await.unwrap().len(), 19);
+        assert_eq!(provider.tools().await.unwrap().len(), 19);
         let created = provider
             .call(
                 "integration_create",
@@ -8741,7 +9011,7 @@ mod tests {
 
         assert!(
             provider
-                .call("clients_list", json!({}))
+                .call("agents_list", json!({}))
                 .await
                 .unwrap()
                 .is_array()
@@ -8807,7 +9077,7 @@ mod tests {
             )
             .unwrap();
         provider
-            .call("client_revoke", json!({"id":"revoke-client-only"}))
+            .call("agent_revoke", json!({"id":"revoke-client-only"}))
             .await
             .unwrap();
 
@@ -8816,7 +9086,7 @@ mod tests {
             .unwrap();
         provider
             .call(
-                "client_integration_revoke",
+                "identity_grant_revoke",
                 json!({"client_id":"admin-tools","integration_id":id}),
             )
             .await
@@ -8895,8 +9165,11 @@ mod tests {
                 ),
             )
             .unwrap();
+        let identity = app.db.list_identities(&user).unwrap()[0].id.clone();
         let auth = AuthContext {
             user: user.clone(),
+            agent: "test-agent".into(),
+            identity,
             client: "agent".into(),
             scopes: HashSet::from(["mcp".into(), "integrations:write".into()]),
             integrations: HashSet::from([integration.clone()]),
@@ -8988,14 +9261,13 @@ mod tests {
     #[test]
     fn integration_ui_distinguishes_disconnect_from_permanent_delete() {
         let source = include_str!("../frontend/src/main.jsx");
-        assert!(source.contains("aria-label={`Disconnect provider for ${item.name}`}"));
-        assert!(source.contains("configuration, immutable ID, and agent grants will be preserved"));
-        assert!(source.contains("aria-label={`Delete ${item.name}`}"));
-        assert!(source.contains("Permanently delete ${item.name}?"));
-        assert!(
-            source
-                .contains("immutable ID, provider credentials, and all agent grants will be lost")
-        );
+        assert!(source.contains("Disconnect credentials but preserve this connection?"));
+        assert!(source.contains("Delete this connection and every descendant?"));
+        assert!(source.contains("all of its connections, agents, credentials, and grants"));
+        assert!(source.contains("function Consent()"));
+        assert!(source.contains("payload.identities[0]?.id"));
+        assert!(source.contains("identity===\"\""));
+        assert!(source.contains("action=\"/api/oauth/consent\""));
     }
 
     #[tokio::test]
