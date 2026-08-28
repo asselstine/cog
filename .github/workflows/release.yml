@@ -17,24 +17,24 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            binary: rexec
-            archive: rexec-x86_64-unknown-linux-gnu.tar.gz
+            binary: cog
+            archive: cog-x86_64-unknown-linux-gnu.tar.gz
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            binary: rexec
-            archive: rexec-aarch64-unknown-linux-gnu.tar.gz
+            binary: cog
+            archive: cog-aarch64-unknown-linux-gnu.tar.gz
           - os: macos-15-intel
             target: x86_64-apple-darwin
-            binary: rexec
-            archive: rexec-x86_64-apple-darwin.tar.gz
+            binary: cog
+            archive: cog-x86_64-apple-darwin.tar.gz
           - os: macos-15
             target: aarch64-apple-darwin
-            binary: rexec
-            archive: rexec-aarch64-apple-darwin.tar.gz
+            binary: cog
+            archive: cog-aarch64-apple-darwin.tar.gz
           - os: windows-2025
             target: x86_64-pc-windows-msvc
-            binary: rexec.exe
-            archive: rexec-x86_64-pc-windows-msvc.zip
+            binary: cog.exe
+            archive: cog-x86_64-pc-windows-msvc.zip
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -54,10 +54,10 @@ jobs:
         run: |
           npm ci --no-audit --no-fund
           npm run build
-      - name: Build rexec
+      - name: Build cog
         shell: bash
         env:
-          REXEC_FRONTEND_PREBUILT: "1"
+          COG_FRONTEND_PREBUILT: "1"
         run: cargo build --locked --release --target "${{ matrix.target }}"
       - name: Smoke test
         shell: bash
@@ -67,15 +67,15 @@ jobs:
         shell: bash
         run: |
           mkdir staging
-          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" staging/rexec
-          tar -C staging -czf "${{ matrix.archive }}" rexec
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" staging/cog
+          tar -C staging -czf "${{ matrix.archive }}" cog
       - name: Package Windows executable
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory staging | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" staging/rexec.exe
-          Compress-Archive -Path staging/rexec.exe -DestinationPath "${{ matrix.archive }}"
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" staging/cog.exe
+          Compress-Archive -Path staging/cog.exe -DestinationPath "${{ matrix.archive }}"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
@@ -96,9 +96,38 @@ jobs:
           merge-multiple: true
       - name: Generate checksums
         working-directory: dist
-        run: sha256sum rexec-* > SHA256SUMS
+        run: sha256sum cog-* > SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
           generate_release_notes: true
           fail_on_unmatched_files: true
+
+  verify-installers:
+    name: Verify installer (${{ matrix.os }})
+    if: github.event_name == 'push'
+    needs: publish
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-15-intel, macos-15, windows-2025]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Install and execute Unix release
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          COG_VERSION: ${{ github.ref_name }}
+          COG_INSTALL_DIR: ${{ runner.temp }}/cog bin
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/actionllama/cog/${{ github.ref_name }}/install.sh" | sh
+          "$COG_INSTALL_DIR/cog" --version
+      - name: Install and execute Windows release
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          COG_VERSION: ${{ github.ref_name }}
+          COG_INSTALL_DIR: ${{ runner.temp }}\cog bin
+        run: |
+          irm "https://raw.githubusercontent.com/actionllama/cog/${{ github.ref_name }}/install.ps1" | iex
+          & (Join-Path $env:COG_INSTALL_DIR 'cog.exe') --version

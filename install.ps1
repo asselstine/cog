@@ -1,15 +1,11 @@
 $ErrorActionPreference = "Stop"
 
-$Repository = if ($env:COG_REPO) { $env:COG_REPO } else { "OWNER/cog" }
+$Repository = if ($env:COG_REPO) { $env:COG_REPO } else { "actionllama/cog" }
 $Version = if ($env:COG_VERSION) { $env:COG_VERSION } else { "latest" }
 $InstallDir = if ($env:COG_INSTALL_DIR) {
     $env:COG_INSTALL_DIR
 } else {
     Join-Path $env:LOCALAPPDATA "Programs\cog\bin"
-}
-
-if ($Repository -eq "OWNER/cog") {
-    throw "Set COG_REPO to the GitHub owner/repository"
 }
 
 $Archive = "cog-x86_64-pc-windows-msvc.zip"

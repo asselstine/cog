@@ -15,10 +15,9 @@ enum Command {
     /// Create a user while cog is stopped.
     CreateUser {
         /// Email address used to sign in.
-        #[arg(long)]
         email: String,
-        /// Read the password from standard input instead of prompting on a TTY.
-        #[arg(long)]
+        /// Read one password line from standard input (required).
+        #[arg(long, required = true)]
         password_stdin: bool,
     },
 }
@@ -31,23 +30,18 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "cog=info".into()),
         )
         .init();
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    cli.config.initialize()?;
     cli.config.validate()?;
     match cli.command {
         Some(Command::CreateUser {
             email,
             password_stdin,
         }) => {
-            let password = if password_stdin {
-                let mut password = String::new();
-                std::io::stdin().read_line(&mut password)?;
-                password.trim_end_matches(['\r', '\n']).to_owned()
-            } else {
-                let password = rpassword::prompt_password("Password: ")?;
-                let confirmation = rpassword::prompt_password("Confirm password: ")?;
-                anyhow::ensure!(password == confirmation, "passwords do not match");
-                password
-            };
+            anyhow::ensure!(password_stdin, "--password-stdin is required");
+            let mut password = String::new();
+            std::io::stdin().read_line(&mut password)?;
+            let password = password.trim_end_matches(['\r', '\n']).to_owned();
             cog::server::create_user(cli.config, &email, &password).await
         }
         None => cog::server::run(cli.config).await,

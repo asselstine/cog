@@ -1092,6 +1092,19 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             .map_err(|error| StartupError::new(StartupPhase::DatabaseOpen, error.as_ref()))?;
         (db, Authority::Local, Durability::Local, None)
     };
+    if db.user_count()? == 0 {
+        lease.stop_renewal();
+        if let Some(task) = renewal.as_mut() {
+            let _ = task.await;
+        }
+        if let Authority::S3(remote) = &lease {
+            remote.relinquish().await?;
+        }
+        eprintln!(
+            "No users exist. Create the first user with:\n  cog create-user owner@example.com --password-stdin"
+        );
+        return Ok(());
+    }
     let app = App {
         secrets: SecretBox::new(config.master_key.as_bytes()),
         runtime: Arc::new(CodeRuntime::new(
@@ -1553,8 +1566,13 @@ async fn readiness(State(a): State<App>) -> impl IntoResponse {
         })),
     )
 }
-async fn version() -> Json<Value> {
-    Json(json!({"name":"cog","version":env!("CARGO_PKG_VERSION")}))
+async fn version(State(a): State<App>) -> Json<Value> {
+    Json(json!({
+        "name":"cog",
+        "version":env!("CARGO_PKG_VERSION"),
+        "schemaVersion": a.db.schema_version().unwrap_or(crate::db::SCHEMA_VERSION),
+        "supportedSchemaVersion": crate::db::SCHEMA_VERSION
+    }))
 }
 async fn metrics(State(a): State<App>) -> impl IntoResponse {
     let body = format!(

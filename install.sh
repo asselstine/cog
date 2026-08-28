@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-COG_REPO=${COG_REPO:-OWNER/cog}
+COG_REPO=${COG_REPO:-actionllama/cog}
 COG_VERSION=${COG_VERSION:-latest}
 COG_INSTALL_DIR=${COG_INSTALL_DIR:-}
 
@@ -12,7 +12,6 @@ fail() {
 
 command -v curl >/dev/null 2>&1 || fail "curl is required"
 command -v tar >/dev/null 2>&1 || fail "tar is required"
-[ "$COG_REPO" != "OWNER/cog" ] || fail "set COG_REPO to the GitHub owner/repository"
 
 case "$(uname -s)" in
     Linux) os=unknown-linux-gnu ;;

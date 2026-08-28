@@ -20,4 +20,5 @@ RUN useradd --system --uid 10001 --home /data cog && mkdir /data && chown cog:co
 USER cog
 VOLUME /data
 EXPOSE 4788
+ENV COG_DATA_DIR=/data COG_LISTEN=0.0.0.0:4788
 ENTRYPOINT ["cog"]

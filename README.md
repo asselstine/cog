@@ -1,41 +1,45 @@
 # Clanker Operations Gateway (COG)
 
-## Brief description
+Cog is a self-hosted gateway that gives AI agents secure, governed access to tools.
 
-Clanker Operations Gateway (`cog`) is a self-hosted agentic tool gateway distributed as one Rust executable. Each user owns named identities; every identity independently owns its provider connections, shared grants, and OAuth-authorized agents.
-
-Agents receive an `execute` tool for code-mode access to upstream integrations. Code running in an isolated V8 runtime can progressively discover integrations with `codemode.search()`, inspect a tool with `codemode.describe()`, and compose calls with `codemode.call()`. Clanker Operations Gateway administration is also exposed as purpose-specific native MCP tools so hosts can apply accurate safety policy and request incremental OAuth consent for administrative scopes.
-
-Clanker Operations Gateway runs with only a persistent local SQLite directory by default. An optional S3-compatible bucket adds exclusive ownership, LTX replication, and restore. The executable embeds its HTTP server, SQLite database, migrations, OAuth server and client, MCP clients, UI assets, credential encryption, and V8 runtime.
-
-Production storage, recovery, and key-handling guidance is in [docs/operations.md](docs/operations.md).
-
-## Usage
-
-### Install a native executable
-
-Tagged releases provide native executables for Linux x86-64 and ARM64, macOS
-Intel and Apple Silicon, and Windows x86-64. Replace `OWNER/cog` below with
-this repository's GitHub owner and name.
-
-On Linux or macOS:
+Install on Linux or macOS:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/OWNER/cog/main/install.sh | COG_REPO=OWNER/cog sh
+curl -fsSL https://raw.githubusercontent.com/actionllama/cog/main/install.sh | sh
 ```
 
-On Windows PowerShell:
+Install on Windows PowerShell:
 
 ```powershell
-$env:COG_REPO = "OWNER/cog"; irm https://raw.githubusercontent.com/OWNER/cog/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/actionllama/cog/main/install.ps1 | iex
 ```
 
-The installers download the executable from the latest GitHub release and
-verify it against the release's `SHA256SUMS`. Set `COG_VERSION` to install a
-specific version (for example, `0.2.0` or `v0.2.0`) and `COG_INSTALL_DIR` to
-override the destination. Installation supplies only the executable; runtime
-configuration, S3 credentials, TLS, and service management remain explicit
-deployment choices.
+Initialize cog, create the first user non-interactively, and start it:
+
+```sh
+cog
+printf '%s\n' "$PASSWORD" | cog create-user owner@example.com --password-stdin
+cog
+```
+
+The first command creates the native state directory and intentionally exits
+until an owner exists. Open <http://localhost:4788> after the final command.
+The default files are:
+
+```text
+~/.cog/master.key
+~/.cog/data/cog.sqlite
+```
+
+The installers verify release checksums. Set `COG_VERSION` to pin a release
+(for example `0.2.0` or `v0.2.0`) and `COG_INSTALL_DIR` to override the
+destination.
+
+## Deployment and configuration
+
+Local SQLite is authoritative by default; S3 is used only when
+`COG_S3_BUCKET` is configured. See [operations](docs/operations.md) for S3,
+backup, restore, recovery, and master-key handling.
 
 ### Run with Docker
 
@@ -57,10 +61,10 @@ docker run --rm \
 Before starting cog, create a user with the same storage configuration the server will use:
 
 ```sh
-cog create-user --email owner@example.com
+cog create-user owner@example.com --password-stdin
 ```
 
-The command prompts for the password without echoing it and uses the same storage mode as the server. With S3 configured it acquires the exclusive lease, restores the current database, and durably replicates the new user. It fails while another cog instance holds that lease, so stop the service before adding a user. For automation, `--password-stdin` reads one password line from standard input.
+The command reads one password line from standard input and uses the same storage mode as the server. With S3 configured it acquires the exclusive lease, restores the current database, and durably replicates the new user. It fails while another cog instance holds that lease, so stop the service before adding a user.
 
 Then start cog and open the configured base URL to sign in. Agents connect to the streamable HTTP MCP endpoint at `/mcp` and complete the advertised OAuth flow.
 
@@ -83,10 +87,11 @@ Important configuration:
 | Variable | Default | Description |
 | --- | --- | --- |
 | `COG_S3_BUCKET` | none | Optional S3 bucket name. When omitted, local SQLite is authoritative. |
-| `COG_MASTER_KEY` | none | Required secret of at least 32 characters used to derive credential encryption. |
+| `COG_HOME` | `~/.cog` | Native state home (`%LOCALAPPDATA%\cog` on Windows). |
+| `COG_MASTER_KEY` | generated | Optional explicit secret; otherwise stored in `<cog-home>/master.key`. |
 | `COG_BASE_URL` | `http://localhost:4788` | Public origin used for OAuth metadata and callbacks. Use HTTPS in production. |
-| `COG_LISTEN` | `0.0.0.0:4788` | HTTP listen address. |
-| `COG_DATA_DIR` | `/data` | Local SQLite working directory. |
+| `COG_LISTEN` | `127.0.0.1:4788` | HTTP listen address. Docker explicitly uses `0.0.0.0:4788`. |
+| `COG_DATA_DIR` | `<cog-home>/data` | SQLite working-state directory. Docker explicitly uses `/data`. |
 | `COG_S3_PREFIX` | `cog/` | Object prefix reserved for cog. |
 | `COG_S3_ENDPOINT` | AWS endpoint | Custom S3-compatible endpoint. |
 | `COG_S3_REGION` | `us-east-1` | S3 region. |

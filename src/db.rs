@@ -22,10 +22,12 @@ impl StorageMode {
     }
 }
 
-const MIGRATIONS: &str = r#"
+pub const SCHEMA_VERSION: i64 = 4;
+
+const INITIAL_SCHEMA: &str = r#"
 PRAGMA foreign_keys=ON;
-CREATE TABLE IF NOT EXISTS schema_meta(version INTEGER NOT NULL CHECK(version = 2));
-INSERT INTO schema_meta(version) SELECT 2 WHERE NOT EXISTS (SELECT 1 FROM schema_meta);
+CREATE TABLE IF NOT EXISTS schema_meta(version INTEGER NOT NULL);
+INSERT INTO schema_meta(version) SELECT 4 WHERE NOT EXISTS (SELECT 1 FROM schema_meta);
 CREATE TABLE IF NOT EXISTS cog_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS users(
  id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
@@ -149,6 +151,88 @@ CREATE INDEX IF NOT EXISTS integrations_identity_id ON integrations(identity_id)
 CREATE INDEX IF NOT EXISTS identity_grants_active ON identity_grants(identity_id,revoked_at);
 CREATE INDEX IF NOT EXISTS oauth_tokens_client_id ON oauth_tokens(client_id);
 "#;
+
+fn apply_migration(tx: &rusqlite::Transaction<'_>, version: i64) -> anyhow::Result<()> {
+    match version {
+        // Version 2 introduced identities and the OAuth/upstream model. The
+        // idempotent schema statements also repair partial pre-release v1 DBs.
+        2 => tx.execute_batch(INITIAL_SCHEMA)?,
+        // Version 3 added token lifecycle, CSRF, and OAuth audience metadata.
+        3 => {
+            // Development versions constrained schema_meta to exactly v2.
+            // Rebuild it before advancing so schema versions can evolve.
+            tx.execute_batch(
+                "CREATE TABLE schema_meta_migration(version INTEGER NOT NULL);
+                 INSERT INTO schema_meta_migration(version) SELECT version FROM schema_meta;
+                 DROP TABLE schema_meta;
+                 ALTER TABLE schema_meta_migration RENAME TO schema_meta;",
+            )?;
+            for (table, column, definition) in [
+                ("oauth_tokens", "refresh_expires_at", "INTEGER"),
+                ("oauth_tokens", "token_id", "TEXT"),
+                ("oauth_tokens", "issued_at", "INTEGER"),
+                ("oauth_tokens", "last_used_at", "INTEGER"),
+                ("sessions", "csrf_hash", "BLOB"),
+                ("upstream_oauth_clients", "resource", "TEXT"),
+                ("upstream_oauth_clients", "issuer", "TEXT"),
+                ("oauth_states", "resource", "TEXT"),
+            ] {
+                if !column_exists(tx, table, column)? {
+                    tx.execute_batch(&format!(
+                        "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+                    ))?;
+                }
+            }
+            tx.execute_batch(
+                "UPDATE oauth_tokens SET issued_at=expires_at-3600 WHERE issued_at IS NULL;
+                 UPDATE oauth_tokens SET token_id=lower(hex(token_hash)) WHERE token_id IS NULL;
+                 CREATE UNIQUE INDEX IF NOT EXISTS oauth_tokens_token_id ON oauth_tokens(token_id);",
+            )?;
+        }
+        // Version 4 added the Git credential and repository schema. Running
+        // the complete idempotent DDL keeps upgrades from development builds
+        // (which shipped parts of this schema under v2) safe.
+        4 => tx.execute_batch(INITIAL_SCHEMA)?,
+        _ => anyhow::bail!("unsupported migration target {version}"),
+    }
+    Ok(())
+}
+
+fn column_exists(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    column: &str,
+) -> anyhow::Result<bool> {
+    let mut statement = tx.prepare(&format!("PRAGMA table_info({table})"))?;
+    Ok(statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .any(|candidate| candidate == column))
+}
+
+fn restrict_database_file(path: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(windows)]
+    {
+        let username =
+            std::env::var("USERNAME").map_err(|_| anyhow::anyhow!("USERNAME is not set"))?;
+        let status = std::process::Command::new("icacls")
+            .arg(path)
+            .args(["/inheritance:r", "/grant:r", &format!("{username}:(R,W)")])
+            .status()?;
+        anyhow::ensure!(
+            status.success(),
+            "could not restrict access to {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
 
 #[derive(Clone)]
 pub struct Database(Arc<Mutex<Connection>>);
@@ -532,7 +616,7 @@ impl Database {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         // In S3 mode the replication capture connection owns checkpoint
@@ -550,15 +634,36 @@ impl Database {
             has_schema_meta || !has_legacy_tables,
             "legacy database detected; back up and explicitly initialize a clean identity schema"
         );
-        conn.execute_batch(MIGRATIONS)?;
-        let schema_version: i64 =
+        if !has_schema_meta {
+            conn.execute_batch(INITIAL_SCHEMA).map_err(|error| anyhow::anyhow!(
+                "database migration 1 failed; the transaction was rolled back—back up the database before recovery: {error}"
+            ))?;
+        }
+        let mut schema_version: i64 =
             conn.query_row("SELECT version FROM schema_meta LIMIT 1", [], |row| {
                 row.get(0)
             })?;
         anyhow::ensure!(
-            schema_version == 2,
-            "unsupported database schema version {schema_version}; back up and explicitly initialize a clean identity schema"
+            schema_version <= SCHEMA_VERSION,
+            "database schema version {schema_version} is newer than this binary supports ({SCHEMA_VERSION}); upgrade cog and do not modify the database"
         );
+        while schema_version < SCHEMA_VERSION {
+            let target = schema_version + 1;
+            let tx = conn.transaction()?;
+            let result = apply_migration(&tx, target).and_then(|()| {
+                tx.execute("UPDATE schema_meta SET version=?", [target])?;
+                Ok(())
+            });
+            match result {
+                Ok(()) => tx.commit().map_err(anyhow::Error::from)?,
+                Err(error) => {
+                    return Err(anyhow::anyhow!(
+                        "database migration {target} failed; the transaction was rolled back—back up the database before recovery: {error}"
+                    ));
+                }
+            }
+            schema_version = target;
+        }
         let existing_mode = conn
             .query_row(
                 "SELECT value FROM cog_meta WHERE key='storage_mode'",
@@ -578,83 +683,23 @@ impl Database {
                 [mode.as_str()],
             )?;
         }
-        let has_refresh_expiry = {
-            let mut statement = conn.prepare("PRAGMA table_info(oauth_tokens)")?;
-            statement
-                .query_map([], |row| row.get::<_, String>(1))?
-                .collect::<Result<Vec<_>, _>>()?
-                .iter()
-                .any(|column| column == "refresh_expires_at")
-        };
-        if !has_refresh_expiry {
-            conn.execute_batch("ALTER TABLE oauth_tokens ADD COLUMN refresh_expires_at INTEGER")?;
-        }
-        let has_token_id = {
-            let mut statement = conn.prepare("PRAGMA table_info(oauth_tokens)")?;
-            statement
-                .query_map([], |row| row.get::<_, String>(1))?
-                .collect::<Result<Vec<_>, _>>()?
-                .iter()
-                .any(|column| column == "token_id")
-        };
-        if !has_token_id {
-            conn.execute_batch("ALTER TABLE oauth_tokens ADD COLUMN token_id TEXT")?;
-        }
-        let has_issued_at = {
-            let mut statement = conn.prepare("PRAGMA table_info(oauth_tokens)")?;
-            statement
-                .query_map([], |row| row.get::<_, String>(1))?
-                .collect::<Result<Vec<_>, _>>()?
-                .iter()
-                .any(|column| column == "issued_at")
-        };
-        if !has_issued_at {
-            conn.execute_batch("ALTER TABLE oauth_tokens ADD COLUMN issued_at INTEGER")?;
-        }
-        let has_last_used_at = {
-            let mut statement = conn.prepare("PRAGMA table_info(oauth_tokens)")?;
-            statement
-                .query_map([], |row| row.get::<_, String>(1))?
-                .collect::<Result<Vec<_>, _>>()?
-                .iter()
-                .any(|column| column == "last_used_at")
-        };
-        if !has_last_used_at {
-            conn.execute_batch("ALTER TABLE oauth_tokens ADD COLUMN last_used_at INTEGER")?;
-        }
-        // Access tokens have always had a one-hour lifetime. This gives tokens
-        // created before issued_at was recorded an accurate lifecycle start.
-        conn.execute_batch(
-            "UPDATE oauth_tokens SET issued_at=expires_at-3600 WHERE issued_at IS NULL",
+        conn.execute(
+            "INSERT INTO cog_meta(key,value) VALUES('last_opened_by_version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [env!("CARGO_PKG_VERSION")],
         )?;
-        conn.execute_batch("UPDATE oauth_tokens SET token_id=lower(hex(token_hash)) WHERE token_id IS NULL; CREATE UNIQUE INDEX IF NOT EXISTS oauth_tokens_token_id ON oauth_tokens(token_id)")?;
-        let has_session_csrf = {
-            let mut statement = conn.prepare("PRAGMA table_info(sessions)")?;
-            statement
-                .query_map([], |row| row.get::<_, String>(1))?
-                .collect::<Result<Vec<_>, _>>()?
-                .iter()
-                .any(|column| column == "csrf_hash")
-        };
-        if !has_session_csrf {
-            conn.execute_batch("ALTER TABLE sessions ADD COLUMN csrf_hash BLOB")?;
-        }
-        for (table, column) in [
-            ("upstream_oauth_clients", "resource"),
-            ("upstream_oauth_clients", "issuer"),
-            ("oauth_states", "resource"),
-        ] {
-            let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-            let present = statement
-                .query_map([], |row| row.get::<_, String>(1))?
-                .collect::<Result<Vec<_>, _>>()?
-                .iter()
-                .any(|candidate| candidate == column);
-            if !present {
-                conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT"))?;
-            }
-        }
+        restrict_database_file(path)?;
         Ok(Self(Arc::new(Mutex::new(conn))))
+    }
+    pub fn schema_version(&self) -> anyhow::Result<i64> {
+        let conn = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+        Ok(
+            conn.query_row("SELECT version FROM schema_meta LIMIT 1", [], |row| {
+                row.get(0)
+            })?,
+        )
     }
     pub fn transact<T>(
         &self,
@@ -2401,5 +2446,79 @@ mod tests {
         let installed = db.integration(&integration, &user).unwrap().unwrap();
         assert!(installed.enabled);
         assert_eq!(installed.config["providerConfig"]["installationId"], "99");
+    }
+
+    #[test]
+    fn every_schema_upgrade_path_and_repeated_open_succeeds() {
+        for old_version in 1..SCHEMA_VERSION {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(format!("v{old_version}.db"));
+            drop(Database::open(&path).unwrap());
+            let connection = Connection::open(&path).unwrap();
+            if old_version == 2 {
+                connection
+                    .execute_batch(
+                        "DROP TABLE schema_meta;
+                         CREATE TABLE schema_meta(version INTEGER NOT NULL CHECK(version = 2));
+                         INSERT INTO schema_meta VALUES(2);",
+                    )
+                    .unwrap();
+            } else {
+                connection
+                    .execute("UPDATE schema_meta SET version=?", [old_version])
+                    .unwrap();
+            }
+            drop(connection);
+            let upgraded = Database::open(&path).unwrap();
+            assert_eq!(upgraded.schema_version().unwrap(), SCHEMA_VERSION);
+            drop(upgraded);
+            assert_eq!(
+                Database::open(&path).unwrap().schema_version().unwrap(),
+                SCHEMA_VERSION
+            );
+        }
+    }
+
+    #[test]
+    fn newer_schema_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future.db");
+        drop(Database::open(&path).unwrap());
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute("UPDATE schema_meta SET version=?", [SCHEMA_VERSION + 1])
+            .unwrap();
+        drop(connection);
+        assert!(
+            Database::open(&path)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("newer")
+        );
+    }
+
+    #[test]
+    fn failed_migration_keeps_previous_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken.db");
+        drop(Database::open(&path).unwrap());
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(
+            "PRAGMA foreign_keys=OFF; DROP TABLE oauth_tokens; UPDATE schema_meta SET version=2;",
+        ).unwrap();
+        drop(connection);
+        assert!(
+            Database::open(&path)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("rolled back")
+        );
+        let connection = Connection::open(&path).unwrap();
+        let version: i64 = connection
+            .query_row("SELECT version FROM schema_meta", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
     }
 }
