@@ -482,8 +482,7 @@ impl ToolProvider for AdminProvider {
 
 fn git_control_tool(name: &str, description: &str, destructive: bool) -> Tool {
     Tool{name:name.into(),description:Some(description.into()),input_schema:match name{
- "repository_access"=>json!({"type":"object","properties":{"integrationId":{"type":"string"},"repository":{"type":"string"},"permission":{"type":"string","enum":["read","write"]}},"required":["integrationId","repository","permission"],"additionalProperties":false}),
- "repository_revoke"=>json!({"type":"object","properties":{"repositoryId":{"type":"string"},"permission":{"type":"string","enum":["read","write","revoked"]}},"required":["repositoryId","permission"],"additionalProperties":false}),
+ "repository_access"=>json!({"type":"object","properties":{"integrationId":{"type":"string"},"repository":{"type":"string"}},"required":["integrationId","repository"],"additionalProperties":false}),
  "remote_credentials"=>json!({"type":"object","properties":{"repositoryId":{"type":"string"}},"required":["repositoryId"],"additionalProperties":false}),
  "credential_bootstrap"=>json!({"type":"object","properties":{"repositoryId":{"type":"string"}},"required":["repositoryId"],"additionalProperties":false}),
  _=>json!({"type":"object","properties":{},"additionalProperties":false})},extra:serde_json::from_value(json!({"annotations":{"readOnlyHint":!destructive,"destructiveHint":destructive,"openWorldHint":false}})).unwrap_or_default()}
@@ -552,38 +551,23 @@ impl ToolProvider for GitControlProvider {
         Ok(vec![
             git_control_tool(
                 "repository_access",
-                "Resolve and request access to one Git repository.",
+                "Resolve a GitHub repository and return its COG remote. Access is controlled by the GitHub App installation and this client's existing integration authorization.",
                 false,
-            ),
-            git_control_tool(
-                "repository_list",
-                "List Git repositories granted to this OAuth client.",
-                false,
-            ),
-            git_control_tool(
-                "repository_revoke",
-                "Downgrade or revoke this client's repository access.",
-                true,
             ),
             git_control_tool(
                 "remote_credentials",
-                "Mint a short-lived repository-bound COG credential.",
+                "Mint a 15-minute credential bound to one resolved repository.",
                 false,
             ),
             git_control_tool(
                 "credential_bootstrap",
-                "Mint a single-use, 60-second capability that a credential helper can exchange.",
+                "Mint a single-use capability for the credential helper.",
                 false,
             ),
         ])
     }
     async fn call(&self, name: &str, args: Value) -> anyhow::Result<Value> {
         match name {
-            "repository_list" => Ok(serde_json::to_value(
-                self.app
-                    .db
-                    .list_git_grants(&self.auth.user, &self.auth.client)?,
-            )?),
             "repository_access" => {
                 // Fence stale owners before repository resolution performs any
                 // provider I/O, then prove authority again under the mutation
@@ -593,11 +577,12 @@ impl ToolProvider for GitControlProvider {
                     .get("integrationId")
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("integrationId is required"))?;
-                let permission = args
-                    .get("permission")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("permission is required"))?;
-                anyhow::ensure!(matches!(permission, "read" | "write"), "invalid permission");
+                if !self.auth.allows(&format!("integration:{integration_id}")) {
+                    return Err(crate::authz::InsufficientScope {
+                        scopes: vec![format!("integration:{integration_id}")],
+                    }
+                    .into());
+                }
                 let integration = self
                     .app
                     .db
@@ -667,143 +652,58 @@ impl ToolProvider for GitControlProvider {
                     integration_id,
                     &resolved,
                 )?;
-                let current = self.app.db.git_grant_permission(
-                    &self.auth.user,
-                    &self.auth.client,
-                    &repo.id,
-                )?;
-                let allowed = current.as_deref() == Some("write")
-                    || (current.as_deref() == Some("read") && permission == "read");
-                if !allowed {
-                    self.app.db.create_git_pending_request(
-                        &self.auth.user,
-                        &self.auth.client,
-                        integration_id,
-                        &repo.id,
-                        permission,
-                        600,
-                    )?;
-                    audit_details(
-                        &self.app,
-                        Some(&self.auth.user),
-                        "git.repository.request",
-                        Some(&repo.id),
-                        "pending",
-                        &json!({"client_id":self.auth.client,"integration_id":integration_id,"permission":permission}),
-                    )?;
-                    persist(&self.app).await?;
+                persist(&self.app).await?;
+                Ok(
+                    json!({"repositoryId":repo.id,"displayName":repo.display_name,"remoteUrl":format!("{}/git/{}.git",self.app.config.base_url.as_str().trim_end_matches('/'),repo.id),"credential":{"username":"cog","source":"remote_credentials","useHttpPath":true}}),
+                )
+            }
+            "remote_credentials" | "credential_bootstrap" => {
+                let repository_id = args
+                    .get("repositoryId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("repositoryId is required"))?;
+                let repository = self
+                    .app
+                    .db
+                    .git_repository(repository_id)?
+                    .filter(|repository| repository.user_id == self.auth.user)
+                    .ok_or_else(|| anyhow::anyhow!("repository not found"))?;
+                if !self
+                    .auth
+                    .allows(&format!("integration:{}", repository.integration_id))
+                {
                     return Err(crate::authz::InsufficientScope {
-                        scopes: vec![
-                            format!("git:{permission}"),
-                            format!("integration:{integration_id}"),
-                        ],
+                        scopes: vec![format!("integration:{}", repository.integration_id)],
                     }
                     .into());
                 }
-                persist(&self.app).await?;
-                Ok(
-                    json!({"repositoryId":repo.id,"displayName":repo.display_name,"permission":current,"remoteUrl":format!("{}/git/{}.git",self.app.config.base_url.as_str().trim_end_matches('/'),repo.id),"credential":{"username":"cog","useHttpPath":true}}),
-                )
-            }
-            "repository_revoke" => {
-                let repo = args
-                    .get("repositoryId")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("repositoryId is required"))?;
-                let permission = args
-                    .get("permission")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("permission is required"))?;
                 let _mutation = self.app.mutations.lock().await;
                 self.app.lease.assert_live()?;
-                if permission == "revoked" {
-                    self.app
-                        .db
-                        .revoke_git_grant(&self.auth.user, &self.auth.client, repo)?;
-                } else {
-                    self.app.db.set_git_grant(
+                if name == "remote_credentials" {
+                    let credential = self.app.db.issue_git_credential(
                         &self.auth.user,
                         &self.auth.client,
-                        repo,
-                        permission,
+                        repository_id,
+                        "write",
+                        900,
                     )?;
+                    persist(&self.app).await?;
+                    Ok(
+                        json!({"username":"cog","password":credential,"expiresIn":900,"useHttpPath":true}),
+                    )
+                } else {
+                    let bootstrap = self.app.db.issue_git_bootstrap(
+                        &self.auth.user,
+                        &self.auth.client,
+                        repository_id,
+                        "write",
+                        60,
+                    )?;
+                    persist(&self.app).await?;
+                    Ok(
+                        json!({"bootstrap":bootstrap,"expiresIn":60,"repositoryId":repository_id,"exchangeUrl":format!("{}/git/bootstrap",self.app.config.base_url.as_str().trim_end_matches('/')),"singleUse":true}),
+                    )
                 }
-                audit(
-                    &self.app,
-                    Some(&self.auth.user),
-                    "git.repository.revoke",
-                    Some(repo),
-                    "success",
-                )?;
-                persist(&self.app).await?;
-                Ok(json!({"repositoryId":repo,"permission":permission}))
-            }
-            "remote_credentials" => {
-                let repo = args
-                    .get("repositoryId")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("repositoryId is required"))?;
-                let permission = self
-                    .app
-                    .db
-                    .git_grant_permission(&self.auth.user, &self.auth.client, repo)?
-                    .ok_or_else(|| anyhow::anyhow!("repository access denied"))?;
-                let _mutation = self.app.mutations.lock().await;
-                self.app.lease.assert_live()?;
-                let credential = self.app.db.issue_git_credential(
-                    &self.auth.user,
-                    &self.auth.client,
-                    repo,
-                    &permission,
-                    900,
-                )?;
-                audit(
-                    &self.app,
-                    Some(&self.auth.user),
-                    "git.credential.issue",
-                    Some(repo),
-                    "success",
-                )?;
-                persist(&self.app).await?;
-                Ok(
-                    json!({"username":"cog","password":credential,"expiresIn":900,"useHttpPath":true}),
-                )
-            }
-            "credential_bootstrap" => {
-                let repo = args
-                    .get("repositoryId")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("repositoryId is required"))?;
-                let permission = self
-                    .app
-                    .db
-                    .git_grant_permission(&self.auth.user, &self.auth.client, repo)?
-                    .ok_or_else(|| anyhow::anyhow!("repository access denied"))?;
-                let _mutation = self.app.mutations.lock().await;
-                self.app.lease.assert_live()?;
-                let bootstrap = self.app.db.issue_git_bootstrap(
-                    &self.auth.user,
-                    &self.auth.client,
-                    repo,
-                    &permission,
-                    60,
-                )?;
-                audit(
-                    &self.app,
-                    Some(&self.auth.user),
-                    "git.credential.bootstrap.issue",
-                    Some(repo),
-                    "success",
-                )?;
-                persist(&self.app).await?;
-                Ok(json!({
-                    "bootstrap": bootstrap,
-                    "expiresIn": 60,
-                    "repositoryId": repo,
-                    "permissionCeiling": permission,
-                    "exchangeUrl": format!("{}/git/bootstrap", self.app.config.base_url.as_str().trim_end_matches('/')),
-                    "singleUse": true
-                }))
             }
             _ => anyhow::bail!("unknown Git control operation"),
         }
@@ -1254,10 +1154,6 @@ fn build_router(app: App) -> Router {
             post(ui_grant_integration),
         )
         .route(
-            "/ui/clients/{client}/git/{repository}/{permission}",
-            post(ui_set_git_grant),
-        )
-        .route(
             "/.well-known/oauth-authorization-server",
             get(auth_metadata),
         )
@@ -1385,15 +1281,7 @@ async fn git_smart_http(
         Some(v) => v,
         None => {
             a.metrics.git_auth_denied.fetch_add(1, Ordering::Relaxed);
-            return auth_failure(
-                &a,
-                AuthFailure::Missing,
-                if operation == GitOperation::Write {
-                    "git:write"
-                } else {
-                    "git:read"
-                },
-            );
+            return auth_failure(&a, AuthFailure::Missing, "mcp");
         }
     };
     let now = chrono::Utc::now().timestamp();
@@ -1410,25 +1298,13 @@ async fn git_smart_http(
     }
     let context = match a
         .db
-        .token_context(&token_hash(&token), now)
+        .git_credential_context(&token, &repository, now)
         .ok()
         .flatten()
-        .or_else(|| {
-            a.db.git_credential_context(&token, &repository, now)
-                .ok()
-                .flatten()
-        }) {
+    {
         Some(v) => v,
         None => {
-            return auth_failure(
-                &a,
-                AuthFailure::Invalid,
-                if operation == GitOperation::Write {
-                    "git:write"
-                } else {
-                    "git:read"
-                },
-            );
+            return auth_failure(&a, AuthFailure::Invalid, "mcp");
         }
     };
     let repo = match a.db.git_repository(&repository).ok().flatten() {
@@ -1445,43 +1321,11 @@ async fn git_smart_http(
             .fetch_add(1, Ordering::Relaxed);
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     }
-    let permission = match a
-        .db
-        .git_grant_permission(&context.user_id, &context.client_id, &repository)
-        .ok()
-        .flatten()
-    {
-        Some(v) => v,
-        None => {
-            return auth_failure(
-                &a,
-                AuthFailure::Insufficient,
-                if operation == GitOperation::Write {
-                    "git:write"
-                } else {
-                    "git:read"
-                },
-            );
-        }
-    };
-    if !crate::git::grants::permits(&permission, operation)
-        || !context.scopes.iter().any(|s| {
-            s == if operation == GitOperation::Write {
-                "git:write"
-            } else {
-                "git:read"
-            } || operation == GitOperation::Read && s == "git:write"
-        })
-        || !context.integration_ids.contains(&repo.integration_id)
-    {
+    if !context.integration_ids.contains(&repo.integration_id) {
         return auth_failure(
             &a,
             AuthFailure::Insufficient,
-            if operation == GitOperation::Write {
-                "git:write"
-            } else {
-                "git:read"
-            },
+            &format!("integration:{}", repo.integration_id),
         );
     }
     let Some(client_permit) = a
@@ -1572,8 +1416,6 @@ async fn git_smart_http(
         return StatusCode::BAD_GATEWAY.into_response();
     }
     let status = response.status();
-    let _ =
-        a.db.touch_git_grant(&context.user_id, &context.client_id, &repository, now);
     let action = match operation {
         GitOperation::Write => "git.push",
         GitOperation::Read if endpoint == "info/refs" => "git.fetch",
@@ -1608,12 +1450,8 @@ async fn git_smart_http(
 struct GitBootstrapExchange {
     bootstrap: String,
     repository_id: String,
-    #[serde(default = "default_git_read_permission")]
-    permission: String,
 }
-fn default_git_read_permission() -> String {
-    "read".into()
-}
+
 async fn exchange_git_bootstrap(
     State(a): State<App>,
     headers: HeaderMap,
@@ -1621,21 +1459,17 @@ async fn exchange_git_bootstrap(
 ) -> Response {
     let auth = match auth_context(&a, &headers) {
         Ok(auth) => auth,
-        Err(failure) => return auth_failure(&a, failure, "git:read"),
+        Err(failure) => return auth_failure(&a, failure, "mcp"),
     };
-    if !crate::git::model::valid_repository_id(&request.repository_id)
-        || !matches!(request.permission.as_str(), "read" | "write")
-    {
+    if !crate::git::model::valid_repository_id(&request.repository_id) {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let Some(grant) =
-        a.db.git_grant_permission(&auth.user, &auth.client, &request.repository_id)
-            .ok()
-            .flatten()
-    else {
-        return StatusCode::FORBIDDEN.into_response();
+    let Some(repository) = a.db.git_repository(&request.repository_id).ok().flatten() else {
+        return StatusCode::NOT_FOUND.into_response();
     };
-    if grant != "write" && request.permission == "write" {
+    if repository.user_id != auth.user
+        || !auth.allows(&format!("integration:{}", repository.integration_id))
+    {
         return StatusCode::FORBIDDEN.into_response();
     }
     let _mutation = a.mutations.lock().await;
@@ -1647,20 +1481,13 @@ async fn exchange_git_bootstrap(
         &auth.user,
         &auth.client,
         &request.repository_id,
-        &request.permission,
+        "write",
         chrono::Utc::now().timestamp(),
     ) {
         Ok(Some(credential)) => credential,
         Ok(None) => return StatusCode::GONE.into_response(),
         Err(_) => return StatusCode::FORBIDDEN.into_response(),
     };
-    let _ = a.db.record_audit(
-        Some(&auth.user),
-        "git.credential.bootstrap.exchange",
-        Some(&request.repository_id),
-        "success",
-        &json!({"client_id":auth.client,"permission":request.permission}),
-    );
     if persist(&a).await.is_err() {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
@@ -2075,7 +1902,6 @@ async fn ui_bootstrap(State(a): State<App>, headers: HeaderMap) -> impl IntoResp
     };
     let clients = a.db.agent_clients(&user).unwrap_or_default();
     let tokens = a.db.agent_tokens(&user).unwrap_or_default();
-    let git_grants = a.db.all_git_grants(&user).unwrap_or_default();
     Json(json!({
         "mode": "admin",
         "user": user,
@@ -2083,52 +1909,8 @@ async fn ui_bootstrap(State(a): State<App>, headers: HeaderMap) -> impl IntoResp
         "integrations": integrations,
         "clients": clients,
         "tokens": tokens,
-        "git_grants": git_grants,
     }))
     .into_response()
-}
-
-async fn ui_set_git_grant(
-    State(a): State<App>,
-    Path((client, repository, permission)): Path<(String, String, String)>,
-    headers: HeaderMap,
-    Form(form): Form<CsrfForm>,
-) -> Response {
-    let _mutation = a.mutations.lock().await;
-    let user = match ui_user(&a, &headers, &form.csrf_token) {
-        Ok(v) => v,
-        Err(e) => return (StatusCode::FORBIDDEN, e).into_response(),
-    };
-    if let Err(e) = a.lease.assert_live() {
-        return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response();
-    }
-    let result = if permission == "revoked" {
-        a.db.revoke_git_grant(&user, &client, &repository)
-            .map(|_| ())
-    } else {
-        a.db.set_git_grant(&user, &client, &repository, &permission)
-    };
-    if let Err(e) = result {
-        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
-    }
-    if let Err(e) = audit_details(
-        &a,
-        Some(&user),
-        match permission.as_str() {
-            "revoked" => "git.repository.revoke",
-            "read" => "git.repository.downgrade",
-            _ => "git.repository.elevate",
-        },
-        Some(&repository),
-        "success",
-        &json!({"client_id":client,"permission":permission}),
-    ) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-    }
-    match persist(&a).await {
-        Ok(()) => Redirect::to("/ui").into_response(),
-        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
-    }
 }
 
 #[derive(Deserialize)]
@@ -5628,10 +5410,10 @@ mod tests {
             .db
             .upsert_git_repository(&user, &integration, &resolved)
             .unwrap();
-        let oauth = "oauth-secret";
+        let mcp_oauth = "oauth-secret";
         app.db
             .store_access_token(
-                &token_hash(oauth),
+                &token_hash(mcp_oauth),
                 "git-client",
                 &user,
                 &format!("mcp git:write integration:{integration}"),
@@ -5640,9 +5422,12 @@ mod tests {
                 None,
             )
             .unwrap();
-        app.db
-            .set_git_grant(&user, "git-client", &repository.id, "read")
-            .unwrap();
+        let oauth: &'static str = Box::leak(
+            app.db
+                .issue_git_credential(&user, "git-client", &repository.id, "write", 900)
+                .unwrap()
+                .into_boxed_str(),
+        );
         let authorizations = Arc::new(std::sync::Mutex::new(Vec::new()));
         app.git_providers.lock().await.insert(
             integration.clone(),
@@ -5675,17 +5460,6 @@ mod tests {
         assert_eq!(read.status(), StatusCode::OK);
         assert!(read.headers().get(header::SET_COOKIE).is_none());
         read.into_body().collect().await.unwrap();
-        let before = fixture.0.lock().unwrap().len();
-        let denied = router
-            .clone()
-            .oneshot(request(oauth, "git-receive-pack", None, "push"))
-            .await
-            .unwrap();
-        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
-        assert_eq!(fixture.0.lock().unwrap().len(), before);
-        app.db
-            .set_git_grant(&user, "git-client", &repository.id, "write")
-            .unwrap();
         let write = router
             .clone()
             .oneshot(request(oauth, "git-receive-pack", None, "push-body"))
@@ -5724,7 +5498,7 @@ mod tests {
                 &token_hash(other),
                 "other-client",
                 &user,
-                &format!("mcp git:write integration:{integration}"),
+                "mcp",
                 chrono::Utc::now().timestamp() + 300,
                 None,
                 None,
@@ -5736,22 +5510,9 @@ mod tests {
             .oneshot(request(other, "git-upload-pack", None, "fetch"))
             .await
             .unwrap();
-        assert_eq!(wrong_client.status(), StatusCode::FORBIDDEN);
+        assert_eq!(wrong_client.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(fixture.0.lock().unwrap().len(), before);
 
-        app.db
-            .revoke_git_grant(&user, "git-client", &repository.id)
-            .unwrap();
-        let revoked = router
-            .clone()
-            .oneshot(request(oauth, "git-upload-pack", None, "fetch"))
-            .await
-            .unwrap();
-        assert_eq!(revoked.status(), StatusCode::FORBIDDEN);
-        assert_eq!(fixture.0.lock().unwrap().len(), before);
-        app.db
-            .set_git_grant(&user, "git-client", &repository.id, "write")
-            .unwrap();
         app.db
             .update_integration(&integration, &user, None, None, Some(false), None)
             .unwrap();
@@ -5963,87 +5724,35 @@ mod tests {
             auth: AuthContext {
                 user: user.clone(),
                 client: "git-client".into(),
-                scopes: HashSet::from(["git:write".into()]),
+                scopes: HashSet::from([format!("integration:{integration}")]),
                 integrations: HashSet::from([integration.clone()]),
             },
         };
         let tools = control.tools().await.unwrap();
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 3);
         assert!(tools.iter().any(|tool| tool.name == "repository_access"));
-        let listed = control.call("repository_list", json!({})).await.unwrap();
-        assert_eq!(listed.as_array().unwrap().len(), 1);
-        let credential = control
-            .call("remote_credentials", json!({"repositoryId":repository.id}))
-            .await
-            .unwrap();
-        assert_eq!(credential["username"], "cog");
-        let bootstrap = control
-            .call(
-                "credential_bootstrap",
-                json!({"repositoryId":repository.id}),
-            )
-            .await
-            .unwrap();
-        assert_eq!(bootstrap["singleUse"], true);
-        let downgraded = control
-            .call(
-                "repository_revoke",
-                json!({"repositoryId":repository.id,"permission":"read"}),
-            )
-            .await
-            .unwrap();
-        assert_eq!(downgraded["permission"], "read");
-        control
-            .call(
-                "repository_revoke",
-                json!({"repositoryId":repository.id,"permission":"revoked"}),
-            )
-            .await
-            .unwrap();
-        assert!(
-            app.db
-                .git_grant_permission(&user, "git-client", &repository.id)
-                .unwrap()
-                .is_none()
-        );
-        let pending = control
+        assert!(tools.iter().any(|tool| tool.name == "remote_credentials"));
+        assert!(tools.iter().any(|tool| tool.name == "credential_bootstrap"));
+        let allowed = control
             .call(
                 "repository_access",
-                json!({"integrationId":integration,"repository":"owner/pending","permission":"read"}),
+                json!({"integrationId":integration,"repository":"owner/pending"}),
             )
             .await
-            .unwrap_err();
-        assert!(
-            pending
-                .downcast_ref::<crate::authz::InsufficientScope>()
-                .is_some()
-        );
+            .unwrap();
         let pending_repo = app
             .db
             .git_repository_by_provider(&user, &integration, "owner/pending")
             .unwrap()
             .unwrap();
-        app.db
-            .set_git_grant(&user, "git-client", &pending_repo.id, "read")
-            .unwrap();
-        let allowed = control
-            .call(
-                "repository_access",
-                json!({"integrationId":integration,"repository":"owner/pending","permission":"read"}),
-            )
-            .await
-            .unwrap();
-        assert_eq!(allowed["permission"], "read");
         assert!(
             allowed["remoteUrl"]
                 .as_str()
                 .unwrap()
                 .contains(&pending_repo.id)
         );
+        assert_eq!(allowed["credential"]["source"], "remote_credentials");
         assert!(control.call("unknown", json!({})).await.is_err());
-        app.db
-            .set_git_grant(&user, "git-client", &repository.id, "write")
-            .unwrap();
         if let Authority::S3(lease) = &app.lease {
             lease.relinquish().await.unwrap();
         }
@@ -6057,35 +5766,15 @@ mod tests {
             auth: AuthContext {
                 user: user.clone(),
                 client: "git-client".into(),
-                scopes: HashSet::from(["git:write".into()]),
+                scopes: HashSet::from([format!("integration:{integration}")]),
                 integrations: HashSet::from([integration.clone()]),
             },
         };
         assert!(
             stale_control
                 .call(
-                    "credential_bootstrap",
-                    json!({"repositoryId":repository.id})
-                )
-                .await
-                .is_err()
-        );
-        assert!(
-            stale_control
-                .call(
-                    "repository_revoke",
-                    json!({"repositoryId":repository.id,"permission":"revoked"})
-                )
-                .await
-                .is_err()
-        );
-        assert!(
-            stale_control
-                .call(
                     "repository_access",
-                    json!({
-                        "integrationId":integration,"repository":"owner/repo","permission":"read"
-                    })
+                    json!({"integrationId":integration,"repository":"owner/repo"})
                 )
                 .await
                 .is_err()
@@ -6279,13 +5968,10 @@ mod tests {
             .db
             .upsert_git_repository(&user, &integration, &resolved)
             .unwrap();
-        app.db
-            .set_git_grant(&user, "real-git", &repository.id, "write")
-            .unwrap();
-        let oauth = "real-git-oauth";
+        let mcp_oauth = "real-git-oauth";
         app.db
             .store_access_token(
-                &token_hash(oauth),
+                &token_hash(mcp_oauth),
                 "real-git",
                 &user,
                 &format!("mcp git:write integration:{integration}"),
@@ -6293,6 +5979,10 @@ mod tests {
                 None,
                 None,
             )
+            .unwrap();
+        let oauth = app
+            .db
+            .issue_git_credential(&user, "real-git", &repository.id, "write", 900)
             .unwrap();
         app.git_providers.lock().await.insert(
             integration,
@@ -6317,7 +6007,7 @@ mod tests {
                 &remote,
                 clone.to_str().unwrap(),
             ],
-            Some(oauth),
+            Some(&oauth),
         );
         let fallback = directory.path().join("fallback-clone");
         git_with_bearer(
@@ -6329,7 +6019,7 @@ mod tests {
                 &remote,
                 fallback.to_str().unwrap(),
             ],
-            Some(oauth),
+            Some(&oauth),
         );
         assert!(fallback.join("README.md").exists());
         std::fs::write(clone.join("from-clone.txt"), "push\n").unwrap();
@@ -6339,7 +6029,7 @@ mod tests {
         git_with_bearer(
             &clone,
             &["push", "--set-upstream", "origin", "fixture-branch"],
-            Some(oauth),
+            Some(&oauth),
         );
         git(&clone, &["checkout", "main"]);
         git(&clone, &["reset", "--hard", "origin/main"]);
@@ -6347,7 +6037,7 @@ mod tests {
         git(&seed, &["add", "README.md"]);
         git(&seed, &["commit", "-m", "upstream"]);
         git(&seed, &["push", "origin", "main"]);
-        git_with_bearer(&clone, &["fetch", "origin"], Some(oauth));
+        git_with_bearer(&clone, &["fetch", "origin"], Some(&oauth));
         std::fs::write(seed.join("README.md"), "initial\nupstream\npull\n").unwrap();
         git(&seed, &["add", "README.md"]);
         git(&seed, &["commit", "-m", "pull"]);
@@ -6355,7 +6045,7 @@ mod tests {
         git_with_bearer(
             &clone,
             &["pull", "--ff-only", "origin", "main"],
-            Some(oauth),
+            Some(&oauth),
         );
         assert!(protocol_v2.load(Ordering::SeqCst));
         gateway.abort();
@@ -6898,14 +6588,14 @@ mod tests {
             auth: AuthContext {
                 user,
                 client: "manifest-client".into(),
-                scopes: HashSet::from(["git:write".into()]),
+                scopes: HashSet::from([format!("integration:{integration}")]),
                 integrations: HashSet::from([integration.to_owned()]),
             },
         };
         let result = control
             .call(
                 "repository_access",
-                json!({"integrationId":integration,"repository":"asselstine/cog","permission":"write"}),
+                json!({"integrationId":integration,"repository":"asselstine/cog"}),
             )
             .await
             .unwrap();

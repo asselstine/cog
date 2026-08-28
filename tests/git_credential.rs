@@ -93,7 +93,7 @@ fn store_get_erase_and_validation_are_origin_and_path_scoped() {
 }
 
 #[test]
-fn bootstrap_exchange_is_persisted_and_reused_without_a_second_exchange() {
+fn bootstrap_exchange_stores_only_the_derived_credential() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = std::thread::spawn(move || {
@@ -104,10 +104,7 @@ fn bootstrap_exchange_is_persisted_and_reused_without_a_second_exchange() {
             let count = stream.read(&mut buffer).unwrap();
             request.extend_from_slice(&buffer[..count]);
             if request.windows(4).any(|window| window == b"\r\n\r\n")
-                && String::from_utf8_lossy(&request)
-                    .split("\r\n\r\n")
-                    .nth(1)
-                    .is_some_and(|body| body.contains("repository_id"))
+                && String::from_utf8_lossy(&request).contains("repository_id")
             {
                 break;
             }
@@ -119,13 +116,8 @@ fn bootstrap_exchange_is_persisted_and_reused_without_a_second_exchange() {
                 .contains("authorization: bearer oauth-token")
         );
         assert!(text.contains("bootstrap-secret"));
-        let body = br#"{"username":"cog","password":"exchanged-secret"}"#;
-        write!(
-            stream,
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        )
-        .unwrap();
+        let body = br#"{"username":"cog","password":"derived-secret"}"#;
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
         stream.write_all(body).unwrap();
     });
     let directory = tempfile::tempdir().unwrap();
@@ -138,7 +130,6 @@ fn bootstrap_exchange_is_persisted_and_reused_without_a_second_exchange() {
         .env("COG_GIT_ORIGIN", format!("http://{address}"))
         .env("COG_GIT_BOOTSTRAP", "bootstrap-secret")
         .env("COG_OAUTH_TOKEN", "oauth-token")
-        .env("COG_GIT_PERMISSION", "write")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -151,15 +142,16 @@ fn bootstrap_exchange_is_persisted_and_reused_without_a_second_exchange() {
         .unwrap();
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("password=exchanged-secret"));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "username=cog\npassword=derived-secret\n"
+    );
     server.join().unwrap();
-
     let cached = helper(
         directory.path(),
         Some(&format!("http://{address}")),
         "get",
         &input,
     );
-    assert!(cached.status.success());
-    assert!(String::from_utf8_lossy(&cached.stdout).contains("password=exchanged-secret"));
+    assert!(String::from_utf8_lossy(&cached.stdout).contains("password=derived-secret"));
 }

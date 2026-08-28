@@ -2,8 +2,6 @@
 //! provider; this module keeps the public, provider-neutral operation names.
 pub const OPERATIONS: &[&str] = &[
     "repository_access",
-    "repository_list",
-    "repository_revoke",
     "remote_credentials",
     "credential_bootstrap",
 ];

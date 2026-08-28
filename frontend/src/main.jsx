@@ -85,11 +85,6 @@ function AgentAccess({ data, action, busy, integrationLabel }) {
   </section>;
 }
 
-function GitAccess({ data, action, busy }) {
-  const grants = data.git_grants || [];
-  return <section className="card overflow-hidden"><div className="border-b border-zinc-200 px-4 py-3 dark:border-white/8"><h2 className="font-semibold">Git repository grants</h2><p className="mt-0.5 text-xs text-zinc-500 dark:text-zinc-400">Exact repository access by OAuth client.</p></div>{grants.length === 0 ? <div className="p-4"><Empty>No Git repositories approved.</Empty></div> : <div className="overflow-x-auto"><table className="compact-table"><thead><tr><th>Repository</th><th>Agent</th><th>Permission</th><th>Last use</th><th><span className="sr-only">Actions</span></th></tr></thead><tbody>{grants.map(grant => <tr key={`${grant.client_id}:${grant.repository_id}`}><td><div className="font-medium">{grant.display_name}</div><code className="text-[11px] text-zinc-400">{grant.repository_id}</code></td><td>{grant.client_name}</td><td><select className="input py-1" value={grant.permission} disabled={!!busy} onChange={event => action(`/ui/clients/${grant.client_id}/git/${grant.repository_id}/${event.target.value}`, {})}><option value="read">read</option><option value="write">write</option></select></td><td>{grant.last_used_at ? <TokenDate label="" timestamp={grant.last_used_at}/> : "Never"}</td><td className="text-right"><button className="button-danger" title="Revoke repository grant" disabled={!!busy} onClick={() => action(`/ui/clients/${grant.client_id}/git/${grant.repository_id}/revoked`, {})}><Trash2 size={15}/></button></td></tr>)}</tbody></table></div>}</section>;
-}
-
 function Dashboard({ data, reload }) {
   const [error, setError] = useState(""); const [busy, setBusy] = useState("");
   const [expandedIntegration, setExpandedIntegration] = useState("");
@@ -104,7 +99,6 @@ function Dashboard({ data, reload }) {
         })}</tbody></table></div>}
       </section>
       <AgentAccess data={data} action={action} busy={busy} integrationLabel={integrationLabel}/>
-      <GitAccess data={data} action={action} busy={busy}/>
     </div><footer className="mt-8 flex items-center gap-2 text-xs text-zinc-500 dark:text-zinc-500"><ShieldCheck size={14}/> Credentials are encrypted at rest and never displayed here.</footer></>;
 }
 

@@ -71,22 +71,20 @@ fn run() -> anyhow::Result<()> {
             ) {
                 let repository_id = path
                     .strip_prefix("git/")
-                    .and_then(|v| v.strip_suffix(".git"))
+                    .and_then(|value| value.strip_suffix(".git"))
                     .ok_or_else(|| {
                         anyhow::anyhow!("credential request has an invalid repository path")
                     })?;
                 uuid::Uuid::parse_str(repository_id).map_err(|_| {
                     anyhow::anyhow!("credential request has a non-opaque repository path")
                 })?;
-                let endpoint = configured.join("git/bootstrap")?;
                 let response = reqwest::blocking::Client::builder()
-                    .redirect(reqwest::redirect::Policy::none()).build()?
-                    .post(endpoint).bearer_auth(oauth)
-                    .json(&serde_json::json!({
-                        "bootstrap": bootstrap,
-                        "repository_id": repository_id,
-                        "permission": std::env::var("COG_GIT_PERMISSION").unwrap_or_else(|_| "read".into())
-                    })).send()?;
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()?
+                    .post(configured.join("git/bootstrap")?)
+                    .bearer_auth(oauth)
+                    .json(&serde_json::json!({"bootstrap":bootstrap,"repository_id":repository_id}))
+                    .send()?;
                 anyhow::ensure!(
                     response.status().is_success(),
                     "bootstrap exchange was rejected ({})",
