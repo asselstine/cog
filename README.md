@@ -5,26 +5,24 @@ Cog is a self-hosted gateway that gives AI agents secure, governed access to too
 Install on Linux or macOS:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/actionllama/cog/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/asselstine/cog/main/install.sh | sh
 ```
 
 Install on Windows PowerShell:
 
 ```powershell
-irm https://raw.githubusercontent.com/actionllama/cog/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/asselstine/cog/main/install.ps1 | iex
 ```
 
-Initialize cog, create the first user non-interactively, and start it:
+Create the first user and start cog:
 
 ```sh
-cog
-printf '%s\n' "$PASSWORD" | cog create-user owner@example.com --password-stdin
+cog create-user $EMAIL $PASSWORD
 cog
 ```
 
-The first command creates the native state directory and intentionally exits
-until an owner exists. Open <http://localhost:4788> after the final command.
-The default files are:
+`create-user` initializes cog automatically. Open <http://localhost:4788>
+after starting it. The default files are:
 
 ```text
 ~/.cog/master.key
@@ -61,10 +59,10 @@ docker run --rm \
 Before starting cog, create a user with the same storage configuration the server will use:
 
 ```sh
-cog create-user owner@example.com --password-stdin
+cog create-user $EMAIL $PASSWORD
 ```
 
-The command reads one password line from standard input and uses the same storage mode as the server. With S3 configured it acquires the exclusive lease, restores the current database, and durably replicates the new user. It fails while another cog instance holds that lease, so stop the service before adding a user.
+The command initializes cog automatically and uses the same storage mode as the server. A positional password can be visible in shell history and process inspection; use `--password-stdin` when that matters. With S3 configured it acquires the exclusive lease, restores the current database, and durably replicates the new user. It fails while another cog instance holds that lease, so stop the service before adding a user.
 
 Then start cog and open the configured base URL to sign in. Agents connect to the streamable HTTP MCP endpoint at `/mcp` and complete the advertised OAuth flow.
 
@@ -146,6 +144,15 @@ cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 ```
+
+### Create a release
+
+Update the package version in `Cargo.toml`, then either push the matching tag
+(for example, `v0.2.0`) or open **Actions → release → Run workflow** and enter
+that tag. The release workflow builds native binaries for Linux x86-64 and
+ARM64, macOS Intel and Apple Silicon, and Windows x86-64. It publishes the five
+archives plus `SHA256SUMS` to a GitHub Release, then installs and executes every
+published binary on its native GitHub-hosted runner.
 
 Run the S3 integration suite:
 

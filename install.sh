@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-COG_REPO=${COG_REPO:-actionllama/cog}
+COG_REPO=${COG_REPO:-asselstine/cog}
 COG_VERSION=${COG_VERSION:-latest}
 COG_INSTALL_DIR=${COG_INSTALL_DIR:-}
 

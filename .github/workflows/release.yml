@@ -4,13 +4,47 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      version:
+        description: Release tag to create (for example, v0.1.0)
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
+  prepare:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: release
+        name: Validate release version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "version must be a v-prefixed semantic version (for example, v0.1.0)" >&2
+            exit 1
+          fi
+          package_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          if [[ "$RELEASE_TAG" != "v$package_version" ]]; then
+            echo "release tag $RELEASE_TAG does not match Cargo.toml version $package_version" >&2
+            exit 1
+          fi
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
   build:
     name: ${{ matrix.target }}
+    needs: prepare
     strategy:
       fail-fast: false
       matrix:
@@ -81,11 +115,11 @@ jobs:
           name: ${{ matrix.target }}
           path: ${{ matrix.archive }}
           if-no-files-found: error
+          retention-days: 7
 
   publish:
     name: Publish GitHub release
-    if: github.event_name == 'push'
-    needs: build
+    needs: [prepare, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -99,14 +133,15 @@ jobs:
         run: sha256sum cog-* > SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           files: dist/*
           generate_release_notes: true
           fail_on_unmatched_files: true
 
   verify-installers:
     name: Verify installer (${{ matrix.os }})
-    if: github.event_name == 'push'
-    needs: publish
+    needs: [prepare, publish]
     strategy:
       fail-fast: false
       matrix:
@@ -117,17 +152,17 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         env:
-          COG_VERSION: ${{ github.ref_name }}
+          COG_VERSION: ${{ needs.prepare.outputs.tag }}
           COG_INSTALL_DIR: ${{ runner.temp }}/cog bin
         run: |
-          curl -fsSL "https://raw.githubusercontent.com/actionllama/cog/${{ github.ref_name }}/install.sh" | sh
+          curl -fsSL "https://raw.githubusercontent.com/asselstine/cog/${{ needs.prepare.outputs.tag }}/install.sh" | sh
           "$COG_INSTALL_DIR/cog" --version
       - name: Install and execute Windows release
         if: runner.os == 'Windows'
         shell: pwsh
         env:
-          COG_VERSION: ${{ github.ref_name }}
+          COG_VERSION: ${{ needs.prepare.outputs.tag }}
           COG_INSTALL_DIR: ${{ runner.temp }}\cog bin
         run: |
-          irm "https://raw.githubusercontent.com/actionllama/cog/${{ github.ref_name }}/install.ps1" | iex
+          irm "https://raw.githubusercontent.com/asselstine/cog/${{ needs.prepare.outputs.tag }}/install.ps1" | iex
           & (Join-Path $env:COG_INSTALL_DIR 'cog.exe') --version

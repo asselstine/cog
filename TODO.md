@@ -49,14 +49,14 @@ On Windows, the equivalent cog home should live under `%LOCALAPPDATA%\cog`.
 
   ```text
   No users exist. Create the first user with:
-    cog create-user owner@example.com --password-stdin
+    cog create-user $EMAIL $PASSWORD
   ```
 
 - [x] Make `create-user` fully non-interactive.
 - [x] Prefer a concise command shape:
 
   ```sh
-  cog create-user USERNAME --password-stdin
+  cog create-user EMAIL PASSWORD
   ```
 
 - [x] Decide whether `USERNAME` replaces the existing email identity or is the email positional argument. Using the existing email field avoids an unnecessary schema migration.
@@ -65,10 +65,9 @@ On Windows, the equivalent cog home should live under `%LOCALAPPDATA%\cog`.
 - [x] If direct password arguments are a firm requirement, optionally add `--password VALUE` and warn in `--help` and the README that it can leak through shell history and process inspection.
 - [x] Ensure `create-user` uses the same cog home, data directory, master key, and optional S3 configuration as normal startup.
 - [x] Add integration coverage for this sequence:
-  1. Bare `cog` creates local state but exits because no user exists.
-  2. Non-interactive `create-user` succeeds.
-  3. Bare `cog` then starts and serves `/readyz`.
-  4. Restart preserves the user and encryption key.
+  1. Non-interactive `create-user` initializes local state and succeeds.
+  2. Bare `cog` then starts and serves `/readyz`.
+  3. Restart preserves the user and encryption key.
 
 ## P0 — Local-only storage by default
 
@@ -130,12 +129,11 @@ On Windows, the equivalent cog home should live under `%LOCALAPPDATA%\cog`.
 - [x] Show the minimal first-run sequence:
 
   ```sh
-  cog
-  printf '%s\n' "$PASSWORD" | cog create-user owner@example.com --password-stdin
+  cog create-user $EMAIL $PASSWORD
   cog
   ```
 
-- [x] Explain that the first `cog` initializes `~/.cog` and intentionally exits until an owner exists.
+- [x] Explain that `create-user` initializes `~/.cog` automatically.
 - [x] Tell the user to open `http://localhost:4788`.
 - [x] Briefly describe the default files:
 

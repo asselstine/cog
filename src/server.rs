@@ -1101,7 +1101,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             remote.relinquish().await?;
         }
         eprintln!(
-            "No users exist. Create the first user with:\n  cog create-user owner@example.com --password-stdin"
+            "No users exist. Create the first user with:\n  cog create-user $EMAIL $PASSWORD"
         );
         return Ok(());
     }

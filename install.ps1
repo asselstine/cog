@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$Repository = if ($env:COG_REPO) { $env:COG_REPO } else { "actionllama/cog" }
+$Repository = if ($env:COG_REPO) { $env:COG_REPO } else { "asselstine/cog" }
 $Version = if ($env:COG_VERSION) { $env:COG_VERSION } else { "latest" }
 $InstallDir = if ($env:COG_INSTALL_DIR) {
     $env:COG_INSTALL_DIR

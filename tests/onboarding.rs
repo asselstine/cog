@@ -1,5 +1,4 @@
 use std::{
-    io::Write,
     net::TcpListener,
     process::{Command, Stdio},
     thread,
@@ -19,29 +18,15 @@ fn command(home: &std::path::Path) -> Command {
 #[test]
 fn readme_first_run_bootstraps_and_restarts() {
     let temp = tempfile::tempdir().unwrap();
-    let first = command(temp.path()).output().unwrap();
-    assert!(first.status.success());
-    assert!(
-        String::from_utf8_lossy(&first.stderr)
-            .contains("cog create-user owner@example.com --password-stdin")
-    );
+    let create = command(temp.path())
+        .args(["create-user", "owner@example.com", "a-secure-test-password"])
+        .output()
+        .unwrap();
+    assert!(create.status.success());
     let key_path = temp.path().join("master.key");
     let database_path = temp.path().join("data/cog.sqlite");
     let key = std::fs::read(&key_path).unwrap();
     assert!(database_path.exists());
-
-    let mut create = command(temp.path());
-    create
-        .args(["create-user", "owner@example.com", "--password-stdin"])
-        .stdin(Stdio::piped());
-    let mut child = create.spawn().unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(b"a-secure-test-password\n")
-        .unwrap();
-    assert!(child.wait().unwrap().success());
 
     for _ in 0..2 {
         let port = TcpListener::bind("127.0.0.1:0")
