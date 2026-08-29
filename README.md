@@ -185,7 +185,8 @@ CI requires 95% line coverage. The full CI sequence, including the instrumented 
 The MCP endpoint defaults to hybrid mode at `/mcp`: `execute` provides code-mode
 access to every connected integration without expanding their tools into the
 top-level list, while COG-native tools are advertised directly. Native Git
-orchestration includes `repository_access` and `ssh_certificate`; native
+orchestration includes `repository_access`, `ssh_certificate_status`, and
+`ssh_certificate`; native
 administration tools use the `cog_` prefix. Connect to `/mcp?codemode=true` for
 code-mode-only discovery, where `execute` is the sole top-level tool and the
 same COG-native operations remain available through the `git` and `cog`

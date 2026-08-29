@@ -530,6 +530,7 @@ impl ToolProvider for AdminProvider {
 fn git_control_tool(name: &str, description: &str, destructive: bool) -> Tool {
     Tool{name:name.into(),description:Some(description.into()),input_schema:match name{
  "repository_access"=>json!({"type":"object","properties":{"integrationId":{"type":"string"},"repository":{"type":"string"}},"required":["integrationId","repository"],"additionalProperties":false}),
+ "ssh_certificate_status"=>json!({"type":"object","properties":{"repositoryId":{"type":"string"},"publicKey":{"type":"string"},"certificate":{"type":"string"}},"required":["repositoryId","publicKey","certificate"],"additionalProperties":false}),
  "ssh_certificate"=>json!({"type":"object","properties":{"repositoryId":{"type":"string"},"publicKey":{"type":"string"},"permission":{"enum":["read","write"]}},"required":["repositoryId","publicKey","permission"],"additionalProperties":false}),
  _=>json!({"type":"object","properties":{},"additionalProperties":false})},extra:serde_json::from_value(json!({"annotations":{"readOnlyHint":!destructive,"destructiveHint":destructive,"openWorldHint":false}})).unwrap_or_default()}
 }
@@ -555,12 +556,13 @@ fn ssh_advertisement(app: &App, repository_id: &str) -> Option<Value> {
         "available":true,
         "url":format!("ssh://git@{host}:{port}/{repository_id}"),
         "certificateTool":"ssh_certificate",
+        "certificateStatusTool":"ssh_certificate_status",
         "certificateTtlSeconds":app.config.ssh_certificate_ttl_secs,
         "publicHost":host,
         "publicPort":port,
         "hostKeyFingerprint":crate::git::ssh::fingerprint(keys.host.public_key()),
         "knownHosts":format!("{host_field} {public_key}"),
-        "requiredPrograms":["git","ssh","ssh-keygen"]
+        "requiredPrograms":["git","ssh"]
     }))
 }
 
@@ -626,13 +628,18 @@ impl ToolProvider for GitControlProvider {
     async fn tools(&self) -> anyhow::Result<Vec<Tool>> {
         let mut tools = vec![git_control_tool(
             "repository_access",
-            "Resolve a GitHub repository and begin the required SSH workflow. After this tool returns: generate or reuse a local Ed25519 key, call ssh_certificate with repositoryId and only the public key, write the returned certificate and knownHosts files, then use sshRemoteUrl. Never send the private key or disable host-key checking. Access is controlled by the GitHub App installation and this client's existing integration authorization.",
+            "Resolve a GitHub repository and begin the required SSH workflow. Reuse an existing local Ed25519 identity from SSH configuration or the SSH agent. Check a saved certificate with ssh_certificate_status and reuse it while valid; otherwise call ssh_certificate with only the existing public key. Store the certificate separately and pass it with CertificateFile. Never send or replace the private key, generate a key automatically, or disable host-key checking. Access is controlled by the GitHub App installation and this client's existing integration authorization.",
             false,
         )];
         if self.app.ssh_keys.is_some() && self.app.ssh_ready.load(Ordering::Acquire) {
             tools.push(git_control_tool(
+                "ssh_certificate_status",
+                "Check whether an existing COG SSH certificate is currently valid for this client, repository, permission grant, and Ed25519 public key. Use this before requesting another certificate. The private key remains local and must never be sent.",
+                false,
+            ));
+            tools.push(git_control_tool(
                 "ssh_certificate",
-                "Issue a short-lived SSH user certificate for a client-generated Ed25519 public key. Generate the private key locally with ssh-keygen; the private key must never be sent to COG. Write the returned certificate beside that private key using the returned certificateFileSuffix, pin knownHosts, and use sshRemoteUrl. On expiry or sandbox loss, generate a new key and call this tool again.",
+                "Issue a short-lived SSH user certificate for an existing local Ed25519 identity. Reuse a key from SSH configuration or the SSH agent and send only its public key. Store the certificate separately and pass it with CertificateFile; never send or replace the private key. Before issuance, use ssh_certificate_status to reuse any saved valid certificate. Renew expired certificates against the same public key.",
                 false,
             ));
         }
@@ -742,18 +749,94 @@ impl ToolProvider for GitControlProvider {
                     "displayName":repo.display_name,
                     "remoteUrl":remote,
                     "remoteUrlVersion":2,
-                    "nextAction":"generateOrReuseEd25519KeyThenCallSshCertificate",
+                    "nextAction":"reuseExistingEd25519IdentityAndCheckSavedCertificate",
                     "workflow":[
-                        {"step":1,"action":"generateOrReuseLocalKey","program":"ssh-keygen","arguments":["-q","-t","ed25519","-N","","-f","<private-key-path>"],"privateKeyRemainsLocal":true},
-                        {"step":2,"action":"callTool","tool":"ssh_certificate","arguments":{"repositoryId":repo.id,"publicKey":"contents of <private-key-path>.pub without a comment","permission":"read or write"}},
-                        {"step":3,"action":"writeOutputs","certificatePath":"<private-key-path>-cert.pub","knownHostsPath":"<private-known-hosts-path>"},
-                        {"step":4,"action":"useRemote","remoteField":"sshRemoteUrl","strictHostKeyChecking":true}
+                        {"step":1,"action":"resolveExistingEd25519Identity","sources":["SSH configuration","SSH agent","standard SSH identity paths"],"privateKeyRemainsLocal":true,"ifUnavailable":"report that an Ed25519 identity must be provisioned; do not generate one automatically"},
+                        {"step":2,"action":"checkSavedCertificate","tool":"ssh_certificate_status","arguments":{"repositoryId":repo.id,"publicKey":"existing Ed25519 public key","certificate":"saved COG certificate"},"ifValid":"reuse","ifMissingOrInvalid":"continue"},
+                        {"step":3,"action":"callToolIfNeeded","tool":"ssh_certificate","arguments":{"repositoryId":repo.id,"publicKey":"existing Ed25519 public key","permission":"read or write"}},
+                        {"step":4,"action":"writeOutputs","certificatePath":"<private-certificate-path>","knownHostsPath":"<private-known-hosts-path>","preserveForReuse":true},
+                        {"step":5,"action":"useRemote","remoteField":"sshRemoteUrl","certificateFile":"<private-certificate-path>","strictHostKeyChecking":true}
                     ],
                     "remotes":{
                         "version":2,
                         "preferred":"ssh",
                         "ssh":ssh.expect("checked above")
                     }
+                }))
+            }
+            "ssh_certificate_status" => {
+                let repository_id = args
+                    .get("repositoryId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("repositoryId is required"))?;
+                let repository = self
+                    .app
+                    .db
+                    .git_repository(repository_id)?
+                    .filter(|repository| repository.user_id == self.auth.user)
+                    .ok_or_else(|| anyhow::anyhow!("repository not found"))?;
+                if !self.auth.allows_integration(&repository.integration_id) {
+                    return Err(crate::authz::InsufficientScope {
+                        scopes: vec![format!("integration:{}", repository.integration_id)],
+                    }
+                    .into());
+                }
+                anyhow::ensure!(
+                    self.app
+                        .db
+                        .integration(&repository.integration_id, &self.auth.user)?
+                        .is_some_and(|integration| integration.enabled),
+                    "integration disabled"
+                );
+                let granted = self
+                    .app
+                    .db
+                    .git_grant_permission(&self.auth.user, &self.auth.client, repository_id)?
+                    .ok_or_else(|| anyhow::anyhow!("repository grant not found"))?;
+                let public_key = crate::git::ssh::parse_public_key(
+                    args.get("publicKey")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| anyhow::anyhow!("publicKey is required"))?,
+                )?;
+                let certificate = args
+                    .get("certificate")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("certificate is required"))?;
+                let now = chrono::Utc::now().timestamp();
+                let binding = crate::git::ssh::verify_certificate_with_durable_cas(
+                    certificate,
+                    &self.app.db,
+                    &public_key,
+                    now,
+                );
+                let Ok(binding) = binding else {
+                    return Ok(json!({
+                        "valid": false,
+                        "repositoryId": repository_id,
+                        "action": "renewWithSamePublicKey",
+                    }));
+                };
+                let binding_matches = binding.user_id == self.auth.user
+                    && binding.identity_id == self.auth.identity
+                    && binding.agent_id == self.auth.agent
+                    && binding.client_id == self.auth.client
+                    && binding.integration_id == repository.integration_id
+                    && binding.repository_id == repository_id
+                    && (binding.permission == "read" || granted == "write");
+                if !binding_matches {
+                    return Ok(json!({
+                        "valid": false,
+                        "repositoryId": repository_id,
+                        "action": "requestCertificateForSamePublicKey",
+                    }));
+                }
+                Ok(json!({
+                    "valid": true,
+                    "repositoryId": repository_id,
+                    "permission": binding.permission,
+                    "expiresAt": chrono::DateTime::from_timestamp(binding.expires_at, 0).expect("valid timestamp").to_rfc3339(),
+                    "usableForSeconds": binding.expires_at.saturating_sub(now),
+                    "action": "reuse",
                 }))
             }
             "ssh_certificate" => {
@@ -915,17 +998,15 @@ impl ToolProvider for GitControlProvider {
                     "expiresAt": chrono::DateTime::from_timestamp(expires_at, 0).expect("valid timestamp").to_rfc3339(),
                     "sshRemoteUrl": remote,
                     "certificate": certificate,
-                    "certificateFileSuffix": "-cert.pub",
                     "knownHosts": format!("{host_field} {host_public}"),
-                    "identityFileHint": "path to the private key corresponding to publicKey",
-                    "requiredPrograms": ["git", "ssh", "ssh-keygen"],
-                    "privateKeyGeneration": {"program":"ssh-keygen","arguments":["-q","-t","ed25519","-N","","-f","<private-key-path>"]},
-                    "certificateOutput": {"path":"<private-key-path>-cert.pub","contentsField":"certificate","encoding":"UTF-8","trailingNewline":true},
+                    "identitySource": "existing Ed25519 identity from SSH configuration or the SSH agent",
+                    "requiredPrograms": ["git", "ssh"],
+                    "certificateOutput": {"path":"<private-certificate-path>","contentsField":"certificate","encoding":"UTF-8","trailingNewline":true,"preserveForReuse":true},
                     "knownHostsOutput": {"path":"<private-known-hosts-path>","contentsField":"knownHosts","encoding":"UTF-8","trailingNewline":true},
                     "gitArguments": ["clone", "--", remote],
-                    "sshArguments": ["-o","IdentitiesOnly=yes","-o","StrictHostKeyChecking=yes","-o","UserKnownHostsFile=<private-known-hosts-path>","-i","<private-key-path>"],
-                    "sshOptions": {"identitiesOnly": true, "strictHostKeyChecking": true, "userKnownHostsFile": "path to the private known_hosts file"},
-                    "renewal": {"implicit":false,"action":"generate a new local key and call ssh_certificate again after expiry or sandbox replacement","privateKeyRemainsLocal":true}
+                    "sshArguments": ["-o","IdentitiesOnly=yes","-o","StrictHostKeyChecking=yes","-o","UserKnownHostsFile=<private-known-hosts-path>","-o","CertificateFile=<private-certificate-path>"],
+                    "sshOptions": {"identitiesOnly": true, "strictHostKeyChecking": true, "userKnownHostsFile": "path to the private known_hosts file", "certificateFile": "path to the saved COG certificate", "identitySource": "existing SSH configuration or SSH agent"},
+                    "renewal": {"implicit":false,"checkTool":"ssh_certificate_status","action":"reuse the same public key when requesting a certificate after expiry","privateKeyRemainsLocal":true,"preserveSshMaterial":true}
                 }))
             }
             _ => anyhow::bail!("unknown Git control operation"),
@@ -6904,6 +6985,107 @@ mod tests {
             .unwrap();
         assert_eq!(result["error"], "github_app_installation_required");
         assert_eq!(result["action"], "completeGitHubSetupThenRetry");
+    }
+
+    #[tokio::test]
+    async fn ssh_certificate_status_reuses_existing_identity_and_certificate() {
+        let (mut app, _directory) = route_test_app().await;
+        app.config.ssh_listen = Some("127.0.0.1:0".parse().unwrap());
+        app.config.ssh_public_host = Some("localhost".into());
+        app.config.ssh_public_port = Some(2222);
+        app.ssh_keys = Some(Arc::new(std::sync::RwLock::new(
+            crate::git::ssh::KeySet::load_or_create(&app.db, &app.secrets).unwrap(),
+        )));
+        app.ssh_ready.store(true, Ordering::Release);
+
+        let user = app
+            .db
+            .create_user("ssh-status@example.com", "hash")
+            .unwrap();
+        let client = "status-client";
+        app.db
+            .register_client(
+                client,
+                Some(&user),
+                "status agent",
+                &["http://localhost/callback".into()],
+            )
+            .unwrap();
+        let agent = app.db.agent_for_client(client).unwrap().unwrap();
+        let integration = app
+            .db
+            .create_integration(
+                &user,
+                "GitHub",
+                "git",
+                &json!({"kind":"git","provider":"github","host":"github.com"}),
+                None,
+            )
+            .unwrap();
+        let repository = app
+            .db
+            .upsert_git_repository(
+                &user,
+                &integration,
+                &ResolvedRepository {
+                    provider_repository_id: "status-repository".into(),
+                    display_name: "owner/status-repository".into(),
+                    upstream_url: "https://github.com/owner/status-repository.git"
+                        .parse()
+                        .unwrap(),
+                    metadata: json!({}),
+                },
+            )
+            .unwrap();
+        let auth = AuthContext {
+            user: user.clone(),
+            agent: agent.id,
+            identity: agent.identity_id,
+            client: client.into(),
+            scopes: HashSet::from([format!("integration:{integration}")]),
+            integrations: HashSet::from([integration.clone()]),
+        };
+        app.db
+            .set_git_grant(&user, &auth.client, &repository.id, "write")
+            .unwrap();
+        let control = GitControlProvider { app, auth };
+        let identity = crate::git::ssh::generate_key().unwrap();
+        let public_key = identity.public_key().to_openssh().unwrap();
+        let issued = control
+            .call(
+                "ssh_certificate",
+                json!({"repositoryId":repository.id,"publicKey":public_key,"permission":"write"}),
+            )
+            .await
+            .unwrap();
+        assert!(issued.get("privateKeyGeneration").is_none());
+        assert_eq!(
+            issued["sshOptions"]["certificateFile"],
+            "path to the saved COG certificate"
+        );
+
+        let status = control
+            .call(
+                "ssh_certificate_status",
+                json!({"repositoryId":repository.id,"publicKey":public_key,"certificate":issued["certificate"]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status["valid"], true);
+        assert_eq!(status["action"], "reuse");
+        assert_eq!(status["permission"], "write");
+        assert!(status["usableForSeconds"].as_i64().unwrap() > 0);
+
+        let other_identity = crate::git::ssh::generate_key().unwrap();
+        let invalid = control
+            .call(
+                "ssh_certificate_status",
+                json!({"repositoryId":repository.id,"publicKey":other_identity.public_key().to_openssh().unwrap(),"certificate":issued["certificate"]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid["valid"], false);
+        assert_eq!(invalid["action"], "renewWithSamePublicKey");
     }
 
     #[test]
