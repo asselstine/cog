@@ -26,14 +26,15 @@ fn main() {
         return;
     }
 
-    let install = Command::new("npm")
+    let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
+    let install = Command::new(npm)
         .args(["ci", "--no-audit", "--no-fund"])
         .current_dir(frontend)
         .status()
         .expect("npm is required to build the cog frontend");
     assert!(install.success(), "npm ci failed");
 
-    let build = Command::new("npm")
+    let build = Command::new(npm)
         .args(["run", "build"])
         .current_dir(frontend)
         .status()

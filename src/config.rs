@@ -451,21 +451,22 @@ mod tests {
     use tempfile::tempdir;
     #[test]
     fn paths_and_validation() {
+        let temp = tempdir().unwrap();
+        let data = temp.path().join("data");
         let mut c = Config::parse_from([
             "cog",
             "--data-dir",
-            "/data",
+            data.to_str().unwrap(),
             "--s3-bucket",
             "b",
             "--master-key",
             "abcdefghijklmnopqrstuvwxyz123456",
         ]);
-        assert_eq!(c.db_path(), PathBuf::from("/data/cog.sqlite"));
+        assert_eq!(c.db_path(), data.join("cog.sqlite"));
         assert_eq!(c.lease_ttl(), Duration::from_secs(30));
         assert!(c.s3_enabled());
         assert_eq!(c.ssh_listen, Some("127.0.0.1:2222".parse().unwrap()));
-        let temp = tempdir().unwrap();
-        c.initialize_in(temp.path()).unwrap();
+        c.initialize_in(&temp.path().join("home")).unwrap();
         assert_eq!(c.ssh_public_host.as_deref(), Some("localhost"));
         assert_eq!(c.ssh_public_port, Some(2222));
         assert!(c.validate().is_ok());
