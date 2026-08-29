@@ -3,9 +3,9 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    cog::ltx::fuzz_validate_reference_ltx(data);
-    cog::upstream::fuzz_validate_sse(data);
+    let _ = cog::ltx::decode_reference_ltx(data);
     if let Ok(text) = std::str::from_utf8(data) {
+        let _ = cog::upstream::parse_sse_json(text, 1);
         let _ = cog::oauth::validate_redirect_uri(text);
         let _ = cog::git::auth::parse_authorization(text);
         let parts = text.split('\0').collect::<Vec<_>>();

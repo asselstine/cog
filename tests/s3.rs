@@ -27,7 +27,7 @@ fn store() -> Arc<dyn ObjectStore> {
 }
 
 #[tokio::test]
-#[ignore = "requires compose.test.yml MinIO"]
+#[ignore = "requires tests/infrastructure/compose.yml MinIO"]
 async fn conditional_lease_excludes_second_owner() {
     let s = store();
     let prefix = format!("tests/{}/", uuid::Uuid::new_v4());
@@ -52,7 +52,7 @@ async fn conditional_lease_excludes_second_owner() {
 }
 
 #[tokio::test]
-#[ignore = "requires compose.test.yml MinIO"]
+#[ignore = "requires tests/infrastructure/compose.yml MinIO"]
 async fn incremental_replication_restores_across_generation() {
     let s = store();
     let prefix = format!("tests/{}/", uuid::Uuid::new_v4());
@@ -82,14 +82,15 @@ async fn incremental_replication_restores_across_generation() {
 }
 
 #[tokio::test]
-#[ignore = "requires compose.test.yml MinIO"]
+#[ignore = "requires tests/infrastructure/compose.yml MinIO"]
 async fn ssh_host_and_ca_identity_survive_s3_takeover() {
     let s = store();
     let prefix = format!("ssh-takeover/{}/", uuid::Uuid::new_v4());
     let directory = tempfile::tempdir().unwrap();
     let first_path = directory.path().join("first.sqlite");
     let first = Database::open(&first_path).unwrap();
-    let secrets = cog::crypto::SecretBox::new(b"0123456789abcdef0123456789abcdef");
+    let master_key = cog::crypto::random_token(32);
+    let secrets = cog::crypto::SecretBox::new(master_key.as_bytes());
     let first_keys = cog::git::ssh::KeySet::load_or_create(&first, &secrets).unwrap();
     let host = first_keys.host.public_key().to_openssh().unwrap();
     let ca = first_keys.user_ca.public_key().to_openssh().unwrap();
@@ -109,7 +110,7 @@ async fn ssh_host_and_ca_identity_survive_s3_takeover() {
 }
 
 #[tokio::test]
-#[ignore = "requires compose.test.yml MinIO"]
+#[ignore = "requires tests/infrastructure/compose.yml MinIO"]
 async fn git_grant_acknowledgements_have_covering_durable_ltx_positions() {
     let s = store();
     let prefix = format!("git-durable-ack/{}/", uuid::Uuid::new_v4());
@@ -178,17 +179,19 @@ async fn git_grant_acknowledgements_have_covering_durable_ltx_positions() {
 }
 
 #[tokio::test]
-#[ignore = "requires compose.test.yml MinIO"]
+#[ignore = "requires tests/infrastructure/compose.yml MinIO"]
 async fn two_process_takeover_restores_and_excludes_stale_owner() {
     let directory = tempfile::tempdir().unwrap();
     let prefix = format!("process-tests/{}/", uuid::Uuid::new_v4());
     let first_dir = directory.path().join("first");
     let second_dir = directory.path().join("second");
+    let master_key = cog::crypto::random_token(32);
     let status = configure_cog(
         Command::new(env!("CARGO_BIN_EXE_cog")),
         &first_dir,
         &prefix,
         19188,
+        &master_key,
     )
     .args(["create-user", "owner@example.com", "--password-stdin"])
     .stdin(Stdio::piped())
@@ -204,10 +207,10 @@ async fn two_process_takeover_restores_and_excludes_stale_owner() {
     })
     .unwrap();
     assert!(status.success());
-    let mut first = spawn_cog(&first_dir, &prefix, 19188);
+    let mut first = spawn_cog(&first_dir, &prefix, 19188, &master_key);
     wait_ready(19188).await;
 
-    let mut excluded = spawn_cog(&second_dir, &prefix, 19189);
+    let mut excluded = spawn_cog(&second_dir, &prefix, 19189, &master_key);
     let status = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if let Some(status) = excluded.try_wait().unwrap() {
@@ -222,18 +225,19 @@ async fn two_process_takeover_restores_and_excludes_stale_owner() {
 
     signal_interrupt(&first);
     assert!(first.wait().unwrap().success());
-    let mut successor = spawn_cog(&second_dir, &prefix, 19189);
+    let mut successor = spawn_cog(&second_dir, &prefix, 19189, &master_key);
     wait_ready(19189).await;
     signal_interrupt(&successor);
     assert!(successor.wait().unwrap().success());
 }
 
-fn spawn_cog(data_dir: &std::path::Path, prefix: &str, port: u16) -> Child {
+fn spawn_cog(data_dir: &std::path::Path, prefix: &str, port: u16, master_key: &str) -> Child {
     configure_cog(
         Command::new(env!("CARGO_BIN_EXE_cog")),
         data_dir,
         prefix,
         port,
+        master_key,
     )
     .spawn()
     .unwrap()
@@ -244,6 +248,7 @@ fn configure_cog(
     data_dir: &std::path::Path,
     prefix: &str,
     port: u16,
+    master_key: &str,
 ) -> Command {
     command
         // Each process needs its own SSH listener as well as its HTTP listener.
@@ -261,7 +266,7 @@ fn configure_cog(
         .env("AWS_ACCESS_KEY_ID", "cog-test")
         .env("AWS_SECRET_ACCESS_KEY", "cog-test-secret")
         .env("AWS_REGION", "us-east-1")
-        .env("COG_MASTER_KEY", "0123456789abcdef0123456789abcdef")
+        .env("COG_MASTER_KEY", master_key)
         .env("COG_LEASE_TTL_SECS", "9")
         .stdout(Stdio::null())
         .stderr(Stdio::null());

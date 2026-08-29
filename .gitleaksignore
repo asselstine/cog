@@ -1,7 +1,0 @@
-# Test-only GitHub App private key fixture.
-559906d934340bf564a111c63c7fa50fe28c5f2b:src/git/providers/github.rs:private-key:231
-
-# Deterministic test-only master keys.
-559906d934340bf564a111c63c7fa50fe28c5f2b:tests/s3.rs:generic-api-key:357
-559906d934340bf564a111c63c7fa50fe28c5f2b:src/server.rs:generic-api-key:6551
-559906d934340bf564a111c63c7fa50fe28c5f2b:src/server.rs:generic-api-key:6805

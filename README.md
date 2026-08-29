@@ -165,7 +165,7 @@ published binary on its native GitHub-hosted runner.
 Run the S3 integration suite:
 
 ```sh
-scripts/test-s3.sh
+tests/infrastructure/test-s3.sh
 ```
 
 The script starts MinIO, creates an isolated bucket, runs the ignored S3 tests, and removes its containers and volumes. It does not use AWS credentials.
@@ -173,10 +173,15 @@ The script starts MinIO, creates an isolated bucket, runs the ignored S3 tests, 
 Measure coverage with:
 
 ```sh
-cargo llvm-cov --all-targets --summary-only
+cargo llvm-cov --all-targets --no-report
+cargo llvm-cov report --no-default-ignore-filename-regex --summary-only
 ```
 
-CI requires 95% line coverage. The full CI sequence, including the instrumented MinIO process and takeover tests, currently measures 95.25% first-party line coverage.
+CI requires 95% line coverage. The report disables cargo-llvm-cov's default
+`tests/` exclusion so the metric remains comparable with the historical
+baseline from when the same test source lived under `src/`. The full CI
+sequence, including instrumented MinIO process and takeover tests, measures at
+least 95.25% line coverage.
 
 ## Deeper description
 

@@ -51,6 +51,7 @@ v8 = "152.1"
 [dev-dependencies]
 http-body-util = "0.1"
 proptest = "1"
+tokio = { version = "1", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
