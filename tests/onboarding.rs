@@ -9,6 +9,8 @@ fn command(home: &std::path::Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_cog"));
     command
         .env("COG_HOME", home)
+        .env("COG_SSH_LISTEN", "127.0.0.1:0")
+        .env("COG_SSH_PUBLIC_PORT", "2222")
         .env_remove("COG_DATA_DIR")
         .env_remove("COG_MASTER_KEY")
         .env_remove("COG_S3_BUCKET");
@@ -35,10 +37,11 @@ fn readme_first_run_bootstraps_and_restarts() {
             .unwrap()
             .port();
         let mut server = command(temp.path());
+        let stderr = tempfile::NamedTempFile::new().unwrap();
         server
             .env("COG_LISTEN", format!("127.0.0.1:{port}"))
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(stderr.reopen().unwrap());
         let mut child = server.spawn().unwrap();
         let url = format!("http://127.0.0.1:{port}/readyz");
         let mut ready = false;
@@ -52,9 +55,13 @@ fn readme_first_run_bootstraps_and_restarts() {
             }
             thread::sleep(Duration::from_millis(50));
         }
-        child.kill().unwrap();
+        let _ = child.kill();
         let _ = child.wait();
-        assert!(ready, "cog did not serve /readyz");
+        assert!(
+            ready,
+            "cog did not serve /readyz; stderr:\n{}",
+            std::fs::read_to_string(stderr.path()).unwrap()
+        );
         assert_eq!(std::fs::read(&key_path).unwrap(), key);
     }
 }
