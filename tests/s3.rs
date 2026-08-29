@@ -83,7 +83,7 @@ async fn incremental_replication_restores_across_generation() {
 
 #[tokio::test]
 #[ignore = "requires tests/infrastructure/compose.yml MinIO"]
-async fn ssh_host_and_ca_identity_survive_s3_takeover() {
+async fn ssh_host_identity_survives_s3_takeover() {
     let s = store();
     let prefix = format!("ssh-takeover/{}/", uuid::Uuid::new_v4());
     let directory = tempfile::tempdir().unwrap();
@@ -93,7 +93,6 @@ async fn ssh_host_and_ca_identity_survive_s3_takeover() {
     let secrets = cog::crypto::SecretBox::new(master_key.as_bytes());
     let first_keys = cog::git::ssh::KeySet::load_or_create(&first, &secrets).unwrap();
     let host = first_keys.host.public_key().to_openssh().unwrap();
-    let ca = first_keys.user_ca.public_key().to_openssh().unwrap();
     let generation1 = Replicator::new(s.clone(), prefix.clone(), first_path, 1);
     generation1.sync().await.unwrap();
     generation1.commit_generation().await.unwrap();
@@ -106,7 +105,6 @@ async fn ssh_host_and_ca_identity_survive_s3_takeover() {
     let second = Database::open(&second_path).unwrap();
     let second_keys = cog::git::ssh::KeySet::load_or_create(&second, &secrets).unwrap();
     assert_eq!(second_keys.host.public_key().to_openssh().unwrap(), host);
-    assert_eq!(second_keys.user_ca.public_key().to_openssh().unwrap(), ca);
 }
 
 #[tokio::test]

@@ -250,8 +250,7 @@ async fn upstream_discovery_dcr_and_refresh_rotation() {
             ssh_listen: None,
             ssh_public_host: None,
             ssh_public_port: None,
-            ssh_certificate_ttl_secs: 900,
-            ssh_certificate_max_ttl_secs: 900,
+            ssh_key_lease_ttl_secs: 900,
             ssh_handshake_timeout_secs: 15,
             ssh_auth_timeout_secs: 15,
             ssh_channel_timeout_secs: 30,
@@ -540,8 +539,7 @@ async fn route_test_app() -> (App, tempfile::TempDir) {
                 ssh_listen: None,
                 ssh_public_host: None,
                 ssh_public_port: None,
-                ssh_certificate_ttl_secs: 900,
-                ssh_certificate_max_ttl_secs: 900,
+                ssh_key_lease_ttl_secs: 900,
                 ssh_handshake_timeout_secs: 15,
                 ssh_auth_timeout_secs: 15,
                 ssh_channel_timeout_secs: 30,
@@ -655,7 +653,7 @@ async fn github_manifest_setup_returns_browser_handoff_and_pending_repository_re
 }
 
 #[tokio::test]
-async fn ssh_certificate_status_reuses_existing_identity_and_certificate() {
+async fn ssh_key_registration_and_internal_lease_renewal_reuse_exact_key() {
     let (mut app, _directory) = route_test_app().await;
     app.config.ssh_listen = Some("127.0.0.1:0".parse().unwrap());
     app.config.ssh_public_host = Some("localhost".into());
@@ -665,199 +663,102 @@ async fn ssh_certificate_status_reuses_existing_identity_and_certificate() {
     )));
     app.ssh_ready.store(true, Ordering::Release);
 
-    let user = app
-        .db
-        .create_user("ssh-status@example.com", "hash")
-        .unwrap();
-    let client = "status-client";
+    let user = app.db.create_user("ssh-key@example.com", "hash").unwrap();
+    let client = "ssh-key-client";
     app.db
         .register_client(
             client,
             Some(&user),
-            "status agent",
+            "SSH key agent",
             &["http://localhost/callback".into()],
         )
         .unwrap();
     let agent = app.db.agent_for_client(client).unwrap().unwrap();
-    let integration = app
-        .db
-        .create_integration(
-            &user,
-            "GitHub",
-            "git",
-            &json!({"kind":"git","provider":"github","host":"github.com"}),
-            None,
-        )
-        .unwrap();
-    let repository = app
-        .db
-        .upsert_git_repository(
-            &user,
-            &integration,
-            &ResolvedRepository {
-                provider_repository_id: "status-repository".into(),
-                display_name: "owner/status-repository".into(),
-                upstream_url: "https://github.com/owner/status-repository.git"
-                    .parse()
-                    .unwrap(),
-                metadata: json!({}),
-            },
-        )
-        .unwrap();
     let auth = AuthContext {
         user: user.clone(),
         agent: agent.id,
         identity: agent.identity_id,
         client: client.into(),
-        scopes: HashSet::from([format!("integration:{integration}")]),
-        integrations: HashSet::from([integration.clone()]),
+        scopes: HashSet::new(),
+        integrations: HashSet::new(),
     };
-    app.db
-        .set_git_grant(&user, &auth.client, &repository.id, "write")
-        .unwrap();
     let control = GitControlProvider { app, auth };
     let tools = control.tools().await.unwrap();
     assert_eq!(tools.len(), 4);
-    let repository_tool = tools
-        .iter()
-        .find(|tool| tool.name == "repository_access")
+    assert!(tools.iter().any(|tool| tool.name == "ssh_key_register"));
+    assert!(tools.iter().any(|tool| tool.name == "ssh_key_status"));
+    assert!(tools.iter().any(|tool| tool.name == "ssh_key_lease_renew"));
+
+    let identity = crate::git::ssh::generate_key().unwrap();
+    let public_key = identity.public_key().to_openssh().unwrap();
+    let missing = control
+        .call("ssh_key_status", json!({"publicKey":public_key}))
+        .await
         .unwrap();
-    assert_eq!(repository_tool.extra["annotations"]["readOnlyHint"], false);
-    assert_eq!(repository_tool.extra["annotations"]["openWorldHint"], true);
-    let renewal_tool = tools
-        .iter()
-        .find(|tool| tool.name == "renew_ssh_certificate")
+    assert_eq!(missing["registered"], false);
+
+    let registered = control
+        .call("ssh_key_register", json!({"publicKey":public_key}))
+        .await
         .unwrap();
-    assert_eq!(renewal_tool.extra["annotations"]["readOnlyHint"], false);
-    assert!(
-        renewal_tool.input_schema["properties"]["publicKey"]["description"]
-            .as_str()
+    assert_eq!(registered["action"], "registeredExistingKey");
+    assert_eq!(registered["keyMaterialChanged"], false);
+
+    let status = control
+        .call("ssh_key_status", json!({"publicKey":public_key}))
+        .await
+        .unwrap();
+    assert_eq!(status["registered"], true);
+    assert_eq!(status["active"], true);
+    assert_eq!(status["action"], "reuse");
+
+    control
+        .app
+        .db
+        .renew_agent_ssh_key_lease(
+            &control.auth.user,
+            &control.auth.identity,
+            &control.auth.agent,
+            &control.auth.client,
+            &public_key,
+            chrono::Utc::now().timestamp() - 1,
+        )
+        .unwrap();
+    let expired = control
+        .call("ssh_key_status", json!({"publicKey":public_key}))
+        .await
+        .unwrap();
+    assert_eq!(expired["active"], false);
+    assert_eq!(expired["action"], "renewLease");
+
+    let renewed = control
+        .call("ssh_key_lease_renew", json!({"publicKey":public_key}))
+        .await
+        .unwrap();
+    assert_eq!(renewed["action"], "renewedInternalLease");
+    assert_eq!(renewed["keyMaterialChanged"], false);
+    assert_eq!(
+        control
+            .app
+            .db
+            .agent_ssh_key(&control.auth.user, &control.auth.agent)
             .unwrap()
-            .contains("same")
+            .unwrap()
+            .public_key,
+        public_key
     );
-    for args in [
-        json!({}),
-        json!({"repositoryId":repository.id,"permission":"owner"}),
-        json!({"repositoryId":"missing","permission":"read","publicKey":"bad"}),
-    ] {
-        assert!(control.call("ssh_certificate", args).await.is_err());
-    }
+
+    let other = crate::git::ssh::generate_key()
+        .unwrap()
+        .public_key()
+        .to_openssh()
+        .unwrap();
     assert!(
         control
-            .call("ssh_certificate_status", json!({}))
+            .call("ssh_key_lease_renew", json!({"publicKey":other}))
             .await
             .is_err()
     );
-    assert!(control.call("unknown", json!({})).await.is_err());
-    let identity = crate::git::ssh::generate_key().unwrap();
-    let public_key = identity.public_key().to_openssh().unwrap();
-    let issued = control
-        .call(
-            "ssh_certificate",
-            json!({"repositoryId":repository.id,"publicKey":public_key,"permission":"write"}),
-        )
-        .await
-        .unwrap();
-    assert!(issued.get("privateKeyGeneration").is_none());
-    assert_eq!(
-        issued["sshOptions"]["certificateFile"],
-        "path to the saved COG certificate"
-    );
-
-    let status = control
-        .call(
-            "ssh_certificate_status",
-            json!({"repositoryId":repository.id,"publicKey":public_key,"certificate":issued["certificate"]}),
-        )
-        .await
-        .unwrap();
-    assert_eq!(status["valid"], true);
-    assert_eq!(status["action"], "reuse");
-    assert_eq!(status["permission"], "write");
-    assert!(status["usableForSeconds"].as_i64().unwrap() > 0);
-
-    let now = chrono::Utc::now().timestamp();
-    let expired_binding = crate::git::ssh::Binding {
-        version: 1,
-        issuance_id: uuid::Uuid::new_v4().to_string(),
-        user_id: control.auth.user.clone(),
-        identity_id: control.auth.identity.clone(),
-        agent_id: control.auth.agent.clone(),
-        client_id: control.auth.client.clone(),
-        integration_id: integration.clone(),
-        repository_id: repository.id.clone(),
-        permission: "write".into(),
-        fingerprint: crate::git::ssh::fingerprint(
-            &crate::git::ssh::parse_public_key(&public_key).unwrap(),
-        ),
-        issued_at: now - 1000,
-        expires_at: now - 100,
-    };
-    let expired_certificate = {
-        let keys = control.app.ssh_keys.as_ref().unwrap().read().unwrap();
-        crate::git::ssh::sign(
-            &keys.user_ca,
-            &crate::git::ssh::parse_public_key(&public_key).unwrap(),
-            &expired_binding,
-            crate::git::ssh::stable_serial(&expired_binding.issuance_id),
-        )
-        .unwrap()
-    };
-    let renewed = control
-        .call(
-            "renew_ssh_certificate",
-            json!({"repositoryId":repository.id,"publicKey":public_key,"previousCertificate":expired_certificate}),
-        )
-        .await
-        .unwrap();
-    assert_eq!(renewed["action"], "renewedExistingIdentity");
-    assert_eq!(renewed["permission"], "write");
-    assert_ne!(renewed["certificate"], issued["certificate"]);
-    assert_eq!(
-        renewed["authenticationFailureRecovery"]["prohibitedAction"],
-        "generateOrReplaceSshIdentity"
-    );
-
-    let other_identity = crate::git::ssh::generate_key().unwrap();
-    let invalid = control
-        .call(
-            "ssh_certificate_status",
-            json!({"repositoryId":repository.id,"publicKey":other_identity.public_key().to_openssh().unwrap(),"certificate":issued["certificate"]}),
-        )
-        .await
-        .unwrap();
-    assert_eq!(invalid["valid"], false);
-    assert_eq!(invalid["action"], "renewWithSamePublicKey");
-    assert!(control
-        .call(
-            "renew_ssh_certificate",
-            json!({"repositoryId":repository.id,"publicKey":other_identity.public_key().to_openssh().unwrap(),"previousCertificate":issued["certificate"]}),
-        )
-        .await
-        .is_err());
-    let mismatched = GitControlProvider {
-        app: control.app.clone(),
-        auth: AuthContext {
-            agent: "different-agent".into(),
-            ..control.auth.clone()
-        },
-    }
-    .call(
-        "ssh_certificate_status",
-        json!({"repositoryId":repository.id,"publicKey":public_key,"certificate":issued["certificate"]}),
-    )
-    .await
-    .unwrap();
-    assert_eq!(mismatched["action"], "requestCertificateForSamePublicKey");
-    let denied = GitControlProvider {
-        app: control.app.clone(),
-        auth: AuthContext {
-            scopes: HashSet::new(),
-            integrations: HashSet::new(),
-            ..control.auth.clone()
-        },
-    };
-    assert!(denied.call("ssh_certificate_status", json!({"repositoryId":repository.id,"publicKey":public_key,"certificate":issued["certificate"]})).await.unwrap_err().downcast_ref::<crate::authz::InsufficientScope>().is_some());
 }
 
 #[test]
@@ -2696,39 +2597,10 @@ async fn ui_mutation_success_and_failure_matrix() {
         .status(),
         StatusCode::BAD_REQUEST
     );
-    assert!(
+    assert_eq!(
         ui_prepare_ssh_key(
             State(app.clone()),
             Path("user_ca".into()),
-            headers.clone(),
-            Form(csrf_form()),
-        )
-        .await
-        .status()
-        .is_redirection()
-    );
-    let prepared = app
-        .db
-        .ssh_keys()
-        .unwrap()
-        .into_iter()
-        .find(|key| key.purpose == "user_ca" && !key.active)
-        .unwrap();
-    assert!(
-        ui_activate_ssh_key(
-            State(app.clone()),
-            Path(("user_ca".into(), prepared.id.clone())),
-            headers.clone(),
-            Form(csrf_form()),
-        )
-        .await
-        .status()
-        .is_redirection()
-    );
-    assert_eq!(
-        ui_retire_ssh_key(
-            State(app.clone()),
-            Path(("user_ca".into(), prepared.id)),
             headers.clone(),
             Form(csrf_form()),
         )
@@ -5298,27 +5170,22 @@ async fn production_ssh_handler_authenticates_and_proxies_upload_pack() {
     let host_key = russh::keys::PrivateKey::from_openssh(&host_encoded).unwrap();
     let subject = crate::git::ssh::generate_key().unwrap();
     let now = chrono::Utc::now().timestamp();
-    let binding = crate::git::ssh::Binding {
-        version: 1,
-        issuance_id: uuid::Uuid::new_v4().to_string(),
-        user_id: user,
-        identity_id: agent.identity_id,
-        agent_id: agent.id,
-        client_id: "ssh-client".into(),
-        integration_id: integration,
-        repository_id: repository.id.clone(),
-        permission: "write".into(),
-        fingerprint: crate::git::ssh::fingerprint(subject.public_key()),
-        issued_at: now,
-        expires_at: now + 300,
-    };
-    let certificate = crate::git::ssh::sign(
-        &keys.user_ca,
-        subject.public_key(),
-        &binding,
-        crate::git::ssh::stable_serial(&binding.issuance_id),
-    )
-    .unwrap();
+    let public_key = subject.public_key().to_openssh().unwrap();
+    app.db
+        .register_agent_ssh_key(
+            &user,
+            &agent.id,
+            "ssh-client",
+            &public_key,
+            &crate::git::ssh::fingerprint(subject.public_key()),
+            now + 300,
+        )
+        .unwrap();
+    let binding = app
+        .db
+        .active_agent_ssh_key(&public_key, now)
+        .unwrap()
+        .unwrap();
     app.ssh_keys = Some(Arc::new(std::sync::RwLock::new(keys)));
     app.ssh_ready.store(true, Ordering::Release);
     app.config.ssh_listen = Some("127.0.0.1:22".parse().unwrap());
@@ -5331,13 +5198,13 @@ async fn production_ssh_handler_authenticates_and_proxies_upload_pack() {
             identity: binding.identity_id.clone(),
             agent: binding.agent_id.clone(),
             client: binding.client_id.clone(),
-            scopes: HashSet::from([format!("integration:{}", binding.integration_id)]),
-            integrations: HashSet::from([binding.integration_id.clone()]),
+            scopes: HashSet::from([format!("integration:{integration}")]),
+            integrations: HashSet::from([integration.clone()]),
         },
     }
     .call(
         "repository_access",
-        json!({"integrationId":binding.integration_id,"repository":"owner/repository"}),
+        json!({"integrationId":integration,"repository":"owner/repository"}),
     )
     .await
     .unwrap();
@@ -5360,21 +5227,19 @@ async fn production_ssh_handler_authenticates_and_proxies_upload_pack() {
     });
 
     let key_path = directory.path().join("id_ed25519");
-    let cert_path = directory.path().join("id_ed25519-cert.pub");
     std::fs::write(
         &key_path,
         crate::git::ssh::encode_private(&subject).unwrap(),
     )
     .unwrap();
-    std::fs::write(&cert_path, format!("{certificate}\n")).unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
     let output = tokio::process::Command::new("ssh")
         .args(["-F", "/dev/null", "-i"])
         .arg(&key_path)
-        .args(["-o"])
-        .arg(format!("CertificateFile={}", cert_path.display()))
         .args([
+            "-o",
+            "IdentitiesOnly=yes",
             "-o",
             "StrictHostKeyChecking=no",
             "-o",
@@ -5398,14 +5263,15 @@ async fn production_ssh_handler_authenticates_and_proxies_upload_pack() {
     assert_eq!(app.metrics.ssh_auth_success.load(Ordering::Relaxed), 1);
     assert_eq!(app.metrics.ssh_read_operations.load(Ordering::Relaxed), 1);
 
-    let raw_key_path = directory.path().join("raw_ed25519");
+    let raw_key_path = directory.path().join("unregistered_ed25519");
+    let unregistered = crate::git::ssh::generate_key().unwrap();
     std::fs::write(
         &raw_key_path,
-        crate::git::ssh::encode_private(&subject).unwrap(),
+        crate::git::ssh::encode_private(&unregistered).unwrap(),
     )
     .unwrap();
     std::fs::set_permissions(&raw_key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    let common = |identity: &std::path::Path, certificate: Option<&std::path::Path>| {
+    let common = |identity: &std::path::Path| {
         let mut command = tokio::process::Command::new("ssh");
         command.args(["-F", "/dev/null", "-i"]).arg(identity).args([
             "-o",
@@ -5419,26 +5285,21 @@ async fn production_ssh_handler_authenticates_and_proxies_upload_pack() {
             "-p",
             &address.port().to_string(),
         ]);
-        if let Some(certificate) = certificate {
-            command
-                .arg("-o")
-                .arg(format!("CertificateFile={}", certificate.display()));
-        }
         command
     };
-    let mut raw = common(&raw_key_path, None);
+    let mut raw = common(&raw_key_path);
     raw.args(["git@127.0.0.1", "true"]);
     assert!(!raw.output().await.unwrap().status.success());
 
-    let mut wrong_user = common(&key_path, Some(&cert_path));
+    let mut wrong_user = common(&key_path);
     wrong_user.args(["root@127.0.0.1", "true"]);
     assert!(!wrong_user.output().await.unwrap().status.success());
 
-    let mut malformed = common(&key_path, Some(&cert_path));
+    let mut malformed = common(&key_path);
     malformed.args(["git@127.0.0.1", "not-a-git-command"]);
     assert!(!malformed.output().await.unwrap().status.success());
 
-    let mut receive = common(&key_path, Some(&cert_path));
+    let mut receive = common(&key_path);
     receive
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -5468,7 +5329,7 @@ async fn production_ssh_handler_authenticates_and_proxies_upload_pack() {
             .revoke_git_grant(&binding.user_id, &binding.client_id, &repository.id)
             .unwrap()
     );
-    let mut revoked = common(&key_path, Some(&cert_path));
+    let mut revoked = common(&key_path);
     revoked.args([
         "git@127.0.0.1",
         &format!("git-upload-pack '{}'", repository.id),
@@ -5478,7 +5339,7 @@ async fn production_ssh_handler_authenticates_and_proxies_upload_pack() {
     assert!(!revoked.stderr.is_empty());
     assert_eq!(app.metrics.ssh_upstream_failures.load(Ordering::Relaxed), 1);
 
-    let mut shell = common(&key_path, Some(&cert_path));
+    let mut shell = common(&key_path);
     shell.args(["-T", "git@127.0.0.1"]);
     assert!(!shell.output().await.unwrap().status.success());
     assert!(app.metrics.ssh_auth_denied.load(Ordering::Relaxed) >= 2);

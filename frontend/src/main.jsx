@@ -556,7 +556,7 @@ function Dashboard({ data, reload }) {
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
             <p className="eyebrow">Git transport</p>
-            <h2 className="mt-2 text-xl font-semibold">SSH certificates</h2>
+            <h2 className="mt-2 text-xl font-semibold">SSH transport</h2>
             <p className="mt-2 text-sm text-zinc-500">
               {data.ssh?.configured
                 ? data.ssh.ready
@@ -568,18 +568,12 @@ function Dashboard({ data, reload }) {
               Aggregate SSH operations: {data.git_transport_usage?.ssh_operations ?? 0}
             </p>
           </div>
-          <div className="flex gap-2">
+          <div>
             <button
               className="button-secondary"
               onClick={() => act("/ui/ssh/host/prepare")}
             >
               Prepare host key
-            </button>
-            <button
-              className="button-secondary"
-              onClick={() => act("/ui/ssh/user_ca/prepare")}
-            >
-              Prepare user CA
             </button>
           </div>
         </div>
@@ -590,7 +584,7 @@ function Dashboard({ data, reload }) {
               key={key.id}
             >
               <div className="flex items-center justify-between">
-                <strong>{key.purpose === "user_ca" ? "User CA" : "Host key"}</strong>
+                <strong>Host key</strong>
                 <span className={key.active ? "text-emerald-600" : "text-zinc-400"}>
                   {key.active ? "active" : key.retirement_time ? "retiring" : "prepared"}
                 </span>

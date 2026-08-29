@@ -1,3 +1,130 @@
+# File structure cleanup
+
+Status: **planned**.
+
+The goal is to make ownership and dependency direction visible from the file
+tree without changing runtime behavior. Follow the useful part of celld's
+layout: organize around real architectural boundaries, not an arbitrary maximum
+file size. Keep Cog as one Rust crate during the initial reorganization; only
+introduce a workspace if a genuinely independent, I/O-free core emerges.
+
+## Preparation
+
+- [ ] Record a clean baseline with `cargo fmt --all --check`,
+  `cargo clippy --all-targets -- -D warnings`, and `cargo test`.
+- [ ] Inventory the public items, route groups, database methods, and test
+  coverage associated with `src/server.rs` and `src/db.rs` before moving code.
+- [ ] Keep structural moves separate from behavior changes so each change can
+  be reviewed as a relocation with equivalent tests.
+- [ ] Verify whether the ignored literal `~/rexec-data/` directory is used by
+  any process or configuration, then move or remove it from the checkout as a
+  separate operational cleanup.
+- [ ] Clean generated build trees (`target/`, `fuzz/target/`,
+  `frontend/node_modules/`, and `frontend/dist/`) when they are not needed;
+  keep all of them ignored.
+
+## Rust application structure
+
+- [ ] Convert `src/server.rs` to `src/server/mod.rs` with a small public surface
+  containing the application state and server entry points.
+- [ ] Extract startup, storage construction, listener setup, graceful shutdown,
+  and durability coordination into `src/server/startup.rs`.
+- [ ] Extract route assembly into `src/server/router.rs`; keep handlers in
+  feature modules instead of adding more implementation to the router.
+- [ ] Extract health, readiness, version, and metrics handlers into
+  `src/server/health.rs`.
+- [ ] Extract login, logout, cookies, browser sessions, CSRF checks, and browser
+  authentication into `src/server/session.rs`.
+- [ ] Extract embedded Vite assets and UI bootstrap/data endpoints into
+  `src/server/frontend.rs`. Keep interactive screens and reusable UI components
+  in `frontend/` as required by `AGENTS.md`.
+- [ ] Separate downstream OAuth authorization-server routes from upstream
+  integration OAuth flows, using `src/server/oauth.rs` and
+  `src/server/upstream_oauth.rs`.
+- [ ] Extract GitHub App setup, manifest callbacks, and installation callbacks
+  into `src/server/github.rs`.
+- [ ] Extract SSH listener, connection, authentication, and Git transport
+  handling into `src/server/ssh.rs` while leaving transport-neutral Git logic
+  under `src/git/`.
+- [ ] Extract the HTTP MCP endpoint and catalog construction into
+  `src/server/mcp.rs`; retain protocol types and parsing in the existing
+  `src/mcp.rs`.
+- [ ] Group tool-provider adapters under `src/server/providers/` (`admin`,
+  `git`, `policy`, `measured`, and OAuth step-up) and keep authorization checks
+  at their existing call boundaries.
+- [ ] Extract authenticated JSON administration endpoints into focused modules
+  rather than one catch-all API file if integrations, identities, and tokens
+  remain independently substantial.
+- [ ] Review visibility after each extraction and make items private to their
+  owning module unless they are part of Cog's intentional library/test API.
+
+## Database structure
+
+- [ ] Convert `src/db.rs` to `src/db/mod.rs`, retaining the `Database` handle
+  and shared transaction primitives there.
+- [ ] Move schema versions and migration execution into
+  `src/db/migrations.rs` without changing migration order or transaction
+  boundaries.
+- [ ] Move database row/domain types into `src/db/models.rs` or their owning
+  feature module, avoiding a second generic dumping ground.
+- [ ] Group identity, agent, session, token, and grant operations under a clear
+  authentication/identity database module.
+- [ ] Group integration, connection, secret, and upstream OAuth persistence
+  under integration-focused database modules.
+- [ ] Move Git repository, grant, pending-request, and SSH-key persistence into
+  Git-focused database modules.
+- [ ] Preserve operations that must be atomic as single `Database` methods or
+  explicit transactions; do not split transaction ownership merely to shorten
+  files.
+
+## Frontend structure
+
+- [ ] Reduce `frontend/src/main.jsx` to application mounting and global style
+  imports.
+- [ ] Move top-level routing/state selection into `frontend/src/App.jsx`.
+- [ ] Move `Login`, `Consent`, `Dashboard`, and
+  `GitHubInstallationComplete` into `frontend/src/screens/`.
+- [ ] Move `Shell`, `Permission`, `Pills`, and future reusable UI into
+  `frontend/src/components/`.
+- [ ] Centralize JSON requests and consistent error handling in
+  `frontend/src/api.js` rather than duplicating fetch behavior across screens.
+- [ ] Add frontend linting and tests if the split introduces enough independent
+  UI logic to justify them; do not add tooling solely for directory symmetry.
+
+## Repository root and documentation
+
+- [ ] Move `SCALING.md` to `docs/design/scaling.md` and
+  `FUTURE_ENVELOPE_ENCRYPTION_PLAN.md` to a clearly named `docs/design/` or
+  `docs/plans/` location, then update inbound links.
+- [ ] Move completed historical reports out of the active TODO list after this
+  cleanup is complete, retaining useful evidence in `docs/history/` if it is
+  still valuable.
+- [ ] Reconcile the differing `audit.toml` and `.cargo/audit.toml` files into
+  one verified configuration used by local development and CI.
+- [ ] Remove the empty `src/bin/` directory.
+- [ ] Keep root-level installer files where stable download URLs require them;
+  avoid moving deployment artifacts merely for visual symmetry.
+- [ ] Add a concise repository-layout section to `README.md` after the new
+  structure settles.
+
+## Test alignment and verification
+
+- [ ] Mirror the new server and database feature boundaries in the existing
+  integration-test modules while retaining a small number of Cargo test
+  targets to avoid unnecessary build/link overhead.
+- [ ] Keep route behavior tested through `build_router` and HTTP requests; do
+  not expose private handlers solely to make the reorganization testable.
+- [ ] Run `cargo fmt --all --check`,
+  `cargo clippy --all-targets -- -D warnings`, and `cargo test` after each
+  independently reviewable extraction.
+- [ ] Run the frontend production build and verify that Cargo still embeds the
+  generated Vite output.
+- [ ] Run the MinIO/S3, installer, SSH interoperability, coverage, and Gitleaks
+  CI paths before declaring the reorganization complete.
+- [ ] Reassess a Cargo workspace only after the split. Create a separate core
+  crate only if policy/protocol decisions form a stable boundary with no I/O,
+  clocks, randomness, locks, or runtime dependencies.
+
 # Test-source separation
 
 Status: **complete**.

@@ -150,18 +150,11 @@ pub struct Config {
     pub ssh_public_port: Option<u16>,
     #[arg(
         long,
-        env = "COG_SSH_CERTIFICATE_TTL_SECS",
+        env = "COG_SSH_KEY_LEASE_TTL_SECS",
         hide_env_values = true,
         default_value_t = 900
     )]
-    pub ssh_certificate_ttl_secs: u64,
-    #[arg(
-        long,
-        env = "COG_SSH_CERTIFICATE_MAX_TTL_SECS",
-        hide_env_values = true,
-        default_value_t = 900
-    )]
-    pub ssh_certificate_max_ttl_secs: u64,
+    pub ssh_key_lease_ttl_secs: u64,
     #[arg(
         long,
         env = "COG_SSH_HANDSHAKE_TIMEOUT_SECS",
@@ -270,10 +263,8 @@ impl Config {
             "Git limits must be positive"
         );
         anyhow::ensure!(
-            self.ssh_certificate_ttl_secs > 0
-                && self.ssh_certificate_ttl_secs <= self.ssh_certificate_max_ttl_secs
-                && self.ssh_certificate_max_ttl_secs <= 900,
-            "SSH certificate TTL must be positive and may not exceed 15 minutes"
+            self.ssh_key_lease_ttl_secs > 0,
+            "SSH key lease TTL must be positive"
         );
         if let Some(listen) = self.ssh_listen {
             let host = self.ssh_public_host.as_deref().unwrap_or_default().trim();

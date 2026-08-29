@@ -92,7 +92,7 @@ Important configuration:
 | `COG_SSH_LISTEN` | `127.0.0.1:2222` | Embedded Git-over-SSH TCP listener. Set `0.0.0.0:2222` for a directly published host/container port. This is not routed by an HTTP reverse proxy. |
 | `COG_SSH_PUBLIC_HOST` | `COG_BASE_URL` host | Public DNS host advertised to Git clients. |
 | `COG_SSH_PUBLIC_PORT` | listen port | Externally reachable SSH port when it differs from the listener port. |
-| `COG_SSH_CERTIFICATE_TTL_SECS` | `900` | User-certificate lifetime; cannot exceed the configured maximum or 15 minutes. |
+| `COG_SSH_KEY_LEASE_TTL_SECS` | `900` | Internal authorization lease for each registered agent SSH public key. |
 | `COG_SSH_HANDSHAKE_TIMEOUT_SECS` | `15` | Maximum SSH handshake interval. |
 | `COG_SSH_AUTH_TIMEOUT_SECS` | `15` | Maximum authentication interval. |
 | `COG_SSH_CHANNEL_TIMEOUT_SECS` | `30` | Idle unauthenticated/session-channel interval. |
@@ -190,8 +190,8 @@ least 95.25% line coverage.
 The MCP endpoint defaults to hybrid mode at `/mcp`: `execute` provides code-mode
 access to every connected integration without expanding their tools into the
 top-level list, while COG-native tools are advertised directly. Native Git
-orchestration includes `repository_access`, `ssh_certificate_status`,
-`ssh_certificate`, and `renew_ssh_certificate`; native
+orchestration includes `repository_access`, `ssh_key_status`,
+`ssh_key_register`, and `ssh_key_lease_renew`; native
 administration tools use the `cog_` prefix. Connect to `/mcp?codemode=true` for
 code-mode-only discovery, where `execute` is the sole top-level tool and the
 same COG-native operations remain available through the `git` and `cog`

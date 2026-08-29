@@ -64,8 +64,8 @@ pub struct Metrics {
     pub ssh_timeouts: AtomicU64,
     pub ssh_limit_rejections: AtomicU64,
     pub ssh_upstream_failures: AtomicU64,
-    pub ssh_certificates_issued: AtomicU64,
-    pub ssh_certificates_denied: AtomicU64,
+    pub ssh_key_registrations: AtomicU64,
+    pub ssh_key_lease_renewals: AtomicU64,
 }
 
 #[derive(Default)]
@@ -570,32 +570,26 @@ fn git_control_tool(name: &str, description: &str) -> Tool {
             true,
             true,
         ),
-        "ssh_certificate_status" => (
+        "ssh_key_status" => (
             json!({"type":"object","properties":{
-                "repositoryId":{"type":"string","description":"Opaque repository ID returned by repository_access."},
-                "publicKey":{"type":"string","description":"Exact canonical OpenSSH Ed25519 public key for the existing local identity. Never send the private key and never generate a replacement key for this check."},
-                "certificate":{"type":"string","description":"Previously saved COG OpenSSH certificate associated with publicKey."}
-            },"required":["repositoryId","publicKey","certificate"],"additionalProperties":false}),
+                "publicKey":{"type":"string","description":"Exact canonical OpenSSH Ed25519 public key registered by this OAuth-bound agent. Never send the private key."}
+            },"required":["publicKey"],"additionalProperties":false}),
             true,
             true,
             false,
         ),
-        "ssh_certificate" => (
+        "ssh_key_register" => (
             json!({"type":"object","properties":{
-                "repositoryId":{"type":"string","description":"Opaque repository ID returned by repository_access."},
-                "publicKey":{"type":"string","description":"Exact canonical OpenSSH Ed25519 public key for an already-existing local identity. The private key stays local. Do not generate or replace a key because a certificate expired."},
-                "permission":{"type":"string","enum":["read","write"],"description":"Requested initial certificate permission, limited by the current repository grant."}
-            },"required":["repositoryId","publicKey","permission"],"additionalProperties":false}),
+                "publicKey":{"type":"string","description":"Exact canonical OpenSSH Ed25519 public key for this OAuth-bound agent. The private key stays local."}
+            },"required":["publicKey"],"additionalProperties":false}),
             false,
             false,
             false,
         ),
-        "renew_ssh_certificate" => (
+        "ssh_key_lease_renew" => (
             json!({"type":"object","properties":{
-                "repositoryId":{"type":"string","description":"Opaque repository ID returned by repository_access and bound into previousCertificate."},
-                "publicKey":{"type":"string","description":"The exact same canonical OpenSSH Ed25519 public key bound into previousCertificate. Never generate or substitute a new key for renewal."},
-                "previousCertificate":{"type":"string","description":"Previously saved COG OpenSSH certificate. It may be expired; COG validates its signature and identity binding before renewal."}
-            },"required":["repositoryId","publicKey","previousCertificate"],"additionalProperties":false}),
+                "publicKey":{"type":"string","description":"The exact registered canonical OpenSSH Ed25519 public key whose internal lease should be renewed."}
+            },"required":["publicKey"],"additionalProperties":false}),
             false,
             false,
             false,
@@ -646,10 +640,10 @@ fn ssh_advertisement(app: &App, repository_id: &str) -> Option<Value> {
     Some(json!({
         "available":true,
         "url":format!("ssh://git@{host}:{port}/{repository_id}"),
-        "certificateTool":"ssh_certificate",
-        "certificateStatusTool":"ssh_certificate_status",
-        "certificateRenewalTool":"renew_ssh_certificate",
-        "certificateTtlSeconds":app.config.ssh_certificate_ttl_secs,
+        "keyRegistrationTool":"ssh_key_register",
+        "keyStatusTool":"ssh_key_status",
+        "keyLeaseRenewalTool":"ssh_key_lease_renew",
+        "keyLeaseTtlSeconds":app.config.ssh_key_lease_ttl_secs,
         "publicHost":host,
         "publicPort":port,
         "hostKeyFingerprint":crate::git::ssh::fingerprint(keys.host.public_key()),
@@ -720,20 +714,20 @@ impl ToolProvider for GitControlProvider {
     async fn tools(&self) -> anyhow::Result<Vec<Tool>> {
         let mut tools = vec![git_control_tool(
             "repository_access",
-            "Resolve a GitHub repository and begin the required SSH workflow. Reuse an existing local Ed25519 identity from SSH configuration or the SSH agent. Check a saved certificate with ssh_certificate_status and reuse it while valid. Use ssh_certificate only for initial enrollment and renew_ssh_certificate with the same public key and previous certificate after expiry. Store the certificate separately and pass it with CertificateFile for clone, fetch, and push. On SSH authentication failure, renew the certificate; never recreate the identity. Never send or replace the private key, generate a key automatically, or disable host-key checking. Access is controlled by the GitHub App installation and this client's existing integration authorization.",
+            "Resolve a GitHub repository and return its COG SSH remote plus pinned host key. Reuse the agent's existing Ed25519 identity, register its public key once with ssh_key_register, and renew only its internal authorization lease with ssh_key_lease_renew. The private key remains local and unchanged. Access is controlled by the live key lease, repository grant, integration, and this client's authorization.",
         )];
         if self.app.ssh_keys.is_some() && self.app.ssh_ready.load(Ordering::Acquire) {
             tools.push(git_control_tool(
-                "ssh_certificate_status",
-                "Check whether an existing COG SSH certificate is currently valid for this client, repository, permission grant, and Ed25519 public key. Reuse it when valid. When expired, call renew_ssh_certificate with this same public key and previous certificate. The private key remains local and must never be sent or recreated for certificate renewal.",
+                "ssh_key_status",
+                "Check whether this OAuth-bound agent's registered Ed25519 public key has a live internal SSH authorization lease.",
             ));
             tools.push(git_control_tool(
-                "ssh_certificate",
-                "Initially enroll an existing local Ed25519 identity by issuing a short-lived SSH user certificate. Reuse a key from SSH configuration or the SSH agent and send only its public key. Store the certificate separately and pass it with CertificateFile; never send or replace the private key. Before issuance, use ssh_certificate_status to reuse any saved valid certificate. For an expired certificate use renew_ssh_certificate instead of generating a key or starting over.",
+                "ssh_key_register",
+                "Register this OAuth-bound agent's existing Ed25519 public key and start its internal authorization lease. This never accepts, creates, or replaces a private key.",
             ));
             tools.push(git_control_tool(
-                "renew_ssh_certificate",
-                "Renew a saved COG SSH certificate while preserving its existing Ed25519 identity. Send the exact same public key and the previous certificate; expired certificates are accepted for cryptographic binding validation. Permission is derived from the previous certificate and constrained by the current grant. Replace only the saved certificate file. Never generate, replace, or send the private key.",
+                "ssh_key_lease_renew",
+                "Extend the internal authorization lease for this OAuth-bound agent's exact registered Ed25519 public key. The keypair and local files do not change.",
             ));
         }
         Ok(tools)
@@ -841,15 +835,16 @@ impl ToolProvider for GitControlProvider {
                     "repositoryId":repo.id,
                     "displayName":repo.display_name,
                     "remoteUrl":remote,
+                    "sshRemoteUrl":remote,
                     "remoteUrlVersion":2,
-                    "nextAction":"reuseExistingEd25519IdentityAndCheckSavedCertificate",
+                    "nextAction":"reuseExistingEd25519IdentityAndCheckKeyLease",
                     "workflow":[
                         {"step":1,"action":"resolveExistingEd25519Identity","sources":["SSH configuration","SSH agent","standard SSH identity paths"],"privateKeyRemainsLocal":true,"ifUnavailable":"report that an Ed25519 identity must be provisioned; do not generate one automatically"},
-                        {"step":2,"action":"checkSavedCertificate","tool":"ssh_certificate_status","arguments":{"repositoryId":repo.id,"publicKey":"existing Ed25519 public key","certificate":"saved COG certificate"},"ifValid":"reuse","ifMissingOrInvalid":"continue"},
-                        {"step":3,"action":"initialEnrollmentOnly","tool":"ssh_certificate","arguments":{"repositoryId":repo.id,"publicKey":"existing Ed25519 public key","permission":"read or write"},"when":"no previous COG certificate exists"},
-                        {"step":4,"action":"renewExpiredCertificate","tool":"renew_ssh_certificate","arguments":{"repositoryId":repo.id,"publicKey":"the same existing Ed25519 public key","previousCertificate":"saved COG certificate"},"when":"the saved certificate is expired or SSH authentication fails","prohibitedAction":"generateOrReplaceSshIdentity"},
-                        {"step":5,"action":"writeOutputs","certificatePath":"<private-certificate-path>","knownHostsPath":"<private-known-hosts-path>","preserveForReuse":true},
-                        {"step":6,"action":"useRemote","remoteField":"sshRemoteUrl","operations":["clone","fetch","push"],"certificateFile":"<private-certificate-path>","strictHostKeyChecking":true,"onAuthenticationFailure":"renew the saved certificate with renew_ssh_certificate and retry; never recreate the identity"}
+                        {"step":2,"action":"checkRegisteredKeyLease","tool":"ssh_key_status","arguments":{"publicKey":"existing Ed25519 public key"},"ifActive":"reuse","ifMissing":"register"},
+                        {"step":3,"action":"registerKeyIfMissing","tool":"ssh_key_register","arguments":{"publicKey":"existing Ed25519 public key"}},
+                        {"step":4,"action":"renewInternalLease","tool":"ssh_key_lease_renew","arguments":{"publicKey":"the same existing Ed25519 public key"},"when":"the lease is expired or SSH authentication fails"},
+                        {"step":5,"action":"writeKnownHosts","knownHostsPath":"<private-known-hosts-path>","preserveForReuse":true},
+                        {"step":6,"action":"useRemote","remoteField":"sshRemoteUrl","operations":["clone","fetch","push"],"strictHostKeyChecking":true,"onAuthenticationFailure":"renew the internal key lease and retry; never recreate the identity"}
                     ],
                     "remotes":{
                         "version":2,
@@ -858,299 +853,123 @@ impl ToolProvider for GitControlProvider {
                     }
                 }))
             }
-            "ssh_certificate_status" => {
-                let repository_id = args
-                    .get("repositoryId")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("repositoryId is required"))?;
-                let repository = self
-                    .app
-                    .db
-                    .git_repository(repository_id)?
-                    .filter(|repository| repository.user_id == self.auth.user)
-                    .ok_or_else(|| anyhow::anyhow!("repository not found"))?;
-                if !self.auth.allows_integration(&repository.integration_id) {
-                    return Err(crate::authz::InsufficientScope {
-                        scopes: vec![format!("integration:{}", repository.integration_id)],
-                    }
-                    .into());
-                }
-                anyhow::ensure!(
-                    self.app
-                        .db
-                        .integration(&repository.integration_id, &self.auth.user)?
-                        .is_some_and(|integration| integration.enabled),
-                    "integration disabled"
-                );
-                let granted = self
-                    .app
-                    .db
-                    .git_grant_permission(&self.auth.user, &self.auth.client, repository_id)?
-                    .ok_or_else(|| anyhow::anyhow!("repository grant not found"))?;
+            "ssh_key_status" => {
                 let public_key = crate::git::ssh::parse_public_key(
                     args.get("publicKey")
                         .and_then(Value::as_str)
                         .ok_or_else(|| anyhow::anyhow!("publicKey is required"))?,
                 )?;
-                let certificate = args
-                    .get("certificate")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("certificate is required"))?;
+                let canonical = public_key.to_openssh()?;
                 let now = chrono::Utc::now().timestamp();
-                let binding = crate::git::ssh::verify_certificate_with_durable_cas(
-                    certificate,
-                    &self.app.db,
-                    &public_key,
-                    now,
-                );
-                let Ok(binding) = binding else {
+                let registered = self
+                    .app
+                    .db
+                    .agent_ssh_key(&self.auth.user, &self.auth.agent)?;
+                let Some(registered) = registered.filter(|key| key.public_key == canonical) else {
                     return Ok(json!({
-                        "valid": false,
-                        "repositoryId": repository_id,
-                        "action": "renewWithSamePublicKey",
-                        "tool": "renew_ssh_certificate",
-                        "prohibitedAction": "generateOrReplaceSshIdentity",
+                        "registered": false,
+                        "active": false,
+                        "action": "registerKey",
+                        "tool": "ssh_key_register"
                     }));
                 };
-                let binding_matches = binding.user_id == self.auth.user
-                    && binding.identity_id == self.auth.identity
-                    && binding.agent_id == self.auth.agent
-                    && binding.client_id == self.auth.client
-                    && binding.integration_id == repository.integration_id
-                    && binding.repository_id == repository_id
-                    && (binding.permission == "read" || granted == "write");
-                if !binding_matches {
-                    return Ok(json!({
-                        "valid": false,
-                        "repositoryId": repository_id,
-                        "action": "requestCertificateForSamePublicKey",
-                        "tool": "renew_ssh_certificate",
-                        "prohibitedAction": "generateOrReplaceSshIdentity",
-                    }));
-                }
+                let active = registered.revoked_at.is_none() && registered.lease_expires_at > now;
                 Ok(json!({
-                    "valid": true,
-                    "repositoryId": repository_id,
-                    "permission": binding.permission,
-                    "expiresAt": chrono::DateTime::from_timestamp(binding.expires_at, 0).expect("valid timestamp").to_rfc3339(),
-                    "usableForSeconds": binding.expires_at.saturating_sub(now),
-                    "action": "reuse",
+                    "registered": true,
+                    "active": active,
+                    "fingerprint": registered.fingerprint,
+                    "leaseExpiresAt": chrono::DateTime::from_timestamp(registered.lease_expires_at, 0).expect("valid timestamp").to_rfc3339(),
+                    "usableForSeconds": registered.lease_expires_at.saturating_sub(now),
+                    "action": if active { "reuse" } else { "renewLease" },
+                    "renewalTool": "ssh_key_lease_renew"
                 }))
             }
-            "ssh_certificate" | "renew_ssh_certificate" => {
-                struct IssuanceGuard {
-                    db: Database,
-                    metrics: Arc<Metrics>,
-                    user: String,
-                    client: String,
-                    repository: Option<String>,
-                    permission: Option<String>,
-                    success: bool,
-                }
-                impl Drop for IssuanceGuard {
-                    fn drop(&mut self) {
-                        if !self.success {
-                            self.metrics
-                                .ssh_certificates_denied
-                                .fetch_add(1, Ordering::Relaxed);
-                            let _ = self.db.record_audit(
-                                Some(&self.user),
-                                "git.ssh_certificate.issue",
-                                self.repository.as_deref(),
-                                "denied",
-                                &json!({"client_id":self.client,"permission":self.permission}),
-                            );
-                        }
-                    }
-                }
-                let renewing = name == "renew_ssh_certificate";
-                let requested_permission = args
-                    .get("permission")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                let mut issuance = IssuanceGuard {
-                    db: self.app.db.clone(),
-                    metrics: self.app.metrics.clone(),
-                    user: self.auth.user.clone(),
-                    client: self.auth.client.clone(),
-                    repository: args
-                        .get("repositoryId")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                    permission: requested_permission.clone(),
-                    success: false,
-                };
-                let keys = self
-                    .app
-                    .ssh_keys
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("SSH transport is disabled"))?;
+            "ssh_key_register" | "ssh_key_lease_renew" => {
                 anyhow::ensure!(
                     self.app.ssh_ready.load(Ordering::Acquire),
                     "SSH listener is not ready"
                 );
-                let repository_id = args
-                    .get("repositoryId")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("repositoryId is required"))?;
-                if !renewing {
-                    anyhow::ensure!(
-                        requested_permission
-                            .as_deref()
-                            .is_some_and(|value| matches!(value, "read" | "write")),
-                        "permission is required and must be read or write"
-                    );
-                }
-                let repository = self
-                    .app
-                    .db
-                    .git_repository(repository_id)?
-                    .filter(|repo| repo.user_id == self.auth.user)
-                    .ok_or_else(|| anyhow::anyhow!("repository not found"))?;
-                if !self.auth.allows_integration(&repository.integration_id) {
-                    return Err(crate::authz::InsufficientScope {
-                        scopes: vec![format!("integration:{}", repository.integration_id)],
-                    }
-                    .into());
-                }
-                let integration = self
-                    .app
-                    .db
-                    .integration(&repository.integration_id, &self.auth.user)?
-                    .filter(|integration| integration.enabled)
-                    .ok_or_else(|| anyhow::anyhow!("integration disabled"))?;
-                let granted = self
-                    .app
-                    .db
-                    .git_grant_permission(&self.auth.user, &self.auth.client, repository_id)?
-                    .ok_or_else(|| anyhow::anyhow!("repository grant not found"))?;
-                self.app.lease.assert_live()?;
-                anyhow::ensure!(
-                    self.app.auth_rate_limit.allow(
-                        format!("ssh-certificate:{}:{repository_id}", self.auth.client),
-                        30,
-                        Duration::from_secs(60)
-                    ),
-                    "SSH certificate issuance rate limit exceeded"
-                );
                 let public_key = crate::git::ssh::parse_public_key(
                     args.get("publicKey")
                         .and_then(Value::as_str)
                         .ok_or_else(|| anyhow::anyhow!("publicKey is required"))?,
                 )?;
-                let now = chrono::Utc::now().timestamp();
-                let permission = if renewing {
-                    let previous_certificate = args
-                        .get("previousCertificate")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| anyhow::anyhow!("previousCertificate is required"))?;
-                    let previous = crate::git::ssh::verify_certificate_for_renewal_with_durable_cas(
-                        previous_certificate,
-                        &self.app.db,
-                        &public_key,
-                        now,
-                    )
-                    .map_err(|error| anyhow::anyhow!(
-                        "previousCertificate is not a renewable COG certificate for this exact publicKey: {error}. Reuse the existing identity; do not generate or substitute a key"
-                    ))?;
-                    anyhow::ensure!(
-                        previous.user_id == self.auth.user
-                            && previous.identity_id == self.auth.identity
-                            && previous.agent_id == self.auth.agent
-                            && previous.client_id == self.auth.client
-                            && previous.integration_id == repository.integration_id
-                            && previous.repository_id == repository_id,
-                        "previousCertificate is bound to a different client or repository; do not generate or substitute an SSH key"
-                    );
-                    previous.permission
-                } else {
-                    requested_permission.expect("validated above")
-                };
+                let canonical = public_key.to_openssh()?;
+                let fingerprint = crate::git::ssh::fingerprint(&public_key);
+                let renewing = name == "ssh_key_lease_renew";
                 anyhow::ensure!(
-                    permission == "read" || granted == "write",
-                    "write access is not granted"
+                    self.app.auth_rate_limit.allow(
+                        format!("ssh-key-lease:{}", self.auth.client),
+                        30,
+                        Duration::from_secs(60)
+                    ),
+                    "SSH key lease mutation rate limit exceeded"
                 );
-                issuance.permission = Some(permission.clone());
-                let expires_at = now + self.app.config.ssh_certificate_ttl_secs as i64;
-                let issuance_id = uuid::Uuid::new_v4().to_string();
-                let binding = crate::git::ssh::Binding {
-                    version: 1,
-                    issuance_id: issuance_id.clone(),
-                    user_id: self.auth.user.clone(),
-                    identity_id: self.auth.identity.clone(),
-                    agent_id: self.auth.agent.clone(),
-                    client_id: self.auth.client.clone(),
-                    integration_id: integration.id,
-                    repository_id: repository_id.to_owned(),
-                    permission: permission.clone(),
-                    fingerprint: crate::git::ssh::fingerprint(&public_key),
-                    issued_at: now,
-                    expires_at,
-                };
-                let serial = crate::git::ssh::stable_serial(&issuance_id);
-                let (certificate, host_public) = {
-                    let keys = keys
-                        .read()
-                        .map_err(|_| anyhow::anyhow!("SSH key lock poisoned"))?;
-                    (
-                        crate::git::ssh::sign(&keys.user_ca, &public_key, &binding, serial)?,
-                        keys.host.public_key().to_openssh()?,
-                    )
-                };
-                let host = self
-                    .app
-                    .config
-                    .ssh_public_host
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("SSH public host is not configured"))?;
-                let port = self.app.config.ssh_public_port.unwrap_or_else(|| {
-                    self.app
-                        .config
-                        .ssh_listen
-                        .expect("keys imply SSH configuration")
-                        .port()
-                });
-                let host_field = if port == 22 {
-                    host.to_owned()
+                let _mutation = self.app.mutations.lock().await;
+                self.app.lease.assert_live()?;
+                let expires_at =
+                    chrono::Utc::now().timestamp() + self.app.config.ssh_key_lease_ttl_secs as i64;
+                let key = if renewing {
+                    self.app.db.renew_agent_ssh_key_lease(
+                        &self.auth.user,
+                        &self.auth.identity,
+                        &self.auth.agent,
+                        &self.auth.client,
+                        &canonical,
+                        expires_at,
+                    )?
                 } else {
-                    format!("[{host}]:{port}")
+                    self.app.db.register_agent_ssh_key(
+                        &self.auth.user,
+                        &self.auth.agent,
+                        &self.auth.client,
+                        &canonical,
+                        &fingerprint,
+                        expires_at,
+                    )?
                 };
-                let remote = format!("ssh://git@{host}:{port}/{repository_id}");
-                let audit_action = if renewing {
-                    "git.ssh_certificate.renew"
+                let action = if renewing {
+                    "git.ssh_key.lease_renew"
                 } else {
-                    "git.ssh_certificate.issue"
+                    "git.ssh_key.register"
                 };
-                self.app.db.record_audit(Some(&self.auth.user), audit_action, Some(repository_id), "success", &json!({"identity_id":self.auth.identity,"agent_id":self.auth.agent,"client_id":self.auth.client,"integration_id":repository.integration_id,"permission":permission,"fingerprint":binding.fingerprint,"serial":serial,"expires_at":expires_at}))?;
+                self.app.db.record_audit(
+                    Some(&self.auth.user),
+                    action,
+                    Some(&self.auth.agent),
+                    "success",
+                    &json!({
+                        "identity_id": self.auth.identity,
+                        "agent_id": self.auth.agent,
+                        "client_id": self.auth.client,
+                        "fingerprint": key.fingerprint,
+                        "lease_expires_at": key.lease_expires_at
+                    }),
+                )?;
                 persist(&self.app).await?;
-                issuance.success = true;
-                issuance
-                    .metrics
-                    .ssh_certificates_issued
-                    .fetch_add(1, Ordering::Relaxed);
+                if renewing {
+                    self.app
+                        .metrics
+                        .ssh_key_lease_renewals
+                        .fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.app
+                        .metrics
+                        .ssh_key_registrations
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 Ok(json!({
-                    "repositoryId": repository_id,
-                    "permission": permission,
-                    "action": if renewing { "renewedExistingIdentity" } else { "enrolledExistingIdentity" },
-                    "expiresAt": chrono::DateTime::from_timestamp(expires_at, 0).expect("valid timestamp").to_rfc3339(),
-                    "sshRemoteUrl": remote,
-                    "certificate": certificate,
-                    "knownHosts": format!("{host_field} {host_public}"),
-                    "identitySource": "existing Ed25519 identity from SSH configuration or the SSH agent",
-                    "requiredPrograms": ["git", "ssh"],
-                    "certificateOutput": {"path":"<private-certificate-path>","contentsField":"certificate","encoding":"UTF-8","trailingNewline":true,"preserveForReuse":true},
-                    "knownHostsOutput": {"path":"<private-known-hosts-path>","contentsField":"knownHosts","encoding":"UTF-8","trailingNewline":true},
-                    "gitArguments": ["clone", "--", remote],
-                    "gitOperations": {
-                        "cloneArguments": ["clone", "--", remote],
-                        "fetchArguments": ["fetch", "--all"],
-                        "pushArguments": ["push"],
-                        "sshEnvironment": "Use the same strict SSH options and saved identity for clone, fetch, and push"
-                    },
-                    "sshArguments": ["-o","IdentitiesOnly=yes","-o","StrictHostKeyChecking=yes","-o","UserKnownHostsFile=<private-known-hosts-path>","-o","CertificateFile=<private-certificate-path>"],
-                    "sshOptions": {"identitiesOnly": true, "strictHostKeyChecking": true, "userKnownHostsFile": "path to the private known_hosts file", "certificateFile": "path to the saved COG certificate", "identitySource": "existing SSH configuration or SSH agent"},
-                    "authenticationFailureRecovery": {"action":"call renew_ssh_certificate with this same public key and the saved certificate, replace only the certificate file, then retry the Git operation","prohibitedAction":"generateOrReplaceSshIdentity"},
-                    "renewal": {"implicit":false,"tool":"renew_ssh_certificate","checkTool":"ssh_certificate_status","action":"reuse the same public key and previous certificate after expiry","privateKeyRemainsLocal":true,"preserveSshMaterial":true}
+                    "action": if renewing { "renewedInternalLease" } else { "registeredExistingKey" },
+                    "agentId": key.agent_id,
+                    "fingerprint": key.fingerprint,
+                    "leaseExpiresAt": chrono::DateTime::from_timestamp(key.lease_expires_at, 0).expect("valid timestamp").to_rfc3339(),
+                    "leaseTtlSeconds": self.app.config.ssh_key_lease_ttl_secs,
+                    "privateKeyRemainsLocal": true,
+                    "keyMaterialChanged": false,
+                    "renewal": {
+                        "tool": "ssh_key_lease_renew",
+                        "action": "extend the internal lease for this exact public key"
+                    }
                 }))
             }
             _ => anyhow::bail!("unknown Git control operation"),
@@ -1784,7 +1603,7 @@ pub struct SshServerFactory {
 
 pub struct SshConnection {
     app: App,
-    binding: Option<crate::git::ssh::Binding>,
+    binding: Option<crate::db::AgentSshBinding>,
     protocols: HashMap<ChannelId, String>,
     inputs: HashMap<ChannelId, tokio::sync::mpsc::Sender<anyhow::Result<bytes::Bytes>>>,
     opened_channel: bool,
@@ -1839,41 +1658,23 @@ impl russh::server::Handler for SshConnection {
 
     async fn auth_publickey(
         &mut self,
-        _user: &str,
-        _key: &russh::keys::PublicKey,
-    ) -> Result<russh::server::Auth, Self::Error> {
-        self.app
-            .metrics
-            .ssh_auth_denied
-            .fetch_add(1, Ordering::Relaxed);
-        Ok(russh::server::Auth::reject())
-    }
-
-    async fn auth_openssh_certificate(
-        &mut self,
         user: &str,
-        certificate: &russh::keys::Certificate,
+        key: &russh::keys::PublicKey,
     ) -> Result<russh::server::Auth, Self::Error> {
-        let Some(_keys) = self.app.ssh_keys.as_ref() else {
-            return Ok(russh::server::Auth::reject());
-        };
-        let result = (|| -> anyhow::Result<crate::git::ssh::Binding> {
+        let result = (|| -> anyhow::Result<crate::db::AgentSshBinding> {
             anyhow::ensure!(user == "git", "SSH username must be git");
             anyhow::ensure!(
                 self._connection_permit.is_some(),
                 "SSH connection limit exceeded"
             );
             self.app.lease.assert_live()?;
-            let encoded = certificate.to_openssh()?;
-            let subject =
-                russh::keys::PublicKey::new(certificate.public_key().clone(), "").to_openssh()?;
-            let subject = crate::git::ssh::parse_public_key(&subject)?;
-            crate::git::ssh::verify_certificate_with_durable_cas(
-                &encoded,
-                &self.app.db,
-                &subject,
-                chrono::Utc::now().timestamp(),
-            )
+            let encoded = key.to_openssh()?;
+            let public_key = crate::git::ssh::parse_public_key(&encoded)?;
+            let canonical = public_key.to_openssh()?;
+            self.app
+                .db
+                .active_agent_ssh_key(&canonical, chrono::Utc::now().timestamp())?
+                .ok_or_else(|| anyhow::anyhow!("SSH key is not registered or its lease expired"))
         })();
         match result {
             Ok(binding) => {
@@ -1889,9 +1690,15 @@ impl russh::server::Handler for SshConnection {
                 let _ = self.app.db.record_audit(
                     Some(&binding.user_id),
                     "git.ssh_authentication",
-                    Some(&binding.repository_id),
+                    Some(&binding.agent_id),
                     "success",
-                    &json!({"identity_id":binding.identity_id,"agent_id":binding.agent_id,"client_id":binding.client_id,"integration_id":binding.integration_id,"permission":binding.permission,"fingerprint":binding.fingerprint,"issuance_id":binding.issuance_id}),
+                    &json!({
+                        "identity_id": binding.identity_id,
+                        "agent_id": binding.agent_id,
+                        "client_id": binding.client_id,
+                        "fingerprint": binding.fingerprint,
+                        "lease_expires_at": binding.lease_expires_at
+                    }),
                 );
                 Ok(russh::server::Auth::Accept)
             }
@@ -1961,12 +1768,6 @@ impl russh::server::Handler for SshConnection {
             let _ = session.channel_failure(channel);
             return Ok(());
         };
-        if binding.repository_id != repository_id
-            || (service.permission() == "write" && binding.permission != "write")
-        {
-            let _ = session.channel_failure(channel);
-            return Ok(());
-        }
         let (sender, receiver) = tokio::sync::mpsc::channel(8);
         self.inputs.insert(channel, sender);
         self.executed_channel = Some(channel);
@@ -2015,7 +1816,7 @@ impl russh::server::Handler for SshConnection {
                     "git.ssh_operation",
                     Some(&repository_id),
                     "failure",
-                    &json!({"identity_id":binding.identity_id,"agent_id":binding.agent_id,"client_id":binding.client_id,"integration_id":binding.integration_id,"permission":binding.permission,"transport":"ssh","error":error_kind}),
+                    &json!({"identity_id":binding.identity_id,"agent_id":binding.agent_id,"client_id":binding.client_id,"fingerprint":binding.fingerprint,"transport":"ssh","error":error_kind}),
                 );
                 let message = match &result {
                     Ok(Err(error)) => {
@@ -2121,7 +1922,7 @@ struct SshGitIo {
 
 async fn run_ssh_git(
     app: App,
-    binding: crate::git::ssh::Binding,
+    binding: crate::db::AgentSshBinding,
     service: crate::git::ssh::Service,
     repository_id: String,
     git_protocol: Option<String>,
@@ -2159,11 +1960,17 @@ async fn run_ssh_git(
     let repository = app
         .db
         .git_repository(&repository_id)?
-        .filter(|repository| {
-            repository.user_id == binding.user_id
-                && repository.integration_id == binding.integration_id
-        })
+        .filter(|repository| repository.user_id == binding.user_id)
         .ok_or_else(|| anyhow::anyhow!("repository is no longer available"))?;
+    let live_key = app
+        .db
+        .agent_ssh_key(&binding.user_id, &binding.agent_id)?
+        .filter(|key| {
+            key.public_key == binding.public_key
+                && key.revoked_at.is_none()
+                && key.lease_expires_at > chrono::Utc::now().timestamp()
+        })
+        .ok_or_else(|| anyhow::anyhow!("SSH key lease has expired or been revoked"))?;
     let grant = app
         .db
         .git_grant_permission(&binding.user_id, &binding.client_id, &repository_id)?
@@ -2174,7 +1981,7 @@ async fn run_ssh_git(
     );
     let integration = app
         .db
-        .integration(&binding.integration_id, &binding.user_id)?
+        .integration(&repository.integration_id, &binding.user_id)?
         .filter(|integration| integration.enabled && integration.identity_id == binding.identity_id)
         .ok_or_else(|| anyhow::anyhow!("integration is disabled or revoked"))?;
     let provider = git_provider(&app, &integration).await?;
@@ -2214,9 +2021,16 @@ async fn run_ssh_git(
         .await
         .map_err(|_| anyhow::anyhow!("SSH client disconnected"))?;
 
-    // Revalidate immediately before the RPC begins. Certificate validity alone
-    // never authorizes an operation after a grant, integration, or lease change.
+    // Revalidate the key lease and live grants immediately before the RPC.
     app.lease.assert_live()?;
+    anyhow::ensure!(
+        app.db
+            .agent_ssh_key(&binding.user_id, &binding.agent_id)?
+            .is_some_and(|key| key.public_key == live_key.public_key
+                && key.revoked_at.is_none()
+                && key.lease_expires_at > chrono::Utc::now().timestamp()),
+        "SSH key lease has expired or been revoked"
+    );
     anyhow::ensure!(
         app.db
             .git_grant_permission(&binding.user_id, &binding.client_id, &repository_id)?
@@ -2225,8 +2039,10 @@ async fn run_ssh_git(
     );
     anyhow::ensure!(
         app.db
-            .integration(&binding.integration_id, &binding.user_id)?
-            .is_some_and(|integration| integration.enabled),
+            .integration(&repository.integration_id, &binding.user_id)?
+            .is_some_and(
+                |integration| integration.enabled && integration.identity_id == binding.identity_id
+            ),
         "integration is disabled"
     );
     let maximum = app.config.git_max_request_bytes;
@@ -2351,7 +2167,7 @@ async fn run_ssh_git(
         },
         Some(&repository_id),
         "success",
-        &json!({"identity_id":binding.identity_id,"agent_id":binding.agent_id,"client_id":binding.client_id,"integration_id":binding.integration_id,"permission":binding.permission,"issuance_id":binding.issuance_id,"transport":"ssh","protocol":git_protocol.as_deref().unwrap_or("version=0")}),
+        &json!({"identity_id":binding.identity_id,"agent_id":binding.agent_id,"client_id":binding.client_id,"integration_id":repository.integration_id,"fingerprint":binding.fingerprint,"transport":"ssh","protocol":git_protocol.as_deref().unwrap_or("version=0")}),
     )?;
     Ok(())
 }
@@ -2431,8 +2247,7 @@ pub async fn readiness(State(a): State<App>) -> impl IntoResponse {
                 "listen": a.config.ssh_listen.map(|address| address.to_string()),
                 "publicHost": a.config.ssh_public_host,
                 "publicPort": a.config.ssh_public_port.or_else(|| a.config.ssh_listen.map(|address| address.port())),
-                "hostKeyFingerprint": a.ssh_keys.as_ref().and_then(|keys| keys.read().ok().map(|keys| crate::git::ssh::fingerprint(keys.host.public_key()))),
-                "userCaFingerprint": a.ssh_keys.as_ref().and_then(|keys| keys.read().ok().map(|keys| crate::git::ssh::fingerprint(keys.user_ca.public_key())))
+                "hostKeyFingerprint": a.ssh_keys.as_ref().and_then(|keys| keys.read().ok().map(|keys| crate::git::ssh::fingerprint(keys.host.public_key())))
             }
         })),
     )
@@ -2465,7 +2280,7 @@ async fn metrics(State(a): State<App>) -> impl IntoResponse {
             "# TYPE cog_ssh_timeouts_total counter\ncog_ssh_timeouts_total {}\n",
             "# TYPE cog_ssh_limit_rejections_total counter\ncog_ssh_limit_rejections_total {}\n",
             "# TYPE cog_ssh_upstream_failures_total counter\ncog_ssh_upstream_failures_total {}\n",
-            "# TYPE cog_ssh_certificates_total counter\ncog_ssh_certificates_total{{result=\"issued\"}} {}\ncog_ssh_certificates_total{{result=\"denied\"}} {}\n"
+            "# TYPE cog_ssh_keys_total counter\ncog_ssh_keys_total{{operation=\"register\"}} {}\ncog_ssh_keys_total{{operation=\"lease_renew\"}} {}\n"
         ),
         u8::from(a.lease.is_live()),
         a.lease.generation(),
@@ -2487,8 +2302,8 @@ async fn metrics(State(a): State<App>) -> impl IntoResponse {
         a.metrics.ssh_timeouts.load(Ordering::Relaxed),
         a.metrics.ssh_limit_rejections.load(Ordering::Relaxed),
         a.metrics.ssh_upstream_failures.load(Ordering::Relaxed),
-        a.metrics.ssh_certificates_issued.load(Ordering::Relaxed),
-        a.metrics.ssh_certificates_denied.load(Ordering::Relaxed),
+        a.metrics.ssh_key_registrations.load(Ordering::Relaxed),
+        a.metrics.ssh_key_lease_renewals.load(Ordering::Relaxed),
     );
     (
         [(http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
@@ -2815,7 +2630,7 @@ async fn ui_bootstrap(State(a): State<App>, headers: HeaderMap) -> impl IntoResp
             "ready": a.ssh_ready.load(Ordering::Acquire),
             "public_host": a.config.ssh_public_host,
             "public_port": a.config.ssh_public_port.or_else(|| a.config.ssh_listen.map(|address| address.port())),
-            "certificate_ttl_seconds": a.config.ssh_certificate_ttl_secs,
+            "key_lease_ttl_seconds": a.config.ssh_key_lease_ttl_secs,
             "keys": ssh_keys
         },
         "git_transport_usage": {
@@ -2850,10 +2665,7 @@ pub async fn ui_prepare_ssh_key(
     };
     let result = (|| -> anyhow::Result<crate::db::SshKeyRecord> {
         a.lease.assert_live()?;
-        anyhow::ensure!(
-            matches!(purpose.as_str(), "host" | "user_ca"),
-            "invalid SSH key purpose"
-        );
+        anyhow::ensure!(purpose == "host", "invalid SSH key purpose");
         let key = crate::git::ssh::generate_key()?;
         let public = key.public_key().to_openssh()?;
         let encrypted = a.secrets.seal(&crate::git::ssh::encode_private(&key)?)?;
@@ -2905,11 +2717,7 @@ pub async fn ui_activate_ssh_key(
         )
             .into_response();
     }
-    let overlap = if purpose == "user_ca" {
-        a.config.ssh_certificate_max_ttl_secs as i64 + 60
-    } else {
-        86_400
-    };
+    let overlap = 86_400;
     let result =
         a.db.activate_ssh_key(&id, &purpose, chrono::Utc::now().timestamp() + overlap);
     if let Err(error) = result {
@@ -2930,28 +2738,6 @@ pub async fn ui_activate_ssh_key(
     }
     if let Err(error) = persist(&a).await {
         return (StatusCode::SERVICE_UNAVAILABLE, safe_error(error.as_ref())).into_response();
-    }
-    if purpose == "user_ca" {
-        match crate::git::ssh::KeySet::load_or_create(&a.db, &a.secrets) {
-            Ok(loaded) => {
-                if let Some(keys) = &a.ssh_keys {
-                    match keys.write() {
-                        Ok(mut keys) => keys.user_ca = loaded.user_ca,
-                        Err(_) => {
-                            return (StatusCode::INTERNAL_SERVER_ERROR, "SSH key lock poisoned")
-                                .into_response();
-                        }
-                    }
-                }
-            }
-            Err(error) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    safe_error(error.as_ref()),
-                )
-                    .into_response();
-            }
-        }
     }
     Redirect::to("/ui").into_response()
 }

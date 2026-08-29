@@ -117,24 +117,22 @@ incorrect.
 
 ## Git transports and SSH incident response
 
-See [Git transports](git.md) for SSH certificate setup.
+See [Git transports](git.md) for registered agent keys and lease renewal.
 SSH is a separate TCP listener and must be allowed through the host firewall and
 load balancer directly; Nginx's HTTP listener cannot proxy it as an HTTP route.
 Verify the effective systemd configuration, listener ownership, `/readyz`, and
-both host/CA fingerprints after deployment and S3 takeover.
+the host-key fingerprint after deployment and S3 takeover.
 
 For emergency SSH disablement, stop COG orderly with SIGINT and block the
 published SSH port; Git access remains unavailable until COG is restarted. For a user
-CA compromise, prepare and activate a replacement CA, revoke affected OAuth
-clients or repository grants immediately, and retain the retiring CA only for
-the maximum certificate lifetime. For a host-key compromise, disable SSH,
+For an agent-key compromise, revoke the affected OAuth client or repository
+grants and do not renew its key lease. For a host-key compromise, disable SSH,
 prepare and activate a replacement while stopped, distribute the new pinned
 `known_hosts` entry through `repository_access`, and then re-enable the listener.
 Never tell clients to bypass host-key checking.
 
-Repository removal, integration disconnect, client revocation, and stale-owner
-fencing take effect at the next SSH command even for an unexpired certificate.
+Repository removal, integration disconnect, client revocation, key-lease
+expiry, and stale-owner fencing take effect at the next SSH command.
 Rotation order is prepare, durably replicate, distribute overlap, activate,
-observe, then retire after `retirement_time`. CA overlap is at least the maximum
-certificate lifetime plus clock skew; host overlap is at least 24 hours unless
+observe, then retire after `retirement_time`. Host overlap is at least 24 hours unless
 the operator documents a longer client rollout window and rollback plan.

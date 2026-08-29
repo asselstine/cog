@@ -22,7 +22,7 @@ impl StorageMode {
     }
 }
 
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 const INITIAL_SCHEMA: &str = r#"
 PRAGMA foreign_keys=ON;
@@ -131,12 +131,18 @@ CREATE TABLE IF NOT EXISTS git_pending_requests(
  consumed_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS ssh_keys(
- id TEXT PRIMARY KEY, purpose TEXT NOT NULL CHECK(purpose IN ('host','user_ca')),
+ id TEXT PRIMARY KEY, purpose TEXT NOT NULL CHECK(purpose = 'host'),
  algorithm TEXT NOT NULL, public_key TEXT NOT NULL, private_ciphertext TEXT NOT NULL,
  created_at INTEGER NOT NULL, active INTEGER NOT NULL DEFAULT 0,
  retirement_time INTEGER
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ssh_keys_one_active ON ssh_keys(purpose) WHERE active=1;
+CREATE TABLE IF NOT EXISTS agent_ssh_keys(
+ agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+ public_key TEXT NOT NULL UNIQUE, fingerprint TEXT NOT NULL UNIQUE,
+ lease_expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+ revoked_at INTEGER
+);
 CREATE TABLE IF NOT EXISTS github_app_setups(
  state_hash BLOB PRIMARY KEY,
  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -207,6 +213,35 @@ fn apply_migration(tx: &rusqlite::Transaction<'_>, version: i64) -> anyhow::Resu
         )?,
         // Version 6 removes the superseded downstream HTTPS credential path.
         6 => tx.execute_batch("DROP TABLE IF EXISTS git_credentials;")?,
+        // Version 7 replaces short-lived user certificates with registered
+        // agent public keys whose authorization is a renewable server lease.
+        7 => tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS agent_ssh_keys(
+               agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+               public_key TEXT NOT NULL UNIQUE,
+               fingerprint TEXT NOT NULL UNIQUE,
+               lease_expires_at INTEGER NOT NULL,
+               created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL,
+               revoked_at INTEGER
+             );
+             DELETE FROM ssh_keys WHERE purpose<>'host';
+             DROP INDEX IF EXISTS ssh_keys_one_active;
+             CREATE TABLE ssh_keys_v7(
+               id TEXT PRIMARY KEY,
+               purpose TEXT NOT NULL CHECK(purpose='host'),
+               algorithm TEXT NOT NULL,
+               public_key TEXT NOT NULL,
+               private_ciphertext TEXT NOT NULL,
+               created_at INTEGER NOT NULL,
+               active INTEGER NOT NULL DEFAULT 0,
+               retirement_time INTEGER
+             );
+             INSERT INTO ssh_keys_v7 SELECT * FROM ssh_keys;
+             DROP TABLE ssh_keys;
+             ALTER TABLE ssh_keys_v7 RENAME TO ssh_keys;
+             CREATE UNIQUE INDEX ssh_keys_one_active ON ssh_keys(purpose) WHERE active=1;",
+        )?,
         _ => anyhow::bail!("unsupported migration target {version}"),
     }
     Ok(())
@@ -368,6 +403,28 @@ pub struct SshKeyRecord {
     pub active: bool,
     pub retirement_time: Option<i64>,
 }
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AgentSshKey {
+    pub agent_id: String,
+    pub public_key: String,
+    pub fingerprint: String,
+    pub lease_expires_at: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub revoked_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSshBinding {
+    pub user_id: String,
+    pub identity_id: String,
+    pub agent_id: String,
+    pub client_id: String,
+    pub public_key: String,
+    pub fingerprint: String,
+    pub lease_expires_at: i64,
+}
 type RefreshTokenRow = (Vec<u8>, String, String, String, Option<i64>);
 fn git_repo_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::git::GitRepository> {
     Ok(crate::git::GitRepository {
@@ -446,10 +503,7 @@ impl Database {
     }
 
     pub fn active_ssh_key(&self, purpose: &str) -> anyhow::Result<Option<SshKeyRecord>> {
-        anyhow::ensure!(
-            matches!(purpose, "host" | "user_ca"),
-            "invalid SSH key purpose"
-        );
+        anyhow::ensure!(purpose == "host", "invalid SSH key purpose");
         let conn = self
             .0
             .lock()
@@ -469,10 +523,7 @@ impl Database {
         public_key: &str,
         private_ciphertext: &str,
     ) -> anyhow::Result<SshKeyRecord> {
-        anyhow::ensure!(
-            matches!(purpose, "host" | "user_ca"),
-            "invalid SSH key purpose"
-        );
+        anyhow::ensure!(purpose == "host", "invalid SSH key purpose");
         let id = Uuid::new_v4().to_string();
         let now = chrono::Utc::now().timestamp();
         self.transact(|tx| {
@@ -492,10 +543,7 @@ impl Database {
         public_key: &str,
         private_ciphertext: &str,
     ) -> anyhow::Result<SshKeyRecord> {
-        anyhow::ensure!(
-            matches!(purpose, "host" | "user_ca"),
-            "invalid SSH key purpose"
-        );
+        anyhow::ensure!(purpose == "host", "invalid SSH key purpose");
         let id = Uuid::new_v4().to_string();
         let now = chrono::Utc::now().timestamp();
         self.transact(|tx| {
@@ -517,10 +565,7 @@ impl Database {
         purpose: &str,
         retirement_time: i64,
     ) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            matches!(purpose, "host" | "user_ca"),
-            "invalid SSH key purpose"
-        );
+        anyhow::ensure!(purpose == "host", "invalid SSH key purpose");
         self.transact(|tx| {
             let exists: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM ssh_keys WHERE id=? AND purpose=? AND active=0 AND retirement_time IS NULL)",
@@ -546,6 +591,122 @@ impl Database {
             anyhow::ensure!(changed == 1, "SSH key is active or its overlap window has not elapsed");
             Ok(())
         })
+    }
+
+    pub fn register_agent_ssh_key(
+        &self,
+        user: &str,
+        agent: &str,
+        client: &str,
+        public_key: &str,
+        fingerprint: &str,
+        lease_expires_at: i64,
+    ) -> anyhow::Result<AgentSshKey> {
+        let now = chrono::Utc::now().timestamp();
+        self.transact(|tx| {
+            let owner: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM agents a JOIN identities i ON i.id=a.identity_id WHERE a.id=? AND a.oauth_client_id=? AND i.user_id=?)",
+                params![agent, client, user],
+                |row| row.get(0),
+            )?;
+            anyhow::ensure!(owner, "agent identity is not authorized");
+            let existing: Option<String> = tx
+                .query_row(
+                    "SELECT public_key FROM agent_ssh_keys WHERE agent_id=?",
+                    [agent],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match existing {
+                Some(existing) => anyhow::ensure!(
+                    existing == public_key,
+                    "agent already has a different SSH key; revoke it before explicit rotation"
+                ),
+                None => {
+                    tx.execute(
+                        "INSERT INTO agent_ssh_keys(agent_id,public_key,fingerprint,lease_expires_at,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                        params![agent, public_key, fingerprint, lease_expires_at, now, now],
+                    )?;
+                }
+            }
+            Ok(())
+        })?;
+        self.agent_ssh_key(user, agent)?
+            .ok_or_else(|| anyhow::anyhow!("registered SSH key was not found"))
+    }
+
+    pub fn renew_agent_ssh_key_lease(
+        &self,
+        user: &str,
+        identity: &str,
+        agent: &str,
+        client: &str,
+        public_key: &str,
+        lease_expires_at: i64,
+    ) -> anyhow::Result<AgentSshKey> {
+        let now = chrono::Utc::now().timestamp();
+        self.transact(|tx| {
+            let changed = tx.execute(
+                "UPDATE agent_ssh_keys SET lease_expires_at=?,updated_at=? WHERE agent_id=? AND public_key=? AND revoked_at IS NULL AND EXISTS(SELECT 1 FROM agents a JOIN identities i ON i.id=a.identity_id WHERE a.id=agent_ssh_keys.agent_id AND a.identity_id=? AND a.oauth_client_id=? AND i.user_id=?)",
+                params![lease_expires_at, now, agent, public_key, identity, client, user],
+            )?;
+            anyhow::ensure!(changed == 1, "registered SSH key not found for this agent");
+            Ok(())
+        })?;
+        self.agent_ssh_key(user, agent)?
+            .ok_or_else(|| anyhow::anyhow!("renewed SSH key was not found"))
+    }
+
+    pub fn agent_ssh_key(&self, user: &str, agent: &str) -> anyhow::Result<Option<AgentSshKey>> {
+        let conn = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+        Ok(conn
+            .query_row(
+                "SELECT k.agent_id,k.public_key,k.fingerprint,k.lease_expires_at,k.created_at,k.updated_at,k.revoked_at FROM agent_ssh_keys k JOIN agents a ON a.id=k.agent_id JOIN identities i ON i.id=a.identity_id WHERE k.agent_id=? AND i.user_id=?",
+                params![agent, user],
+                |row| {
+                    Ok(AgentSshKey {
+                        agent_id: row.get(0)?,
+                        public_key: row.get(1)?,
+                        fingerprint: row.get(2)?,
+                        lease_expires_at: row.get(3)?,
+                        created_at: row.get(4)?,
+                        updated_at: row.get(5)?,
+                        revoked_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn active_agent_ssh_key(
+        &self,
+        public_key: &str,
+        now: i64,
+    ) -> anyhow::Result<Option<AgentSshBinding>> {
+        let conn = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+        Ok(conn
+            .query_row(
+                "SELECT i.user_id,a.identity_id,a.id,a.oauth_client_id,k.public_key,k.fingerprint,k.lease_expires_at FROM agent_ssh_keys k JOIN agents a ON a.id=k.agent_id JOIN identities i ON i.id=a.identity_id WHERE k.public_key=? AND k.revoked_at IS NULL AND k.lease_expires_at>?",
+                params![public_key, now],
+                |row| {
+                    Ok(AgentSshBinding {
+                        user_id: row.get(0)?,
+                        identity_id: row.get(1)?,
+                        agent_id: row.get(2)?,
+                        client_id: row.get(3)?,
+                        public_key: row.get(4)?,
+                        fingerprint: row.get(5)?,
+                        lease_expires_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()?)
     }
 
     pub fn upsert_git_repository(
