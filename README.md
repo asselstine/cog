@@ -155,12 +155,16 @@ cargo test
 
 ### Create a release
 
+To test the complete native artifact build without publishing a release, open
+**Actions → build → Run workflow**. The build workflow uploads a
+`release-artifacts` bundle containing all five archives and `SHA256SUMS`.
+
 Update the package version in `Cargo.toml`, then either push the matching tag
 (for example, `v0.2.0`) or open **Actions → release → Run workflow** and enter
-that tag. The release workflow builds native binaries for Linux x86-64 and
-ARM64, macOS Intel and Apple Silicon, and Windows x86-64. It publishes the five
-archives plus `SHA256SUMS` to a GitHub Release, then installs and executes every
-published binary on its native GitHub-hosted runner.
+that tag. The release workflow calls the same build workflow for Linux x86-64
+and ARM64, macOS Intel and Apple Silicon, and Windows x86-64. It publishes the
+five archives plus `SHA256SUMS` to a GitHub Release, then installs and executes
+every published binary on its native GitHub-hosted runner.
 
 Run the S3 integration suite:
 

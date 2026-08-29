@@ -1,0 +1,103 @@
+name: build
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: cog
+            archive: cog-x86_64-unknown-linux-gnu.tar.gz
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            binary: cog
+            archive: cog-aarch64-unknown-linux-gnu.tar.gz
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: cog
+            archive: cog-x86_64-apple-darwin.tar.gz
+          - os: macos-15
+            target: aarch64-apple-darwin
+            binary: cog
+            archive: cog-aarch64-apple-darwin.tar.gz
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            binary: cog.exe
+            archive: cog-x86_64-pc-windows-msvc.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - name: Build embedded frontend
+        working-directory: frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+      - name: Build cog
+        shell: bash
+        env:
+          COG_FRONTEND_PREBUILT: "1"
+        run: cargo build --locked --release --target "${{ matrix.target }}"
+      - name: Smoke test
+        shell: bash
+        run: "target/${{ matrix.target }}/release/${{ matrix.binary }} --version"
+      - name: Package Unix executable
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir staging
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" staging/cog
+          tar -C staging -czf "${{ matrix.archive }}" cog
+      - name: Package Windows executable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory staging | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" staging/cog.exe
+          Compress-Archive -Path staging/cog.exe -DestinationPath "${{ matrix.archive }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 7
+
+  bundle:
+    name: Bundle artifacts
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: '*-*-*'
+          merge-multiple: true
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum cog-* > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-artifacts
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
