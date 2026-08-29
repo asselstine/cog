@@ -971,6 +971,17 @@ impl Catalog {
             }
             for tool in tools {
                 let target = format!("{id}.{}", tool.name);
+                let required_scope = tool
+                    .extra
+                    .get("x-cog-requiredScope")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("integration:{id}"));
+                let client_access_granted = tool
+                    .extra
+                    .get("x-cog-clientAccessGranted")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(entry.client_access_granted);
                 let hay = format!(
                     "{} {} {} {}",
                     id,
@@ -985,17 +996,17 @@ impl Catalog {
                         "integrationLabel": entry.label,
                         "tool": tool.name,
                         "description": tool.description,
-                        "authorized": entry.client_access_granted,
+                        "authorized": client_access_granted,
                         "upstreamConnected": entry.upstream_status == "connected",
                         "upstreamStatus": entry.upstream_status,
-                        "clientAccessGranted": entry.client_access_granted,
-                        "requiredScope": format!("integration:{id}"),
+                        "clientAccessGranted": client_access_granted,
+                        "requiredScope": required_scope,
                         "grantRequestSupported": true,
                         "target": target,
                         "searchMode": "literalSubstring",
                         "broadDiscoveryFallback": "codemode.search('')",
                     });
-                    if !entry.client_access_granted {
+                    if !client_access_granted {
                         result["authorizationRequired"] = json!(true);
                         result["grantRequestAction"] = json!(
                             "Proceed with codemode.describe or codemode.call to trigger downstream OAuth progressive consent; do not reconnect the upstream integration."

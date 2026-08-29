@@ -137,7 +137,7 @@ struct GitControlProvider {
 
 fn admin_tool(name: &str, description: &str) -> Tool {
     let (input_schema, read_only, destructive, idempotent, open_world) = match name {
-        "integrations_list" | "agents_list" | "tokens_list" | "audit_list" | "agent_get_self" => (
+        "integrations_list" | "agents_list" | "tokens_list" | "agent_get_self" => (
             json!({"type":"object","properties":{},"additionalProperties":false}),
             true,
             false,
@@ -215,6 +215,13 @@ fn admin_tool(name: &str, description: &str) -> Tool {
             json!({"type":"object","properties":{"client_id":{"type":"string"},"integration_id":{"type":"string"}},"required":["client_id","integration_id"],"additionalProperties":false}),
             false,
             true,
+            true,
+            false,
+        ),
+        "audit_list" => (
+            json!({"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":1000,"default":100,"description":"Maximum number of recent audit events to return."}},"additionalProperties":false}),
+            true,
+            false,
             true,
             false,
         ),
@@ -320,16 +327,25 @@ fn redact_value(value: Value) -> Value {
 #[async_trait::async_trait]
 impl ToolProvider for AdminProvider {
     async fn tools(&self) -> anyhow::Result<Vec<Tool>> {
+        // Code-mode discovery must include operations that need progressive
+        // consent. Authorization is enforced at call time so a client can
+        // discover and describe a tool before receiving its exact scope
+        // challenge.
         Ok(self
             .advertised_tools()
             .await?
             .into_iter()
-            .filter(|tool| {
-                (matches!(
+            .map(|mut tool| {
+                let required_scope = admin_required_scope(&tool.name).unwrap_or("mcp");
+                let access_granted = matches!(
                     tool.name.as_str(),
                     "integrations_list" | "agent_get_self" | "agent_update_self"
-                ) && self.auth.allows("mcp"))
-                    || admin_required_scope(&tool.name).is_some_and(|scope| self.auth.allows(scope))
+                ) || self.auth.allows(required_scope);
+                tool.extra
+                    .insert("x-cog-clientAccessGranted".into(), json!(access_granted));
+                tool.extra
+                    .insert("x-cog-requiredScope".into(), json!(required_scope));
+                tool
             })
             .collect())
     }
@@ -463,10 +479,16 @@ impl ToolProvider for AdminProvider {
                 self.app.db.agent_tokens(&self.auth.user)?,
             )?),
             "audit_list" if self.auth.allows("audit:read") => {
-                Ok(serde_json::to_value(self.app.db.audit_events_for_user(
-                    &self.auth.user,
-                    args.get("limit").and_then(Value::as_u64).unwrap_or(100) as u32,
-                )?)?)
+                let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(100);
+                anyhow::ensure!(
+                    (1..=1000).contains(&limit),
+                    "limit must be between 1 and 1000"
+                );
+                Ok(serde_json::to_value(
+                    self.app
+                        .db
+                        .audit_events_for_user(&self.auth.user, limit as u32)?,
+                )?)
             }
             "integration_create" if self.auth.allows("integrations:write") => {
                 admin_create(&self.app, &self.auth.user, args).await
@@ -522,17 +544,82 @@ impl ToolProvider for AdminProvider {
                     .ok_or_else(|| anyhow::anyhow!("integration_id is required"))?;
                 admin_revoke_grant(&self.app, &self.auth.user, client, integration).await
             }
+            name if admin_required_scope(name).is_some() => {
+                Err(crate::authz::InsufficientScope::one(
+                    admin_required_scope(name).expect("checked above"),
+                )
+                .into())
+            }
             _ => anyhow::bail!("unknown or unauthorized administration tool"),
         }
     }
 }
 
-fn git_control_tool(name: &str, description: &str, destructive: bool) -> Tool {
-    Tool{name:name.into(),description:Some(description.into()),input_schema:match name{
- "repository_access"=>json!({"type":"object","properties":{"integrationId":{"type":"string"},"repository":{"type":"string"}},"required":["integrationId","repository"],"additionalProperties":false}),
- "ssh_certificate_status"=>json!({"type":"object","properties":{"repositoryId":{"type":"string"},"publicKey":{"type":"string"},"certificate":{"type":"string"}},"required":["repositoryId","publicKey","certificate"],"additionalProperties":false}),
- "ssh_certificate"=>json!({"type":"object","properties":{"repositoryId":{"type":"string"},"publicKey":{"type":"string"},"permission":{"enum":["read","write"]}},"required":["repositoryId","publicKey","permission"],"additionalProperties":false}),
- _=>json!({"type":"object","properties":{},"additionalProperties":false})},extra:serde_json::from_value(json!({"annotations":{"readOnlyHint":!destructive,"destructiveHint":destructive,"openWorldHint":false}})).unwrap_or_default()}
+fn git_control_tool(name: &str, description: &str) -> Tool {
+    let (input_schema, read_only, idempotent, open_world) = match name {
+        "repository_access" => (
+            json!({"type":"object","properties":{
+                "integrationId":{"type":"string","description":"Immutable ID of the configured GitHub integration. Use integrations_list to discover it; do not use its display name."},
+                "repository":{"type":"string","description":"GitHub repository reference to resolve, normally owner/name. This may contact GitHub and records the resolved repository grant."}
+            },"required":["integrationId","repository"],"additionalProperties":false}),
+            false,
+            true,
+            true,
+        ),
+        "ssh_certificate_status" => (
+            json!({"type":"object","properties":{
+                "repositoryId":{"type":"string","description":"Opaque repository ID returned by repository_access."},
+                "publicKey":{"type":"string","description":"Exact canonical OpenSSH Ed25519 public key for the existing local identity. Never send the private key and never generate a replacement key for this check."},
+                "certificate":{"type":"string","description":"Previously saved COG OpenSSH certificate associated with publicKey."}
+            },"required":["repositoryId","publicKey","certificate"],"additionalProperties":false}),
+            true,
+            true,
+            false,
+        ),
+        "ssh_certificate" => (
+            json!({"type":"object","properties":{
+                "repositoryId":{"type":"string","description":"Opaque repository ID returned by repository_access."},
+                "publicKey":{"type":"string","description":"Exact canonical OpenSSH Ed25519 public key for an already-existing local identity. The private key stays local. Do not generate or replace a key because a certificate expired."},
+                "permission":{"type":"string","enum":["read","write"],"description":"Requested initial certificate permission, limited by the current repository grant."}
+            },"required":["repositoryId","publicKey","permission"],"additionalProperties":false}),
+            false,
+            false,
+            false,
+        ),
+        "renew_ssh_certificate" => (
+            json!({"type":"object","properties":{
+                "repositoryId":{"type":"string","description":"Opaque repository ID returned by repository_access and bound into previousCertificate."},
+                "publicKey":{"type":"string","description":"The exact same canonical OpenSSH Ed25519 public key bound into previousCertificate. Never generate or substitute a new key for renewal."},
+                "previousCertificate":{"type":"string","description":"Previously saved COG OpenSSH certificate. It may be expired; COG validates its signature and identity binding before renewal."}
+            },"required":["repositoryId","publicKey","previousCertificate"],"additionalProperties":false}),
+            false,
+            false,
+            false,
+        ),
+        _ => (
+            json!({"type":"object","properties":{},"additionalProperties":false}),
+            false,
+            false,
+            false,
+        ),
+    };
+    let security_schemes = json!([{"type":"oauth2","scopes":["mcp"]}]);
+    Tool {
+        name: name.into(),
+        description: Some(description.into()),
+        input_schema,
+        extra: serde_json::from_value(json!({
+            "annotations":{
+                "readOnlyHint":read_only,
+                "destructiveHint":false,
+                "idempotentHint":idempotent,
+                "openWorldHint":open_world
+            },
+            "securitySchemes":security_schemes,
+            "_meta":{"securitySchemes":security_schemes}
+        }))
+        .unwrap_or_default(),
+    }
 }
 
 fn ssh_advertisement(app: &App, repository_id: &str) -> Option<Value> {
@@ -557,6 +644,7 @@ fn ssh_advertisement(app: &App, repository_id: &str) -> Option<Value> {
         "url":format!("ssh://git@{host}:{port}/{repository_id}"),
         "certificateTool":"ssh_certificate",
         "certificateStatusTool":"ssh_certificate_status",
+        "certificateRenewalTool":"renew_ssh_certificate",
         "certificateTtlSeconds":app.config.ssh_certificate_ttl_secs,
         "publicHost":host,
         "publicPort":port,
@@ -628,19 +716,20 @@ impl ToolProvider for GitControlProvider {
     async fn tools(&self) -> anyhow::Result<Vec<Tool>> {
         let mut tools = vec![git_control_tool(
             "repository_access",
-            "Resolve a GitHub repository and begin the required SSH workflow. Reuse an existing local Ed25519 identity from SSH configuration or the SSH agent. Check a saved certificate with ssh_certificate_status and reuse it while valid; otherwise call ssh_certificate with only the existing public key. Store the certificate separately and pass it with CertificateFile. Never send or replace the private key, generate a key automatically, or disable host-key checking. Access is controlled by the GitHub App installation and this client's existing integration authorization.",
-            false,
+            "Resolve a GitHub repository and begin the required SSH workflow. Reuse an existing local Ed25519 identity from SSH configuration or the SSH agent. Check a saved certificate with ssh_certificate_status and reuse it while valid. Use ssh_certificate only for initial enrollment and renew_ssh_certificate with the same public key and previous certificate after expiry. Store the certificate separately and pass it with CertificateFile for clone, fetch, and push. On SSH authentication failure, renew the certificate; never recreate the identity. Never send or replace the private key, generate a key automatically, or disable host-key checking. Access is controlled by the GitHub App installation and this client's existing integration authorization.",
         )];
         if self.app.ssh_keys.is_some() && self.app.ssh_ready.load(Ordering::Acquire) {
             tools.push(git_control_tool(
                 "ssh_certificate_status",
-                "Check whether an existing COG SSH certificate is currently valid for this client, repository, permission grant, and Ed25519 public key. Use this before requesting another certificate. The private key remains local and must never be sent.",
-                false,
+                "Check whether an existing COG SSH certificate is currently valid for this client, repository, permission grant, and Ed25519 public key. Reuse it when valid. When expired, call renew_ssh_certificate with this same public key and previous certificate. The private key remains local and must never be sent or recreated for certificate renewal.",
             ));
             tools.push(git_control_tool(
                 "ssh_certificate",
-                "Issue a short-lived SSH user certificate for an existing local Ed25519 identity. Reuse a key from SSH configuration or the SSH agent and send only its public key. Store the certificate separately and pass it with CertificateFile; never send or replace the private key. Before issuance, use ssh_certificate_status to reuse any saved valid certificate. Renew expired certificates against the same public key.",
-                false,
+                "Initially enroll an existing local Ed25519 identity by issuing a short-lived SSH user certificate. Reuse a key from SSH configuration or the SSH agent and send only its public key. Store the certificate separately and pass it with CertificateFile; never send or replace the private key. Before issuance, use ssh_certificate_status to reuse any saved valid certificate. For an expired certificate use renew_ssh_certificate instead of generating a key or starting over.",
+            ));
+            tools.push(git_control_tool(
+                "renew_ssh_certificate",
+                "Renew a saved COG SSH certificate while preserving its existing Ed25519 identity. Send the exact same public key and the previous certificate; expired certificates are accepted for cryptographic binding validation. Permission is derived from the previous certificate and constrained by the current grant. Replace only the saved certificate file. Never generate, replace, or send the private key.",
             ));
         }
         Ok(tools)
@@ -753,9 +842,10 @@ impl ToolProvider for GitControlProvider {
                     "workflow":[
                         {"step":1,"action":"resolveExistingEd25519Identity","sources":["SSH configuration","SSH agent","standard SSH identity paths"],"privateKeyRemainsLocal":true,"ifUnavailable":"report that an Ed25519 identity must be provisioned; do not generate one automatically"},
                         {"step":2,"action":"checkSavedCertificate","tool":"ssh_certificate_status","arguments":{"repositoryId":repo.id,"publicKey":"existing Ed25519 public key","certificate":"saved COG certificate"},"ifValid":"reuse","ifMissingOrInvalid":"continue"},
-                        {"step":3,"action":"callToolIfNeeded","tool":"ssh_certificate","arguments":{"repositoryId":repo.id,"publicKey":"existing Ed25519 public key","permission":"read or write"}},
-                        {"step":4,"action":"writeOutputs","certificatePath":"<private-certificate-path>","knownHostsPath":"<private-known-hosts-path>","preserveForReuse":true},
-                        {"step":5,"action":"useRemote","remoteField":"sshRemoteUrl","certificateFile":"<private-certificate-path>","strictHostKeyChecking":true}
+                        {"step":3,"action":"initialEnrollmentOnly","tool":"ssh_certificate","arguments":{"repositoryId":repo.id,"publicKey":"existing Ed25519 public key","permission":"read or write"},"when":"no previous COG certificate exists"},
+                        {"step":4,"action":"renewExpiredCertificate","tool":"renew_ssh_certificate","arguments":{"repositoryId":repo.id,"publicKey":"the same existing Ed25519 public key","previousCertificate":"saved COG certificate"},"when":"the saved certificate is expired or SSH authentication fails","prohibitedAction":"generateOrReplaceSshIdentity"},
+                        {"step":5,"action":"writeOutputs","certificatePath":"<private-certificate-path>","knownHostsPath":"<private-known-hosts-path>","preserveForReuse":true},
+                        {"step":6,"action":"useRemote","remoteField":"sshRemoteUrl","operations":["clone","fetch","push"],"certificateFile":"<private-certificate-path>","strictHostKeyChecking":true,"onAuthenticationFailure":"renew the saved certificate with renew_ssh_certificate and retry; never recreate the identity"}
                     ],
                     "remotes":{
                         "version":2,
@@ -814,6 +904,8 @@ impl ToolProvider for GitControlProvider {
                         "valid": false,
                         "repositoryId": repository_id,
                         "action": "renewWithSamePublicKey",
+                        "tool": "renew_ssh_certificate",
+                        "prohibitedAction": "generateOrReplaceSshIdentity",
                     }));
                 };
                 let binding_matches = binding.user_id == self.auth.user
@@ -828,6 +920,8 @@ impl ToolProvider for GitControlProvider {
                         "valid": false,
                         "repositoryId": repository_id,
                         "action": "requestCertificateForSamePublicKey",
+                        "tool": "renew_ssh_certificate",
+                        "prohibitedAction": "generateOrReplaceSshIdentity",
                     }));
                 }
                 Ok(json!({
@@ -839,7 +933,7 @@ impl ToolProvider for GitControlProvider {
                     "action": "reuse",
                 }))
             }
-            "ssh_certificate" => {
+            "ssh_certificate" | "renew_ssh_certificate" => {
                 struct IssuanceGuard {
                     db: Database,
                     metrics: Arc<Metrics>,
@@ -865,6 +959,11 @@ impl ToolProvider for GitControlProvider {
                         }
                     }
                 }
+                let renewing = name == "renew_ssh_certificate";
+                let requested_permission = args
+                    .get("permission")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
                 let mut issuance = IssuanceGuard {
                     db: self.app.db.clone(),
                     metrics: self.app.metrics.clone(),
@@ -874,10 +973,7 @@ impl ToolProvider for GitControlProvider {
                         .get("repositoryId")
                         .and_then(Value::as_str)
                         .map(str::to_owned),
-                    permission: args
-                        .get("permission")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
+                    permission: requested_permission.clone(),
                     success: false,
                 };
                 let keys = self
@@ -893,11 +989,14 @@ impl ToolProvider for GitControlProvider {
                     .get("repositoryId")
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("repositoryId is required"))?;
-                let permission = args
-                    .get("permission")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("permission is required"))?;
-                anyhow::ensure!(matches!(permission, "read" | "write"), "invalid permission");
+                if !renewing {
+                    anyhow::ensure!(
+                        requested_permission
+                            .as_deref()
+                            .is_some_and(|value| matches!(value, "read" | "write")),
+                        "permission is required and must be read or write"
+                    );
+                }
                 let repository = self
                     .app
                     .db
@@ -921,10 +1020,6 @@ impl ToolProvider for GitControlProvider {
                     .db
                     .git_grant_permission(&self.auth.user, &self.auth.client, repository_id)?
                     .ok_or_else(|| anyhow::anyhow!("repository grant not found"))?;
-                anyhow::ensure!(
-                    permission == "read" || granted == "write",
-                    "write access is not granted"
-                );
                 self.app.lease.assert_live()?;
                 anyhow::ensure!(
                     self.app.auth_rate_limit.allow(
@@ -940,6 +1035,38 @@ impl ToolProvider for GitControlProvider {
                         .ok_or_else(|| anyhow::anyhow!("publicKey is required"))?,
                 )?;
                 let now = chrono::Utc::now().timestamp();
+                let permission = if renewing {
+                    let previous_certificate = args
+                        .get("previousCertificate")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| anyhow::anyhow!("previousCertificate is required"))?;
+                    let previous = crate::git::ssh::verify_certificate_for_renewal_with_durable_cas(
+                        previous_certificate,
+                        &self.app.db,
+                        &public_key,
+                        now,
+                    )
+                    .map_err(|error| anyhow::anyhow!(
+                        "previousCertificate is not a renewable COG certificate for this exact publicKey: {error}. Reuse the existing identity; do not generate or substitute a key"
+                    ))?;
+                    anyhow::ensure!(
+                        previous.user_id == self.auth.user
+                            && previous.identity_id == self.auth.identity
+                            && previous.agent_id == self.auth.agent
+                            && previous.client_id == self.auth.client
+                            && previous.integration_id == repository.integration_id
+                            && previous.repository_id == repository_id,
+                        "previousCertificate is bound to a different client or repository; do not generate or substitute an SSH key"
+                    );
+                    previous.permission
+                } else {
+                    requested_permission.expect("validated above")
+                };
+                anyhow::ensure!(
+                    permission == "read" || granted == "write",
+                    "write access is not granted"
+                );
+                issuance.permission = Some(permission.clone());
                 let expires_at = now + self.app.config.ssh_certificate_ttl_secs as i64;
                 let issuance_id = uuid::Uuid::new_v4().to_string();
                 let binding = crate::git::ssh::Binding {
@@ -951,7 +1078,7 @@ impl ToolProvider for GitControlProvider {
                     client_id: self.auth.client.clone(),
                     integration_id: integration.id,
                     repository_id: repository_id.to_owned(),
-                    permission: permission.to_owned(),
+                    permission: permission.clone(),
                     fingerprint: crate::git::ssh::fingerprint(&public_key),
                     issued_at: now,
                     expires_at,
@@ -985,7 +1112,12 @@ impl ToolProvider for GitControlProvider {
                     format!("[{host}]:{port}")
                 };
                 let remote = format!("ssh://git@{host}:{port}/{repository_id}");
-                self.app.db.record_audit(Some(&self.auth.user), "git.ssh_certificate.issue", Some(repository_id), "success", &json!({"identity_id":self.auth.identity,"agent_id":self.auth.agent,"client_id":self.auth.client,"integration_id":repository.integration_id,"permission":permission,"fingerprint":binding.fingerprint,"serial":serial,"expires_at":expires_at}))?;
+                let audit_action = if renewing {
+                    "git.ssh_certificate.renew"
+                } else {
+                    "git.ssh_certificate.issue"
+                };
+                self.app.db.record_audit(Some(&self.auth.user), audit_action, Some(repository_id), "success", &json!({"identity_id":self.auth.identity,"agent_id":self.auth.agent,"client_id":self.auth.client,"integration_id":repository.integration_id,"permission":permission,"fingerprint":binding.fingerprint,"serial":serial,"expires_at":expires_at}))?;
                 persist(&self.app).await?;
                 issuance.success = true;
                 issuance
@@ -995,6 +1127,7 @@ impl ToolProvider for GitControlProvider {
                 Ok(json!({
                     "repositoryId": repository_id,
                     "permission": permission,
+                    "action": if renewing { "renewedExistingIdentity" } else { "enrolledExistingIdentity" },
                     "expiresAt": chrono::DateTime::from_timestamp(expires_at, 0).expect("valid timestamp").to_rfc3339(),
                     "sshRemoteUrl": remote,
                     "certificate": certificate,
@@ -1004,9 +1137,16 @@ impl ToolProvider for GitControlProvider {
                     "certificateOutput": {"path":"<private-certificate-path>","contentsField":"certificate","encoding":"UTF-8","trailingNewline":true,"preserveForReuse":true},
                     "knownHostsOutput": {"path":"<private-known-hosts-path>","contentsField":"knownHosts","encoding":"UTF-8","trailingNewline":true},
                     "gitArguments": ["clone", "--", remote],
+                    "gitOperations": {
+                        "cloneArguments": ["clone", "--", remote],
+                        "fetchArguments": ["fetch", "--all"],
+                        "pushArguments": ["push"],
+                        "sshEnvironment": "Use the same strict SSH options and saved identity for clone, fetch, and push"
+                    },
                     "sshArguments": ["-o","IdentitiesOnly=yes","-o","StrictHostKeyChecking=yes","-o","UserKnownHostsFile=<private-known-hosts-path>","-o","CertificateFile=<private-certificate-path>"],
                     "sshOptions": {"identitiesOnly": true, "strictHostKeyChecking": true, "userKnownHostsFile": "path to the private known_hosts file", "certificateFile": "path to the saved COG certificate", "identitySource": "existing SSH configuration or SSH agent"},
-                    "renewal": {"implicit":false,"checkTool":"ssh_certificate_status","action":"reuse the same public key when requesting a certificate after expiry","privateKeyRemainsLocal":true,"preserveSshMaterial":true}
+                    "authenticationFailureRecovery": {"action":"call renew_ssh_certificate with this same public key and the saved certificate, replace only the certificate file, then retry the Git operation","prohibitedAction":"generateOrReplaceSshIdentity"},
+                    "renewal": {"implicit":false,"tool":"renew_ssh_certificate","checkTool":"ssh_certificate_status","action":"reuse the same public key and previous certificate after expiry","privateKeyRemainsLocal":true,"preserveSshMaterial":true}
                 }))
             }
             _ => anyhow::bail!("unknown Git control operation"),
@@ -7084,7 +7224,25 @@ mod tests {
             .set_git_grant(&user, &auth.client, &repository.id, "write")
             .unwrap();
         let control = GitControlProvider { app, auth };
-        assert_eq!(control.tools().await.unwrap().len(), 3);
+        let tools = control.tools().await.unwrap();
+        assert_eq!(tools.len(), 4);
+        let repository_tool = tools
+            .iter()
+            .find(|tool| tool.name == "repository_access")
+            .unwrap();
+        assert_eq!(repository_tool.extra["annotations"]["readOnlyHint"], false);
+        assert_eq!(repository_tool.extra["annotations"]["openWorldHint"], true);
+        let renewal_tool = tools
+            .iter()
+            .find(|tool| tool.name == "renew_ssh_certificate")
+            .unwrap();
+        assert_eq!(renewal_tool.extra["annotations"]["readOnlyHint"], false);
+        assert!(
+            renewal_tool.input_schema["properties"]["publicKey"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("same")
+        );
         for args in [
             json!({}),
             json!({"repositoryId":repository.id,"permission":"owner"}),
@@ -7126,6 +7284,48 @@ mod tests {
         assert_eq!(status["permission"], "write");
         assert!(status["usableForSeconds"].as_i64().unwrap() > 0);
 
+        let now = chrono::Utc::now().timestamp();
+        let expired_binding = crate::git::ssh::Binding {
+            version: 1,
+            issuance_id: uuid::Uuid::new_v4().to_string(),
+            user_id: control.auth.user.clone(),
+            identity_id: control.auth.identity.clone(),
+            agent_id: control.auth.agent.clone(),
+            client_id: control.auth.client.clone(),
+            integration_id: integration.clone(),
+            repository_id: repository.id.clone(),
+            permission: "write".into(),
+            fingerprint: crate::git::ssh::fingerprint(
+                &crate::git::ssh::parse_public_key(&public_key).unwrap(),
+            ),
+            issued_at: now - 1000,
+            expires_at: now - 100,
+        };
+        let expired_certificate = {
+            let keys = control.app.ssh_keys.as_ref().unwrap().read().unwrap();
+            crate::git::ssh::sign(
+                &keys.user_ca,
+                &crate::git::ssh::parse_public_key(&public_key).unwrap(),
+                &expired_binding,
+                crate::git::ssh::stable_serial(&expired_binding.issuance_id),
+            )
+            .unwrap()
+        };
+        let renewed = control
+            .call(
+                "renew_ssh_certificate",
+                json!({"repositoryId":repository.id,"publicKey":public_key,"previousCertificate":expired_certificate}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(renewed["action"], "renewedExistingIdentity");
+        assert_eq!(renewed["permission"], "write");
+        assert_ne!(renewed["certificate"], issued["certificate"]);
+        assert_eq!(
+            renewed["authenticationFailureRecovery"]["prohibitedAction"],
+            "generateOrReplaceSshIdentity"
+        );
+
         let other_identity = crate::git::ssh::generate_key().unwrap();
         let invalid = control
             .call(
@@ -7136,6 +7336,13 @@ mod tests {
             .unwrap();
         assert_eq!(invalid["valid"], false);
         assert_eq!(invalid["action"], "renewWithSamePublicKey");
+        assert!(control
+            .call(
+                "renew_ssh_certificate",
+                json!({"repositoryId":repository.id,"publicKey":other_identity.public_key().to_openssh().unwrap(),"previousCertificate":issued["certificate"]}),
+            )
+            .await
+            .is_err());
         let mismatched = GitControlProvider {
             app: control.app.clone(),
             auth: AuthContext {
@@ -9943,14 +10150,45 @@ mod tests {
             .await
             .unwrap()
             .into_iter()
-            .map(|tool| tool.name)
-            .collect::<Vec<_>>();
-        assert!(names.contains(&"integrations_list".into()));
-        assert!(!names.contains(&"integration_delete".into()));
+            .map(|tool| (tool.name, tool.extra))
+            .collect::<HashMap<_, _>>();
+        assert!(names.contains_key("integrations_list"));
+        assert!(names.contains_key("integration_delete"));
+        assert_eq!(
+            names["integration_delete"]["x-cog-clientAccessGranted"],
+            false
+        );
+        assert_eq!(
+            names["integration_delete"]["x-cog-requiredScope"],
+            "integrations:write"
+        );
         assert!(
             read.call("integration_delete", json!({"id":id}))
                 .await
-                .is_err()
+                .unwrap_err()
+                .downcast_ref::<crate::authz::InsufficientScope>()
+                .is_some()
+        );
+        let mut code_catalog = Catalog::new();
+        code_catalog.add_labeled(
+            "cog".into(),
+            "Clanker Operations Gateway administration".into(),
+            Arc::new(AdminProvider {
+                app: app.clone(),
+                auth: read.auth.clone(),
+            }),
+        );
+        let discovered = code_catalog.search("integration_delete").await.unwrap();
+        assert_eq!(discovered[0]["target"], "cog.integration_delete");
+        assert_eq!(discovered[0]["clientAccessGranted"], false);
+        assert_eq!(discovered[0]["requiredScope"], "integrations:write");
+        assert!(
+            code_catalog
+                .call("cog.integration_delete", json!({"id":id}))
+                .await
+                .unwrap_err()
+                .downcast_ref::<crate::authz::InsufficientScope>()
+                .is_some()
         );
         let value = read
             .call("integration_get", json!({"id":id}))
@@ -10156,6 +10394,8 @@ mod tests {
             create.input_schema["required"],
             json!(["name", "transport", "config"])
         );
+        let audit = admin_tool("audit_list", "Read recent audit events.");
+        assert_eq!(audit.input_schema["properties"]["limit"]["maximum"], 1000);
         assert_eq!(
             native_admin_scope("cog_integration_create"),
             Some("integrations:write")

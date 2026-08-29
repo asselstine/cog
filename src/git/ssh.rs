@@ -221,6 +221,37 @@ pub fn verify_certificate(
             [&ca_fingerprint],
         )
         .map_err(|_| anyhow::anyhow!("SSH certificate verification failed"))?;
+    let binding = verify_certificate_fields(&certificate, subject)?;
+    anyhow::ensure!(binding.issued_at <= now, "SSH certificate is not yet valid");
+    anyhow::ensure!(binding.expires_at > now, "SSH certificate has expired");
+    Ok(binding)
+}
+
+/// Verify a previously issued COG certificate without requiring it to still
+/// be inside its validity window. This is only for renewal: the signature,
+/// durable CA, subject key, and signed binding are still fully checked.
+pub fn verify_certificate_for_renewal(
+    encoded: &str,
+    ca: &PublicKey,
+    subject: &PublicKey,
+) -> anyhow::Result<Binding> {
+    let certificate = ssh_key::Certificate::from_openssh(encoded)
+        .map_err(|_| anyhow::anyhow!("invalid OpenSSH certificate"))?;
+    anyhow::ensure!(
+        certificate.valid_before() > certificate.valid_after(),
+        "SSH certificate validity window is invalid"
+    );
+    let ca_fingerprint = ca.fingerprint(ssh_key::HashAlg::Sha256);
+    certificate
+        .validate_at(certificate.valid_after(), [&ca_fingerprint])
+        .map_err(|_| anyhow::anyhow!("SSH certificate verification failed"))?;
+    verify_certificate_fields(&certificate, subject)
+}
+
+fn verify_certificate_fields(
+    certificate: &ssh_key::Certificate,
+    subject: &PublicKey,
+) -> anyhow::Result<Binding> {
     anyhow::ensure!(
         certificate.cert_type() == certificate::CertType::User,
         "SSH certificate is not a user certificate"
@@ -238,8 +269,19 @@ pub fn verify_certificate(
         "SSH certificate contains unsupported permissions"
     );
     let binding = decode_binding(certificate.key_id())?;
-    anyhow::ensure!(binding.issued_at <= now, "SSH certificate is not yet valid");
-    anyhow::ensure!(binding.expires_at > now, "SSH certificate has expired");
+    anyhow::ensure!(
+        binding.issued_at < binding.expires_at,
+        "SSH certificate binding validity window is invalid"
+    );
+    let bound_valid_after = u64::try_from(binding.issued_at.saturating_sub(30))
+        .map_err(|_| anyhow::anyhow!("SSH certificate binding start time is invalid"))?;
+    let bound_valid_before = u64::try_from(binding.expires_at)
+        .map_err(|_| anyhow::anyhow!("SSH certificate binding expiry time is invalid"))?;
+    anyhow::ensure!(
+        certificate.valid_after() == bound_valid_after
+            && certificate.valid_before() == bound_valid_before,
+        "SSH certificate validity does not match its binding"
+    );
     anyhow::ensure!(
         binding.fingerprint == fingerprint(subject),
         "SSH certificate fingerprint binding does not match"
@@ -269,6 +311,27 @@ pub fn verify_certificate_with_durable_cas(
         let ca = PublicKey::from_openssh(&record.public_key)
             .map_err(|_| anyhow::anyhow!("durable SSH CA public key is unreadable"))?;
         match verify_certificate(encoded, &ca, subject, now) {
+            Ok(binding) => return Ok(binding),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no valid SSH user CA is available")))
+}
+
+pub fn verify_certificate_for_renewal_with_durable_cas(
+    encoded: &str,
+    db: &Database,
+    subject: &PublicKey,
+    now: i64,
+) -> anyhow::Result<Binding> {
+    let mut last_error = None;
+    for record in db.ssh_keys()?.into_iter().filter(|record| {
+        record.purpose == "user_ca"
+            && (record.active || record.retirement_time.is_some_and(|until| until > now))
+    }) {
+        let ca = PublicKey::from_openssh(&record.public_key)
+            .map_err(|_| anyhow::anyhow!("durable SSH CA public key is unreadable"))?;
+        match verify_certificate_for_renewal(encoded, &ca, subject) {
             Ok(binding) => return Ok(binding),
             Err(error) => last_error = Some(error),
         }
@@ -433,6 +496,19 @@ mod tests {
         );
         assert!(
             verify_certificate(&encoded, ca.public_key(), subject.public_key(), now + 901).is_err()
+        );
+        assert_eq!(
+            verify_certificate_for_renewal(&encoded, ca.public_key(), subject.public_key())
+                .unwrap(),
+            binding
+        );
+        assert!(
+            verify_certificate_for_renewal(
+                &encoded,
+                ca.public_key(),
+                generate_key().unwrap().public_key()
+            )
+            .is_err()
         );
     }
 
