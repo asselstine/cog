@@ -2400,6 +2400,106 @@ mod tests {
     }
 
     #[test]
+    fn identity_agent_grant_audit_and_empty_getter_lifecycles() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lifecycle.db");
+        let db = Database::open(&path).unwrap();
+        let user = db.create_user("lifecycle@example.com", "hash").unwrap();
+        let other = db.create_user("other@example.com", "hash").unwrap();
+        let identity = db.create_identity(&user, "Primary").unwrap();
+        assert!(db.identity(&user, &identity).unwrap().is_some());
+        assert!(db.identity(&other, &identity).unwrap().is_none());
+        assert!(db.rename_identity(&user, &identity, "Renamed").unwrap());
+        assert!(!db.rename_identity(&other, &identity, "Nope").unwrap());
+        assert!(db.create_identity(&user, "  ").is_err());
+        db.register_client(
+            "lifecycle-client",
+            None,
+            "Lifecycle Agent",
+            &["http://localhost/cb".into()],
+        )
+        .unwrap();
+        assert!(
+            db.bind_agent(&other, &identity, "lifecycle-client")
+                .is_err()
+        );
+        let agent = db.bind_agent(&user, &identity, "lifecycle-client").unwrap();
+        assert_eq!(
+            db.bind_agent(&user, &identity, "lifecycle-client")
+                .unwrap()
+                .id,
+            agent.id
+        );
+        assert_eq!(
+            db.agent_for_client("lifecycle-client").unwrap().unwrap().id,
+            agent.id
+        );
+        assert_eq!(db.agents_for_identity(&user, &identity).unwrap().len(), 1);
+        assert!(db.rename_agent(&user, &agent.id, "Owner Name").unwrap());
+        assert!(db.rename_self(&agent.id, "Self Name").unwrap());
+        assert!(!db.rename_self("missing", "Nope").unwrap());
+        db.set_identity_grants(
+            &user,
+            &identity,
+            &["integration:one".into(), "git:repo:write".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            db.identity_grants(&user, &identity).unwrap(),
+            ["git:repo:write", "integration:one", "mcp"]
+        );
+        assert_eq!(
+            db.client_granted_scopes(&user, "lifecycle-client").unwrap(),
+            ["git:repo:write", "integration:one", "mcp"]
+        );
+        assert!(db.identity_grants(&other, &identity).unwrap().is_empty());
+        assert!(db.set_identity_grants(&other, &identity, &[]).is_err());
+        assert!(
+            db.client_granted_scopes(&user, "missing")
+                .unwrap()
+                .is_empty()
+        );
+        db.record_audit(
+            Some(&user),
+            "first",
+            Some(&identity),
+            "success",
+            &serde_json::json!({"n":1}),
+        )
+        .unwrap();
+        db.record_audit(
+            Some(&other),
+            "second",
+            None,
+            "failure",
+            &serde_json::json!({"n":2}),
+        )
+        .unwrap();
+        assert_eq!(
+            db.audit_events_for_user(&user, 1).unwrap()[0].action,
+            "first"
+        );
+        let integration = db
+            .create_integration(&user, "Provider", "http", &serde_json::json!({}), None)
+            .unwrap();
+        assert_eq!(
+            db.integration_scopes().unwrap(),
+            [format!("integration:{integration}")]
+        );
+        assert!(db.delete_identity(&user, &identity).unwrap());
+        assert!(!db.delete_identity(&user, &identity).unwrap());
+        drop(db);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE cog_meta SET value='future' WHERE key='storage_mode'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(Database::inspect_storage_mode(&path).is_err());
+    }
+
+    #[test]
     fn legacy_schema_requires_explicit_clean_initialization() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("legacy.sqlite");
@@ -2480,12 +2580,46 @@ mod tests {
         );
         db.set_git_grant(&user, "client", &repository.id, "write")
             .unwrap();
+        db.touch_git_grant(&user, "client", &repository.id, now + 1)
+            .unwrap();
+        let grants = db.list_git_grants(&user, "client").unwrap();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].permission, "write");
+        assert_eq!(grants[0].last_used_at, Some(now + 1));
+        let all = db.all_git_grants(&user).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0]["repository_id"], repository.id);
+        assert!(
+            db.set_git_grant(&user, "client", &repository.id, "owner")
+                .is_err()
+        );
+        assert!(
+            db.create_git_pending_request(
+                &user,
+                "client",
+                &integration,
+                &repository.id,
+                "owner",
+                60
+            )
+            .is_err()
+        );
+        assert!(
+            db.consume_git_pending_requests(&user, "client", &["not-hex".into()], now)
+                .is_err()
+        );
         db.revoke_git_grant(&user, "client", &repository.id)
             .unwrap();
         assert!(
             db.git_grant_permission(&user, "client", &repository.id)
                 .unwrap()
                 .is_none()
+        );
+        assert!(db.list_git_grants(&user, "client").unwrap().is_empty());
+        assert!(db.all_git_grants(&user).unwrap().is_empty());
+        assert!(
+            !db.revoke_git_grant(&user, "missing", &repository.id)
+                .unwrap()
         );
         assert!(db.delete_integration(&integration, &user).unwrap());
         assert!(db.git_repository(&repository.id).unwrap().is_none());
@@ -2639,5 +2773,101 @@ mod tests {
             .query_row("SELECT version FROM schema_meta", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, 2);
+    }
+
+    #[test]
+    fn token_lookup_rotation_boundaries_and_full_integration_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("tokens.db")).unwrap();
+        let user = db.create_user("tokens@example.com", "hash").unwrap();
+        db.register_client(
+            "token-client",
+            Some(&user),
+            "Token client",
+            &["http://localhost/callback".into()],
+        )
+        .unwrap();
+        db.store_access_token(
+            b"access-one",
+            "token-client",
+            &user,
+            "mcp agents:read",
+            200,
+            Some(b"refresh-one"),
+            Some(300),
+        )
+        .unwrap();
+        assert_eq!(
+            db.token_user(b"access-one", 100).unwrap(),
+            Some(user.clone())
+        );
+        assert!(db.token_user(b"access-one", 200).unwrap().is_none());
+        assert_eq!(
+            db.token_user_for_scope(b"access-one", 100, "agents:read")
+                .unwrap(),
+            Some(user.clone())
+        );
+        assert!(
+            db.token_user_for_scope(b"access-one", 100, "agents:write")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.token_user_for_scope(b"missing", 100, "mcp")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            db.token_user_and_scope(b"access-one", 100).unwrap(),
+            Some((user.clone(), "mcp agents:read".into()))
+        );
+        assert!(db.token_user_and_scope(b"missing", 100).unwrap().is_none());
+        assert!(
+            db.rotate_refresh_token(
+                b"refresh-one",
+                "wrong-client",
+                100,
+                b"access-two",
+                400,
+                b"refresh-two",
+                500,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(db.token_user(b"access-one", 100).unwrap().is_none());
+
+        let integration = db
+            .create_integration(
+                &user,
+                "Before",
+                "http",
+                &serde_json::json!({"url":"http://before.example"}),
+                None,
+            )
+            .unwrap();
+        db.update_integration(
+            &integration,
+            &user,
+            Some("After"),
+            Some(&serde_json::json!({"url":"http://after.example"})),
+            Some(false),
+            Some("sealed-secret"),
+        )
+        .unwrap();
+        let updated = db.integration(&integration, &user).unwrap().unwrap();
+        assert_eq!(updated.name, "After");
+        assert!(!updated.enabled);
+        assert_eq!(updated.config["url"], "http://after.example");
+        assert_eq!(
+            db.integration_secret(&integration, &user)
+                .unwrap()
+                .as_deref(),
+            Some("sealed-secret")
+        );
+        assert!(
+            db.update_integration("missing", &user, None, None, None, None)
+                .is_err()
+        );
     }
 }

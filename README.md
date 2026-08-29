@@ -176,7 +176,7 @@ Measure coverage with:
 cargo llvm-cov --all-targets --summary-only
 ```
 
-CI requires 95% line coverage. The full CI sequence, including the instrumented MinIO process and takeover tests, currently measures 95.02% first-party line coverage.
+CI requires 95% line coverage. The full CI sequence, including the instrumented MinIO process and takeover tests, currently measures 95.25% first-party line coverage.
 
 ## Deeper description
 

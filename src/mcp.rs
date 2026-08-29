@@ -242,7 +242,231 @@ pub fn insufficient_scope_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::upstream::{Tool, ToolProvider};
+    use async_trait::async_trait;
     use proptest::prelude::*;
+
+    struct NativeFixture;
+    #[async_trait]
+    impl ToolProvider for NativeFixture {
+        async fn tools(&self) -> anyhow::Result<Vec<Tool>> {
+            Ok(vec![
+                Tool {
+                    name: "repository_access".into(),
+                    description: None,
+                    input_schema: json!({}),
+                    extra: serde_json::Map::new(),
+                },
+                Tool {
+                    name: "object".into(),
+                    description: None,
+                    input_schema: json!({}),
+                    extra: serde_json::Map::new(),
+                },
+                Tool {
+                    name: "scalar".into(),
+                    description: None,
+                    input_schema: json!({}),
+                    extra: serde_json::Map::new(),
+                },
+                Tool {
+                    name: "scope".into(),
+                    description: None,
+                    input_schema: json!({}),
+                    extra: serde_json::Map::new(),
+                },
+            ])
+        }
+        async fn call(&self, name: &str, _args: Value) -> anyhow::Result<Value> {
+            match name {
+                "object" | "repository_access" => Ok(json!({"ok": true})),
+                "scalar" => Ok(json!(7)),
+                "scope" => Err(InsufficientScope::one("integration:fixture").into()),
+                _ => anyhow::bail!("fixture failure"),
+            }
+        }
+    }
+
+    async fn request(
+        method: &str,
+        params: Value,
+        codemode: bool,
+        catalog: Arc<Catalog>,
+    ) -> RpcResponse {
+        handle_with_options(
+            RpcRequest {
+                jsonrpc: "2.0".into(),
+                id: Some(json!(1)),
+                method: method.into(),
+                params,
+            },
+            Arc::new(CodeRuntime::new(16, std::time::Duration::from_secs(1))),
+            catalog,
+            "/metadata",
+            codemode,
+        )
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn validation_native_calls_and_error_shapes() {
+        let mut fixture = Catalog::new();
+        fixture.add("git".into(), Arc::new(NativeFixture));
+        fixture.add("cog".into(), Arc::new(NativeFixture));
+        let fixture = Arc::new(fixture);
+
+        let invalid = handle(
+            RpcRequest {
+                jsonrpc: "1.0".into(),
+                id: None,
+                method: "ping".into(),
+                params: json!({}),
+            },
+            Arc::new(CodeRuntime::new(16, std::time::Duration::from_secs(1))),
+            fixture.clone(),
+        )
+        .await;
+        assert_eq!(invalid.error.unwrap()["code"], -32600);
+        for params in [
+            json!({}),
+            json!({"protocolVersion":1,"capabilities":{},"clientInfo":{}}),
+        ] {
+            assert_eq!(
+                request("initialize", params, true, fixture.clone())
+                    .await
+                    .error
+                    .unwrap()["code"],
+                -32602
+            );
+        }
+        assert_eq!(
+            request(
+                "initialize",
+                json!({"protocolVersion":"future","capabilities":{},"clientInfo":{}}),
+                true,
+                fixture.clone()
+            )
+            .await
+            .result
+            .unwrap()["protocolVersion"],
+            LATEST_PROTOCOL_VERSION
+        );
+        assert!(
+            request("ping", json!({}), true, fixture.clone())
+                .await
+                .result
+                .is_some()
+        );
+        assert!(
+            request(
+                "notifications/initialized",
+                json!({}),
+                true,
+                fixture.clone()
+            )
+            .await
+            .result
+            .is_some()
+        );
+        assert_eq!(
+            request("missing", json!({}), true, fixture.clone())
+                .await
+                .error
+                .unwrap()["code"],
+            -32601
+        );
+        assert_eq!(
+            request("tools/call", json!({}), true, fixture.clone())
+                .await
+                .error
+                .unwrap()["message"],
+            "tool name is required"
+        );
+        assert_eq!(
+            request(
+                "tools/call",
+                json!({"name":"missing"}),
+                true,
+                fixture.clone()
+            )
+            .await
+            .error
+            .unwrap()["message"],
+            "unknown tool"
+        );
+        assert_eq!(
+            request(
+                "tools/call",
+                json!({"name":"execute"}),
+                true,
+                fixture.clone()
+            )
+            .await
+            .error
+            .unwrap()["message"],
+            "code is required"
+        );
+
+        let listed = request("tools/list", json!({}), false, fixture.clone())
+            .await
+            .result
+            .unwrap();
+        assert!(listed["tools"].as_array().unwrap().len() >= 7);
+        for (name, expected) in [
+            ("repository_access", json!({"ok":true})),
+            ("cog_scalar", json!(7)),
+        ] {
+            let response = request(
+                "tools/call",
+                json!({"name":name,"arguments":{}}),
+                false,
+                fixture.clone(),
+            )
+            .await
+            .result
+            .unwrap();
+            assert_eq!(
+                response["structuredContent"],
+                if expected.is_object() {
+                    expected
+                } else {
+                    json!({"result":expected})
+                }
+            );
+        }
+        let scoped = request(
+            "tools/call",
+            json!({"name":"cog_scope"}),
+            false,
+            fixture.clone(),
+        )
+        .await
+        .result
+        .unwrap();
+        assert_eq!(scoped["structuredContent"]["error"], "insufficient_scope");
+        assert_eq!(
+            scoped["structuredContent"]["requiredScopes"],
+            json!(["mcp", "integration:fixture"])
+        );
+        let execute_scoped = request(
+            "tools/call",
+            json!({"name":"execute","arguments":{"code":"return codemode.call('cog.scope',{});"}}),
+            true,
+            fixture.clone(),
+        )
+        .await
+        .result
+        .unwrap();
+        assert_eq!(
+            execute_scoped["structuredContent"]["requiredScopes"],
+            json!(["mcp", "integration:fixture"])
+        );
+        let failed = request("tools/call", json!({"name":"cog_missing"}), false, fixture)
+            .await
+            .result
+            .unwrap();
+        assert_eq!(failed["isError"], true);
+    }
     #[tokio::test(flavor = "multi_thread")]
     async fn protocol() {
         let rt = Arc::new(CodeRuntime::new(16, std::time::Duration::from_secs(2)));

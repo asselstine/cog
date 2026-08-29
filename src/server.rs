@@ -1160,6 +1160,7 @@ struct App {
     ssh_keys: Option<Arc<std::sync::RwLock<crate::git::ssh::KeySet>>>,
     ssh_ready: Arc<AtomicBool>,
     ssh_connections: Arc<tokio::sync::Semaphore>,
+    github_api_base: url::Url,
 }
 
 #[derive(Clone)]
@@ -1399,6 +1400,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         ssh_keys: None,
         ssh_ready: Arc::new(AtomicBool::new(false)),
         ssh_connections: Arc::new(tokio::sync::Semaphore::new(config.ssh_max_connections)),
+        github_api_base: "https://api.github.com/"
+            .parse()
+            .expect("valid GitHub API URL"),
     };
     let ssh_listener = if let Some(address) = config.ssh_listen {
         let keys = Arc::new(std::sync::RwLock::new(
@@ -5066,11 +5070,15 @@ async fn github_app_manifest_callback(
     };
     let encoded_code =
         url::form_urlencoded::byte_serialize(query.code.as_bytes()).collect::<String>();
+    let conversion_url = match a
+        .github_api_base
+        .join(&format!("app-manifests/{encoded_code}/conversions"))
+    {
+        Ok(url) => url,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
     let response = match client
-        .post(format!(
-            "https://api.github.com/app-manifests/{}/conversions",
-            encoded_code
-        ))
+        .post(conversion_url)
         .header(header::ACCEPT, "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28")
         .send()
@@ -6634,6 +6642,7 @@ mod tests {
             ssh_keys: None,
             ssh_ready: Arc::new(AtomicBool::new(false)),
             ssh_connections: Arc::new(tokio::sync::Semaphore::new(64)),
+            github_api_base: "https://api.github.com/".parse().unwrap(),
         };
         let user = db.create_user("owner@example.com", "hash").unwrap();
         let missing = auth_failure(&app, AuthFailure::Missing, "mcp");
@@ -6830,6 +6839,31 @@ mod tests {
         assert!(!request.to_ascii_lowercase().contains("cookie:"));
     }
 
+    #[tokio::test]
+    async fn local_callback_indeterminate_response_boundaries() {
+        for response in [
+            b"HTTP/1.1 500 Nope\r\nContent-Length: 0\r\n\r\n".to_vec(),
+            b"not-http\r\n\r\n".to_vec(),
+            vec![b'x'; 17 * 1024],
+        ] {
+            let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let receiver = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 2048];
+                let _ = stream.read(&mut request).await.unwrap();
+                stream.write_all(&response).await.unwrap();
+            });
+            let callback =
+                url::Url::parse(&format!("http://[::1]:{}/callback", address.port())).unwrap();
+            assert_eq!(
+                deliver_loopback_callback(&callback).await,
+                CallbackDelivery::Indeterminate
+            );
+            receiver.await.unwrap();
+        }
+    }
+
     async fn route_test_app() -> (App, tempfile::TempDir) {
         let directory = tempfile::tempdir().unwrap();
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -6898,6 +6932,7 @@ mod tests {
                 ssh_keys: None,
                 ssh_ready: Arc::new(AtomicBool::new(false)),
                 ssh_connections: Arc::new(tokio::sync::Semaphore::new(64)),
+                github_api_base: "https://api.github.com/".parse().unwrap(),
             },
             directory,
         )
@@ -7049,6 +7084,21 @@ mod tests {
             .set_git_grant(&user, &auth.client, &repository.id, "write")
             .unwrap();
         let control = GitControlProvider { app, auth };
+        assert_eq!(control.tools().await.unwrap().len(), 3);
+        for args in [
+            json!({}),
+            json!({"repositoryId":repository.id,"permission":"owner"}),
+            json!({"repositoryId":"missing","permission":"read","publicKey":"bad"}),
+        ] {
+            assert!(control.call("ssh_certificate", args).await.is_err());
+        }
+        assert!(
+            control
+                .call("ssh_certificate_status", json!({}))
+                .await
+                .is_err()
+        );
+        assert!(control.call("unknown", json!({})).await.is_err());
         let identity = crate::git::ssh::generate_key().unwrap();
         let public_key = identity.public_key().to_openssh().unwrap();
         let issued = control
@@ -7086,6 +7136,29 @@ mod tests {
             .unwrap();
         assert_eq!(invalid["valid"], false);
         assert_eq!(invalid["action"], "renewWithSamePublicKey");
+        let mismatched = GitControlProvider {
+            app: control.app.clone(),
+            auth: AuthContext {
+                agent: "different-agent".into(),
+                ..control.auth.clone()
+            },
+        }
+        .call(
+            "ssh_certificate_status",
+            json!({"repositoryId":repository.id,"publicKey":public_key,"certificate":issued["certificate"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(mismatched["action"], "requestCertificateForSamePublicKey");
+        let denied = GitControlProvider {
+            app: control.app.clone(),
+            auth: AuthContext {
+                scopes: HashSet::new(),
+                integrations: HashSet::new(),
+                ..control.auth.clone()
+            },
+        };
+        assert!(denied.call("ssh_certificate_status", json!({"repositoryId":repository.id,"publicKey":public_key,"certificate":issued["certificate"]})).await.unwrap_err().downcast_ref::<crate::authz::InsufficientScope>().is_some());
     }
 
     #[test]
@@ -7098,6 +7171,7 @@ mod tests {
             "mcp integrations:write"
         );
         assert_eq!(selected_scopes("mcp admin", &HashMap::new()), "mcp");
+        assert_eq!(permission_copy("custom:scope", None).0, "custom:scope");
     }
 
     #[test]
@@ -7111,6 +7185,321 @@ mod tests {
             selected_scopes(requested, &fields),
             "mcp audit:read integration:cloudflare"
         );
+    }
+
+    #[tokio::test]
+    async fn consent_get_and_post_validation_matrix() {
+        let (app, _directory) = route_test_app().await;
+        let user = app
+            .db
+            .create_user("consent-matrix@example.com", "hash")
+            .unwrap();
+        let other = app
+            .db
+            .create_user("consent-other@example.com", "hash")
+            .unwrap();
+        app.db
+            .register_client(
+                "consent-client",
+                None,
+                "Consent Client",
+                &["http://localhost/callback".into()],
+            )
+            .unwrap();
+        let session = "consent-session";
+        let csrf = "consent-csrf";
+        app.db
+            .create_session(
+                &token_hash(session),
+                &user,
+                &token_hash(csrf),
+                chrono::Utc::now().timestamp() + 600,
+            )
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::COOKIE,
+            format!("cog_session={session}; cog_csrf={csrf}")
+                .parse()
+                .unwrap(),
+        );
+        headers.insert(
+            http::header::ORIGIN,
+            "http://localhost:4788".parse().unwrap(),
+        );
+        let valid = || Authorize {
+            response_type: response_code(),
+            client_id: "consent-client".into(),
+            redirect_uri: "http://localhost/callback".into(),
+            state: "state".into(),
+            code_challenge: "challenge".into(),
+            code_challenge_method: challenge_s256(),
+            scope: scope_mcp(),
+            resource: "http://localhost:4788/mcp".into(),
+        };
+        let mut wrong = valid();
+        wrong.response_type = "token".into();
+        assert_eq!(
+            authorize_consent(State(app.clone()), headers.clone(), Query(wrong))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let mut wrong = valid();
+        wrong.resource = "https://other.example/mcp".into();
+        assert_eq!(
+            authorize_consent(State(app.clone()), headers.clone(), Query(wrong))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let mut wrong = valid();
+        wrong.client_id = "missing".into();
+        assert_eq!(
+            authorize_consent(State(app.clone()), headers.clone(), Query(wrong))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let mut wrong = valid();
+        wrong.redirect_uri = "http://localhost/other".into();
+        assert_eq!(
+            authorize_consent(State(app.clone()), headers.clone(), Query(wrong))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            authorize_consent(State(app.clone()), HeaderMap::new(), Query(valid()))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let mut no_csrf = headers.clone();
+        no_csrf.insert(
+            http::header::COOKIE,
+            format!("cog_session={session}").parse().unwrap(),
+        );
+        assert_eq!(
+            authorize_consent(State(app.clone()), no_csrf, Query(valid()))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let mut empty = valid();
+        empty.scope.clear();
+        assert_eq!(
+            authorize_consent(State(app.clone()), headers.clone(), Query(empty))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let consent = ConsentRequest {
+            response_type: "code".into(),
+            client_id: "consent-client".into(),
+            redirect_uri: "http://localhost/callback".into(),
+            state: "state".into(),
+            code_challenge: "challenge".into(),
+            code_challenge_method: "S256".into(),
+            requested_scope: "mcp integrations:read".into(),
+            resource: "http://localhost:4788/mcp".into(),
+            user: user.clone(),
+            allowed_identity_ids: Vec::new(),
+            fixed_identity_id: None,
+            expires_at: chrono::Utc::now().timestamp() + 600,
+            git_pending_ids: Vec::new(),
+        };
+        let seal = |consent: &ConsentRequest| {
+            app.secrets
+                .seal(&serde_json::to_vec(consent).unwrap())
+                .unwrap()
+        };
+        let form = |sealed: String, decision: &str, fields: HashMap<String, String>| ConsentForm {
+            consent: sealed,
+            csrf_token: csrf.into(),
+            decision: decision.into(),
+            fields,
+        };
+        assert_eq!(
+            authorize_post(
+                State(app.clone()),
+                headers.clone(),
+                Form(form("invalid".into(), "allow", HashMap::new()))
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let mut expired = ConsentRequest { ..consent };
+        expired.expires_at = 0;
+        assert_eq!(
+            authorize_post(
+                State(app.clone()),
+                headers.clone(),
+                Form(form(seal(&expired), "allow", HashMap::new()))
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        expired.expires_at = chrono::Utc::now().timestamp() + 600;
+        let mut bad_origin = headers.clone();
+        bad_origin.insert(
+            http::header::ORIGIN,
+            "https://evil.example".parse().unwrap(),
+        );
+        assert_eq!(
+            authorize_post(
+                State(app.clone()),
+                bad_origin,
+                Form(form(seal(&expired), "allow", HashMap::new()))
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        let mut wrong_csrf = form(seal(&expired), "allow", HashMap::new());
+        wrong_csrf.csrf_token = "wrong".into();
+        assert_eq!(
+            authorize_post(State(app.clone()), headers.clone(), Form(wrong_csrf))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        expired.user = other;
+        assert_eq!(
+            authorize_post(
+                State(app.clone()),
+                headers.clone(),
+                Form(form(seal(&expired), "allow", HashMap::new()))
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        expired.user = user;
+        assert_eq!(
+            authorize_post(
+                State(app.clone()),
+                headers.clone(),
+                Form(form(seal(&expired), "maybe", HashMap::new()))
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            authorize_post(
+                State(app.clone()),
+                headers.clone(),
+                Form(form(seal(&expired), "allow", HashMap::new()))
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let mut unavailable = HashMap::new();
+        unavailable.insert("identity_id".into(), "missing".into());
+        assert_eq!(
+            authorize_post(
+                State(app.clone()),
+                headers,
+                Form(form(seal(&expired), "allow", unavailable))
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_http_origin_version_and_incremental_scope_boundaries() {
+        let (app, _directory) = route_test_app().await;
+        let user = app
+            .db
+            .create_user("mcp-boundary@example.com", "hash")
+            .unwrap();
+        app.db
+            .register_client(
+                "mcp-boundary",
+                Some(&user),
+                "MCP",
+                &["http://localhost/callback".into()],
+            )
+            .unwrap();
+        app.db
+            .store_access_token(
+                &token_hash("mcp-boundary-token"),
+                "mcp-boundary",
+                &user,
+                "mcp",
+                chrono::Utc::now().timestamp() + 600,
+                None,
+                None,
+            )
+            .unwrap();
+        let integration = app
+            .db
+            .create_integration(
+                &user,
+                "Fixture",
+                "http",
+                &json!({"url":"http://localhost:9999/mcp"}),
+                None,
+            )
+            .unwrap();
+        let router = build_router(app);
+        let rpc = |body: Value| {
+            Request::post("/mcp")
+                .header(http::header::AUTHORIZATION, "Bearer mcp-boundary-token")
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let mut request = rpc(json!({"jsonrpc":"2.0","id":1,"method":"ping"}));
+        request.headers_mut().insert(
+            http::header::ORIGIN,
+            "https://evil.example".parse().unwrap(),
+        );
+        assert_eq!(
+            router.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        let mut request = rpc(json!({"jsonrpc":"2.0","id":1,"method":"ping"}));
+        request
+            .headers_mut()
+            .insert("MCP-Protocol-Version", "1900-01-01".parse().unwrap());
+        assert_eq!(
+            router.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+        let response = router.clone().oneshot(Request::post("/mcp?codemode=false").header(http::header::AUTHORIZATION, "Bearer mcp-boundary-token").header(http::header::CONTENT_TYPE, "application/json").body(Body::from(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cog_integration_create","arguments":{}}}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            response
+                .headers()
+                .contains_key(http::header::WWW_AUTHENTICATE)
+        );
+        let response = router.clone().oneshot(rpc(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"execute","arguments":{"code":format!("return codemode.describe('{integration}.tool');")}}}))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = router.oneshot(rpc(json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"execute","arguments":{"code":"return undefined;"}}}))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await["result"]["isError"], true);
     }
 
     #[tokio::test]
@@ -8319,6 +8708,419 @@ mod tests {
         token_server.abort();
     }
 
+    #[tokio::test]
+    async fn ui_mutation_success_and_failure_matrix() {
+        let (app, _directory) = route_test_app().await;
+        let user = app.db.create_user("ui-matrix@example.com", "hash").unwrap();
+        let session = "ui-matrix-session";
+        let csrf = "ui-matrix-csrf";
+        app.db
+            .create_session(
+                &token_hash(session),
+                &user,
+                &token_hash(csrf),
+                chrono::Utc::now().timestamp() + 600,
+            )
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::ORIGIN,
+            "http://localhost:4788".parse().unwrap(),
+        );
+        headers.insert(
+            http::header::COOKIE,
+            format!("cog_session={session}; cog_csrf={csrf}")
+                .parse()
+                .unwrap(),
+        );
+        let name = |value: &str| UiNameForm {
+            name: value.into(),
+            csrf_token: csrf.into(),
+        };
+        let csrf_form = || CsrfForm {
+            csrf_token: csrf.into(),
+        };
+
+        assert_eq!(
+            ui_create_identity(State(app.clone()), headers.clone(), Form(name("work")))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            ui_create_identity(State(app.clone()), headers.clone(), Form(name(" ")))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let identity = app
+            .db
+            .list_identities(&user)
+            .unwrap()
+            .into_iter()
+            .find(|identity| identity.name == "work")
+            .unwrap();
+        assert_eq!(
+            ui_rename_identity(
+                State(app.clone()),
+                Path(identity.id.clone()),
+                headers.clone(),
+                Form(name("renamed")),
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        for (id, value, expected) in [
+            (identity.id.as_str(), "", StatusCode::BAD_REQUEST),
+            ("missing", "name", StatusCode::NOT_FOUND),
+        ] {
+            assert_eq!(
+                ui_rename_identity(
+                    State(app.clone()),
+                    Path(id.to_owned()),
+                    headers.clone(),
+                    Form(name(value)),
+                )
+                .await
+                .into_response()
+                .status(),
+                expected
+            );
+        }
+        assert_eq!(
+            ui_delete_identity(
+                State(app.clone()),
+                Path("missing".into()),
+                headers.clone(),
+                Form(csrf_form()),
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            ui_delete_identity(
+                State(app.clone()),
+                Path(identity.id),
+                headers.clone(),
+                Form(csrf_form()),
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+
+        app.db
+            .register_client(
+                "matrix-client",
+                Some(&user),
+                "matrix",
+                &["http://localhost/callback".into()],
+            )
+            .unwrap();
+        app.db
+            .store_access_token(
+                &token_hash("matrix-access"),
+                "matrix-client",
+                &user,
+                "mcp admin",
+                chrono::Utc::now().timestamp() + 600,
+                None,
+                None,
+            )
+            .unwrap();
+        let agent = app.db.agent_for_client("matrix-client").unwrap().unwrap();
+        assert_eq!(
+            ui_rename_agent(
+                State(app.clone()),
+                Path(agent.id.clone()),
+                headers.clone(),
+                Form(name("renamed agent")),
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        for (id, value, expected) in [
+            (agent.id.as_str(), "", StatusCode::BAD_REQUEST),
+            ("missing", "agent", StatusCode::NOT_FOUND),
+        ] {
+            assert_eq!(
+                ui_rename_agent(
+                    State(app.clone()),
+                    Path(id.into()),
+                    headers.clone(),
+                    Form(name(value)),
+                )
+                .await
+                .into_response()
+                .status(),
+                expected
+            );
+        }
+
+        assert_eq!(
+            ui_add_integration(
+                State(app.clone()),
+                headers.clone(),
+                Form(UiIntegrationForm {
+                    name: "file".into(),
+                    url: "file:///tmp/socket".parse().unwrap(),
+                    csrf_token: csrf.into(),
+                }),
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        for response in [
+            ui_delete_integration(
+                State(app.clone()),
+                Path("missing".into()),
+                headers.clone(),
+                Form(csrf_form()),
+            )
+            .await
+            .into_response(),
+            ui_disconnect_integration(
+                State(app.clone()),
+                Path("missing".into()),
+                headers.clone(),
+                Form(csrf_form()),
+            )
+            .await
+            .into_response(),
+            ui_revoke_token(
+                State(app.clone()),
+                Path("missing".into()),
+                headers.clone(),
+                Form(csrf_form()),
+            )
+            .await
+            .into_response(),
+            ui_revoke_client(
+                State(app.clone()),
+                Path("missing".into()),
+                headers.clone(),
+                Form(csrf_form()),
+            )
+            .await
+            .into_response(),
+        ] {
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        let integration = app
+            .db
+            .create_integration(
+                &user,
+                "matrix integration",
+                "http",
+                &json!({"url":"http://localhost:9999/mcp"}),
+                None,
+            )
+            .unwrap();
+        assert!(
+            ui_grant_integration(
+                State(app.clone()),
+                Path(("matrix-client".into(), integration.clone())),
+                headers.clone(),
+                Form(csrf_form()),
+            )
+            .await
+            .into_response()
+            .status()
+            .is_redirection()
+        );
+        assert!(
+            ui_grant_integration(
+                State(app.clone()),
+                Path(("matrix-client".into(), integration.clone())),
+                headers.clone(),
+                Form(csrf_form()),
+            )
+            .await
+            .into_response()
+            .status()
+            .is_redirection()
+        );
+        assert!(
+            ui_revoke_grant(
+                State(app.clone()),
+                Path(("matrix-client".into(), integration.clone())),
+                headers.clone(),
+                Form(csrf_form()),
+            )
+            .await
+            .into_response()
+            .status()
+            .is_redirection()
+        );
+        assert_eq!(
+            ui_revoke_grant(
+                State(app.clone()),
+                Path(("matrix-client".into(), integration)),
+                headers.clone(),
+                Form(csrf_form()),
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        assert_eq!(
+            ui_prepare_ssh_key(
+                State(app.clone()),
+                Path("invalid".into()),
+                headers.clone(),
+                Form(csrf_form()),
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(
+            ui_prepare_ssh_key(
+                State(app.clone()),
+                Path("user_ca".into()),
+                headers.clone(),
+                Form(csrf_form()),
+            )
+            .await
+            .status()
+            .is_redirection()
+        );
+        let prepared = app
+            .db
+            .ssh_keys()
+            .unwrap()
+            .into_iter()
+            .find(|key| key.purpose == "user_ca" && !key.active)
+            .unwrap();
+        assert!(
+            ui_activate_ssh_key(
+                State(app.clone()),
+                Path(("user_ca".into(), prepared.id.clone())),
+                headers.clone(),
+                Form(csrf_form()),
+            )
+            .await
+            .status()
+            .is_redirection()
+        );
+        assert_eq!(
+            ui_retire_ssh_key(
+                State(app.clone()),
+                Path(("user_ca".into(), prepared.id)),
+                headers.clone(),
+                Form(csrf_form()),
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        app.ssh_ready.store(true, Ordering::Release);
+        assert_eq!(
+            ui_activate_ssh_key(
+                State(app.clone()),
+                Path(("host".into(), "missing".into())),
+                headers,
+                Form(csrf_form()),
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+
+        let mut api_headers = HeaderMap::new();
+        api_headers.insert(
+            http::header::AUTHORIZATION,
+            "Bearer matrix-access".parse().unwrap(),
+        );
+        for response in [
+            list_integrations(State(app.clone()), api_headers.clone())
+                .await
+                .into_response(),
+            list_agent_clients(State(app.clone()), api_headers.clone())
+                .await
+                .into_response(),
+            list_agent_tokens(State(app.clone()), api_headers.clone())
+                .await
+                .into_response(),
+            list_audit_events(
+                State(app.clone()),
+                api_headers.clone(),
+                Query(AuditQuery { limit: 10 }),
+            )
+            .await
+            .into_response(),
+        ] {
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        assert_eq!(
+            get_integration(
+                State(app.clone()),
+                Path("missing".into()),
+                api_headers.clone(),
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+        for response in [
+            revoke_agent_client(
+                State(app.clone()),
+                Path("missing".into()),
+                api_headers.clone(),
+            )
+            .await
+            .into_response(),
+            revoke_agent_token(
+                State(app.clone()),
+                Path("missing".into()),
+                api_headers.clone(),
+            )
+            .await
+            .into_response(),
+            revoke_agent_grant(
+                State(app.clone()),
+                Path(("missing".into(), "missing".into())),
+                api_headers.clone(),
+            )
+            .await
+            .into_response(),
+            reconnect_integration(
+                State(app.clone()),
+                Path("missing".into()),
+                api_headers.clone(),
+            )
+            .await
+            .into_response(),
+            disconnect_integration(
+                State(app.clone()),
+                Path("missing".into()),
+                api_headers.clone(),
+            )
+            .await
+            .into_response(),
+            delete_integration(State(app.clone()), Path("missing".into()), api_headers)
+                .await
+                .into_response(),
+        ] {
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+    }
+
     async fn request_status(
         router: &Router,
         method: http::Method,
@@ -8866,6 +9668,22 @@ mod tests {
             )
             .is_err()
         );
+        assert!(
+            validate_transport(
+                "git",
+                &json!({
+                    "kind":"git",
+                    "provider":"github",
+                    "providerConfig":{"appId":"1","installationId":"2"}
+                }),
+                Some(&HashMap::from([(
+                    "privateKey".into(),
+                    "invalid pem".into()
+                )])),
+                false,
+            )
+            .is_err()
+        );
         let oauth = json!({"url":"https://example.com/mcp","oauth":{"resource_metadata_url":"https://example.com/resource","issuer":"https://issuer.example/path","authorization_endpoint":"http://localhost/authorize","token_endpoint":"http://127.0.0.1/token","registration_endpoint":"http://localhost/register","client_id":"client","scope":"mcp"}});
         assert!(
             validate_transport(
@@ -9023,6 +9841,19 @@ mod tests {
         assert_eq!(awaiting[0]["upstreamStatus"], "disconnected");
         assert_eq!(awaiting[0]["clientAccessGranted"], false);
         assert_eq!(awaiting[0]["requiredScope"], format!("integration:{oauth}"));
+
+        let authorization = admin_authorize(&app, &user, &oauth).await.unwrap();
+        assert_eq!(authorization["alreadyConnected"], false);
+        let authorization_url =
+            url::Url::parse(authorization["authorization_url"].as_str().unwrap()).unwrap();
+        let parameters = authorization_url
+            .query_pairs()
+            .into_owned()
+            .collect::<HashMap<_, _>>();
+        assert_eq!(parameters["client_id"], "client");
+        assert!(!parameters.contains_key("scope"));
+        assert!(parameters.contains_key("state"));
+        assert!(parameters.contains_key("code_challenge"));
 
         app.db
             .put_upstream_oauth_token(
@@ -9554,5 +10385,1365 @@ mod tests {
                 .access_token_ciphertext,
             ciphertext
         );
+    }
+
+    #[tokio::test]
+    async fn browser_health_assets_and_identity_lifecycles() {
+        let (app, _directory) = route_test_app().await;
+        create_user_record(
+            &app.db,
+            "browser@example.com",
+            "correct horse battery staple",
+        )
+        .unwrap();
+        app.replicator.sync().await.unwrap();
+        let router = build_router(app.clone());
+
+        for path in [
+            "/",
+            "/login",
+            "/healthz",
+            "/readyz",
+            "/version",
+            "/metrics",
+            "/.well-known/oauth-authorization-server",
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-client",
+            "/oauth/authorize",
+            "/github/app/installation/complete",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    axum::http::Request::get(path)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+        }
+        assert_eq!(
+            request_status(
+                &router,
+                http::Method::GET,
+                "/ui/assets/missing.js",
+                None,
+                None,
+                ""
+            )
+            .await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            request_status(
+                &router,
+                http::Method::GET,
+                "/ui/assets/../index.html",
+                None,
+                None,
+                ""
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        let login = router
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/login")
+                    .header(http::header::ORIGIN, "http://localhost:4788")
+                    .header(
+                        http::header::CONTENT_TYPE,
+                        "application/x-www-form-urlencoded",
+                    )
+                    .body(axum::body::Body::from(encoded_form(&[
+                        ("email", "browser@example.com"),
+                        ("password", "correct horse battery staple"),
+                    ])))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::SEE_OTHER);
+        let set_cookies = login
+            .headers()
+            .get_all(http::header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap().split(';').next().unwrap())
+            .collect::<Vec<_>>();
+        let cookie_header = set_cookies.join("; ");
+        let csrf = set_cookies
+            .iter()
+            .find_map(|cookie| cookie.strip_prefix("cog_csrf="))
+            .unwrap()
+            .to_owned();
+        let origin = "http://localhost:4788";
+        let post_form = |path: String, pairs: Vec<(&str, &str)>| {
+            axum::http::Request::post(path)
+                .header(http::header::ORIGIN, origin)
+                .header(http::header::COOKIE, &cookie_header)
+                .header(
+                    http::header::CONTENT_TYPE,
+                    "application/x-www-form-urlencoded",
+                )
+                .body(axum::body::Body::from(encoded_form(&pairs)))
+                .unwrap()
+        };
+
+        let bootstrap = router
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/ui")
+                    .header(http::header::COOKIE, &cookie_header)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response_json(bootstrap).await["mode"], "admin");
+
+        let created = router
+            .clone()
+            .oneshot(post_form(
+                "/ui/identities".into(),
+                vec![("name", "Primary"), ("csrf_token", &csrf)],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::NO_CONTENT);
+        let user = app
+            .db
+            .user_by_email("browser@example.com")
+            .unwrap()
+            .unwrap()
+            .0;
+        app.db
+            .register_client(
+                "browser-agent",
+                Some(&user),
+                "Browser Agent",
+                &["http://localhost/callback".into()],
+            )
+            .unwrap();
+        let agent = app.db.agent_for_client("browser-agent").unwrap().unwrap();
+        let identity = app.db.list_identities(&user).unwrap().pop().unwrap();
+        let renamed = router
+            .clone()
+            .oneshot(post_form(
+                format!("/ui/identities/{}/rename", identity.id),
+                vec![("name", "Renamed"), ("csrf_token", &csrf)],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(renamed.status(), StatusCode::NO_CONTENT);
+        let missing = router
+            .clone()
+            .oneshot(post_form(
+                "/ui/identities/missing/rename".into(),
+                vec![("name", "Nope"), ("csrf_token", &csrf)],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let invalid_rename = router
+            .clone()
+            .oneshot(post_form(
+                format!("/ui/identities/{}/rename", identity.id),
+                vec![("name", "  "), ("csrf_token", &csrf)],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid_rename.status(), StatusCode::BAD_REQUEST);
+        let renamed_agent = router
+            .clone()
+            .oneshot(post_form(
+                format!("/ui/agents/{}/rename", agent.id),
+                vec![("name", "Renamed Agent"), ("csrf_token", &csrf)],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(renamed_agent.status(), StatusCode::NO_CONTENT);
+        let missing_agent = router
+            .clone()
+            .oneshot(post_form(
+                "/ui/agents/missing/rename".into(),
+                vec![("name", "Nope"), ("csrf_token", &csrf)],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing_agent.status(), StatusCode::NOT_FOUND);
+        let invalid_agent = router
+            .clone()
+            .oneshot(post_form(
+                format!("/ui/agents/{}/rename", agent.id),
+                vec![("name", ""), ("csrf_token", &csrf)],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid_agent.status(), StatusCode::BAD_REQUEST);
+
+        let prepared = router
+            .clone()
+            .oneshot(post_form(
+                "/ui/ssh/host/prepare".into(),
+                vec![("csrf_token", &csrf)],
+            ))
+            .await
+            .unwrap();
+        assert!(prepared.status().is_redirection());
+        let key = app
+            .db
+            .ssh_keys()
+            .unwrap()
+            .into_iter()
+            .find(|key| key.purpose == "host" && !key.active)
+            .unwrap();
+        let activated = router
+            .clone()
+            .oneshot(post_form(
+                format!("/ui/ssh/host/{}/activate", key.id),
+                vec![("csrf_token", &csrf)],
+            ))
+            .await
+            .unwrap();
+        assert!(activated.status().is_redirection());
+        let retired = router
+            .clone()
+            .oneshot(post_form(
+                format!("/ui/ssh/host/{}/retire", key.id),
+                vec![("csrf_token", &csrf)],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(retired.status(), StatusCode::BAD_REQUEST);
+        let invalid_key = router
+            .clone()
+            .oneshot(post_form(
+                "/ui/ssh/invalid/prepare".into(),
+                vec![("csrf_token", &csrf)],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid_key.status(), StatusCode::BAD_REQUEST);
+
+        let deleted = router
+            .clone()
+            .oneshot(post_form(
+                format!("/ui/identities/{}/delete", identity.id),
+                vec![("csrf_token", &csrf)],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+        let logout = router
+            .clone()
+            .oneshot(post_form("/logout".into(), vec![("csrf_token", &csrf)]))
+            .await
+            .unwrap();
+        assert_eq!(logout.status(), StatusCode::SEE_OTHER);
+    }
+
+    #[tokio::test]
+    async fn login_readiness_assets_and_connection_state_boundaries() {
+        let (mut app, _directory) = route_test_app().await;
+        create_user_record(&app.db, "boundary@example.com", "correct password value").unwrap();
+        app.replicator.sync().await.unwrap();
+        let router = build_router(app.clone());
+        let login_request = |origin: &str, email: &str, password: &str| {
+            Request::post("/login")
+                .header(http::header::ORIGIN, origin)
+                .header(
+                    http::header::CONTENT_TYPE,
+                    "application/x-www-form-urlencoded",
+                )
+                .body(Body::from(encoded_form(&[
+                    ("email", email),
+                    ("password", password),
+                ])))
+                .unwrap()
+        };
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(login_request(
+                    "https://evil.example",
+                    "boundary@example.com",
+                    "correct password value",
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(login_request(
+                    "http://localhost:4788",
+                    "missing@example.com",
+                    "wrong",
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        for _ in 0..9 {
+            let response = router
+                .clone()
+                .oneshot(login_request(
+                    "http://localhost:4788",
+                    "boundary@example.com",
+                    "wrong",
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(
+            router
+                .oneshot(login_request(
+                    "http://localhost:4788",
+                    "boundary@example.com",
+                    "wrong",
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+
+        app.config.ssh_listen = Some("127.0.0.1:2222".parse().unwrap());
+        assert_eq!(
+            readiness(State(app.clone())).await.into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        app.ssh_ready.store(true, Ordering::Release);
+        assert_eq!(
+            readiness(State(app.clone())).await.into_response().status(),
+            StatusCode::OK
+        );
+
+        let js = Frontend::iter().find(|path| path.ends_with(".js")).unwrap();
+        let css = Frontend::iter()
+            .find(|path| path.ends_with(".css"))
+            .unwrap();
+        assert_eq!(
+            frontend_response(js.as_ref()).headers()[http::header::CONTENT_TYPE],
+            "text/javascript; charset=utf-8"
+        );
+        assert_eq!(
+            frontend_response(css.as_ref()).headers()[http::header::CONTENT_TYPE],
+            "text/css; charset=utf-8"
+        );
+        assert_eq!(
+            frontend_response("missing.bin").status(),
+            StatusCode::NOT_FOUND
+        );
+
+        let user = app
+            .db
+            .user_by_email("boundary@example.com")
+            .unwrap()
+            .unwrap()
+            .0;
+        let setup = app
+            .db
+            .create_integration(
+                &user,
+                "Git setup",
+                "git",
+                &json!({"kind":"git","providerConfig":{"appId":"1"}}),
+                None,
+            )
+            .unwrap();
+        let setup = app.db.integration(&setup, &user).unwrap().unwrap();
+        assert_eq!(
+            upstream_connection_state(&app, &setup),
+            ("setup_required", false)
+        );
+        let configured = app
+            .db
+            .create_integration(
+                &user,
+                "Git configured",
+                "git",
+                &json!({"kind":"git","providerConfig":{"appId":"1","installationId":"2"}}),
+                Some("sealed"),
+            )
+            .unwrap();
+        let configured = app.db.integration(&configured, &user).unwrap().unwrap();
+        assert_eq!(
+            upstream_connection_state(&app, &configured),
+            ("configured", true)
+        );
+
+        let oauth = app
+            .db
+            .create_integration(
+                &user,
+                "Expired OAuth",
+                "http",
+                &json!({"url":"http://localhost/mcp","oauth":{}}),
+                None,
+            )
+            .unwrap();
+        app.db
+            .put_upstream_oauth_token(
+                &oauth,
+                &UpstreamOAuthToken {
+                    access_token_ciphertext: app.secrets.seal(b"expired").unwrap(),
+                    refresh_token_ciphertext: None,
+                    token_type: "Bearer".into(),
+                    scope: "mcp".into(),
+                    expires_at: Some(chrono::Utc::now().timestamp() - 1),
+                    refresh_expires_at: None,
+                },
+            )
+            .unwrap();
+        let oauth = app.db.integration(&oauth, &user).unwrap().unwrap();
+        assert_eq!(upstream_connection_state(&app, &oauth), ("expired", false));
+    }
+
+    #[tokio::test]
+    async fn github_callback_and_setup_rejections_are_bounded() {
+        let (app, _directory) = route_test_app().await;
+        let router = build_router(app.clone());
+
+        let cases = [
+            (
+                format!("/github/app/setup/{}", "x".repeat(257)),
+                StatusCode::BAD_REQUEST,
+            ),
+            ("/github/app/setup/unknown".into(), StatusCode::BAD_REQUEST),
+            (
+                "/github/app/manifest/callback?code=x&state=unknown".into(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                format!(
+                    "/github/app/manifest/callback?code={}&state=x",
+                    "x".repeat(513)
+                ),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "/github/app/installation/callback?installation_id=&state=x".into(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "/github/app/installation/callback?installation_id=abc&state=x".into(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "/github/app/installation/callback?installation_id=1&state=x&setup_action=remove"
+                    .into(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "/github/app/installation/callback?installation_id=1&state=unknown".into(),
+                StatusCode::BAD_REQUEST,
+            ),
+        ];
+        for (uri, expected) in cases {
+            let response = router
+                .clone()
+                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            assert!(response_text(response).await.len() < 1_024);
+        }
+
+        for slug in ["", "Upper", "under_score", "slash/name", "dot.name"] {
+            assert!(github_app_install_url(slug).is_err(), "{slug}");
+        }
+        assert_eq!(
+            github_app_install_url("valid-app-123").unwrap(),
+            "https://github.com/apps/valid-app-123/installations/new"
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_callback_rejections_do_not_reflect_secrets() {
+        let (app, _directory) = route_test_app().await;
+        let router = build_router(app);
+        let cases = [
+            (
+                "/oauth/upstream/callback?state=x&error=denied&error_description=provider-secret",
+                "provider-secret",
+            ),
+            ("/oauth/upstream/callback?state=x", ""),
+            (
+                "/oauth/upstream/callback?state=unknown&code=provider-secret",
+                "provider-secret",
+            ),
+        ];
+        for (uri, secret) in cases {
+            let response = router
+                .clone()
+                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = response_text(response).await;
+            if !secret.is_empty() && !uri.contains("error_description") {
+                assert!(!body.contains(secret));
+            }
+            assert!(body.len() < 16 * 1_024);
+        }
+    }
+
+    #[test]
+    fn oauth_uri_transport_and_redaction_boundaries() {
+        for accepted in [
+            "https://example.com/path?query=ok",
+            "http://localhost:1234/path",
+            "http://127.0.0.1/path",
+        ] {
+            validate_oauth_uri(&accepted.parse().unwrap(), "test URI").unwrap();
+        }
+        for rejected in [
+            "relative/path",
+            "https://user@example.com/path",
+            "https://example.com/path#fragment",
+            "http://example.com/path",
+            "ftp://example.com/path",
+            "http://[::1]/path",
+        ] {
+            let uri = url::Url::parse(rejected)
+                .unwrap_or_else(|_| url::Url::parse("file:///relative/path").unwrap());
+            assert!(validate_oauth_uri(&uri, "test URI").is_err(), "{rejected}");
+        }
+
+        let redacted = redact_value(json!({
+            "safe": {"value": 1},
+            "items": [{"token":"hidden", "visible":true}],
+            "clientSecret":"hidden",
+            "ciphertext":"hidden",
+            "headers":{"Authorization":"hidden"},
+            "authorization":"hidden"
+        }));
+        assert_eq!(redacted["safe"]["value"], 1);
+        assert_eq!(redacted["items"][0]["visible"], true);
+        assert!(redacted["items"][0].get("token").is_none());
+        for key in ["clientSecret", "ciphertext", "headers", "authorization"] {
+            assert!(redacted.get(key).is_none(), "{key}");
+        }
+
+        let valid = [
+            ("http", json!({"url":"https://example.com/mcp"}), false),
+            ("sse", json!({"url":"https://example.com/sse"}), false),
+            ("stdio", json!({"command":"safe-command","args":[]}), true),
+        ];
+        for (transport, config, allow_stdio) in valid {
+            validate_transport(transport, &config, None, allow_stdio).unwrap();
+        }
+        let invalid = [
+            ("unknown", json!({}), false),
+            ("http", json!({}), false),
+            ("http", json!({"url":"file:///tmp/socket"}), false),
+            ("stdio", json!({"command":"safe-command"}), false),
+            ("stdio", json!({"command":"   "}), true),
+        ];
+        for (transport, config, allow_stdio) in invalid {
+            assert!(
+                validate_transport(transport, &config, None, allow_stdio).is_err(),
+                "{transport}: {config}"
+            );
+        }
+        assert!(
+            validate_transport(
+                "http",
+                &json!({"url":"https://example.com"}),
+                Some(&HashMap::from([("bad header\n".into(), "value".into())])),
+                false,
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn github_manifest_and_installation_callbacks_complete_against_mock_api() {
+        async fn conversion(Path(code): Path<String>, State(pem): State<String>) -> Response {
+            match code.as_str() {
+                "rejected" => StatusCode::BAD_REQUEST.into_response(),
+                "malformed" => "not-json".into_response(),
+                "incomplete" => Json(json!({"id":42})).into_response(),
+                "bad-credentials" => {
+                    Json(json!({"id":42,"slug":"INVALID_SLUG","pem":"bad"})).into_response()
+                }
+                _ => Json(json!({"id":42,"slug":"cog-fixture","pem":pem})).into_response(),
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let pem_path = directory.path().join("github.pem");
+        let generated = std::process::Command::new("openssl")
+            .args(["genrsa", "-traditional", "-out"])
+            .arg(&pem_path)
+            .arg("2048")
+            .output()
+            .unwrap();
+        assert!(generated.status.success());
+        let pem = std::fs::read_to_string(&pem_path).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let provider = tokio::spawn(
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/app-manifests/{code}/conversions", post(conversion))
+                    .with_state(pem),
+            )
+            .into_future(),
+        );
+        let (mut app, _app_directory) = route_test_app().await;
+        app.github_api_base = format!("http://{address}/").parse().unwrap();
+        let user = app
+            .db
+            .create_user("github-flow@example.com", "hash")
+            .unwrap();
+        for (code, expected) in [
+            ("rejected", StatusCode::BAD_GATEWAY),
+            ("malformed", StatusCode::BAD_GATEWAY),
+            ("incomplete", StatusCode::BAD_GATEWAY),
+            ("bad-credentials", StatusCode::BAD_GATEWAY),
+        ] {
+            let failed = admin_github_app_setup_start(&app, &user, json!({"name":code}))
+                .await
+                .unwrap();
+            let failed_state = failed["browserUrl"]
+                .as_str()
+                .unwrap()
+                .rsplit('/')
+                .next()
+                .unwrap();
+            let response = build_router(app.clone())
+                .oneshot(
+                    Request::get(format!(
+                        "/github/app/manifest/callback?code={code}&state={failed_state}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{code}");
+        }
+        let setup = admin_github_app_setup_start(&app, &user, json!({"name":"GitHub"}))
+            .await
+            .unwrap();
+        let state = setup["browserUrl"]
+            .as_str()
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_owned();
+        let router = build_router(app.clone());
+        let launch = router
+            .clone()
+            .oneshot(
+                Request::get(format!("/github/app/setup/{state}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(launch.status(), StatusCode::OK);
+        assert!(response_text(launch).await.contains("github-manifest"));
+        let manifest = router
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/github/app/manifest/callback?code=conversion-code&state={state}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(manifest.status().is_redirection());
+        assert_eq!(
+            manifest.headers()[http::header::LOCATION],
+            "https://github.com/apps/cog-fixture/installations/new"
+        );
+        let integration = setup["id"].as_str().unwrap();
+        let status = admin_github_app_setup_status(&app, &user, integration)
+            .await
+            .unwrap();
+        assert_eq!(status["status"], "installation_pending");
+        assert_eq!(status["credentialsConfigured"], true);
+        let installed = router
+            .clone()
+            .oneshot(Request::get(format!("/github/app/installation/callback?installation_id=99&state={state}&setup_action=install")).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert!(installed.status().is_redirection());
+        assert!(
+            installed.headers()[http::header::LOCATION]
+                .to_str()
+                .unwrap()
+                .contains(integration)
+        );
+        let status = admin_github_app_setup_status(&app, &user, integration)
+            .await
+            .unwrap();
+        assert_eq!(status["status"], "installed");
+        let installed_integration = app.db.integration(integration, &user).unwrap().unwrap();
+        assert!(git_provider(&app, &installed_integration).await.is_ok());
+        assert!(app.git_providers.lock().await.contains_key(integration));
+        assert_eq!(
+            installed_integration.config["providerConfig"]["installationId"],
+            "99"
+        );
+        let replay = router
+            .oneshot(
+                Request::get(format!(
+                    "/github/app/installation/callback?installation_id=99&state={state}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
+        provider.abort();
+    }
+
+    #[tokio::test]
+    async fn upstream_oauth_callback_exchanges_and_stores_rotating_tokens() {
+        async fn exchange(body: String) -> Json<Value> {
+            assert!(body.contains("grant_type=authorization_code"));
+            assert!(body.contains("code=provider-code"));
+            assert!(body.contains("code_verifier=pkce-verifier"));
+            assert!(body.contains("client_secret=provider-secret"));
+            Json(
+                json!({"access_token":"provider-access","refresh_token":"provider-refresh","token_type":"bearer","scope":"read write","expires_in":60,"refresh_expires_in":120}),
+            )
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let provider = tokio::spawn(
+            axum::serve(listener, Router::new().route("/token", post(exchange))).into_future(),
+        );
+        let (app, _directory) = route_test_app().await;
+        let user = app
+            .db
+            .create_user("oauth-callback@example.com", "hash")
+            .unwrap();
+        let integration = app
+            .db
+            .create_integration(
+                &user,
+                "OAuth",
+                "http",
+                &json!({"url":"https://example.com/mcp","oauth":{}}),
+                None,
+            )
+            .unwrap();
+        app.db
+            .put_upstream_oauth_client(
+                &integration,
+                &UpstreamOAuthClient {
+                    client_id: "provider-client".into(),
+                    client_secret_ciphertext: Some(app.secrets.seal(b"provider-secret").unwrap()),
+                    authorization_endpoint: format!("http://{address}/authorize"),
+                    token_endpoint: format!("http://{address}/token"),
+                    scope: "read".into(),
+                    resource: Some("https://resource.example/mcp".into()),
+                    issuer: Some("https://issuer.example".into()),
+                },
+            )
+            .unwrap();
+        let state = "callback-state";
+        app.db
+            .store_oauth_state(
+                &token_hash(state),
+                &user,
+                &integration,
+                &app.secrets.seal(b"pkce-verifier").unwrap(),
+                "http://localhost:4788/oauth/upstream/callback",
+                chrono::Utc::now().timestamp() + 60,
+                Some("https://resource.example/mcp"),
+            )
+            .unwrap();
+        let response = build_router(app.clone()).oneshot(Request::get(format!("/oauth/upstream/callback?code=provider-code&state={state}&iss=https%3A%2F%2Fissuer.example")).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response_text(response)
+                .await
+                .contains("Connection complete")
+        );
+        let stored = app.db.upstream_oauth_token(&integration).unwrap().unwrap();
+        assert_eq!(
+            open_secret_text(&app, &stored.access_token_ciphertext).unwrap(),
+            "provider-access"
+        );
+        assert_eq!(
+            open_secret_text(&app, stored.refresh_token_ciphertext.as_deref().unwrap()).unwrap(),
+            "provider-refresh"
+        );
+        assert_eq!(stored.scope, "read write");
+        assert!(
+            app.db
+                .redeem_oauth_state(&token_hash(state))
+                .unwrap()
+                .is_none()
+        );
+        provider.abort();
+    }
+
+    #[tokio::test]
+    async fn upstream_scope_step_up_merges_existing_and_challenged_scopes() {
+        async fn resource(State(resource): State<String>) -> Json<Value> {
+            Json(json!({"resource":resource}))
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let resource_url = format!("http://{address}/mcp");
+        let provider = tokio::spawn(
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/metadata", get(resource))
+                    .with_state(resource_url.clone()),
+            )
+            .into_future(),
+        );
+        let (app, _directory) = route_test_app().await;
+        let user = app.db.create_user("step-up@example.com", "hash").unwrap();
+        let integration = app
+            .db
+            .create_integration(
+                &user,
+                "OAuth",
+                "http",
+                &json!({"url":resource_url,"oauth":{}}),
+                None,
+            )
+            .unwrap();
+        app.db
+            .put_upstream_oauth_client(
+                &integration,
+                &UpstreamOAuthClient {
+                    client_id: "client".into(),
+                    client_secret_ciphertext: None,
+                    authorization_endpoint: format!("http://{address}/authorize"),
+                    token_endpoint: format!("http://{address}/token"),
+                    scope: "base".into(),
+                    resource: Some(resource_url.clone()),
+                    issuer: None,
+                },
+            )
+            .unwrap();
+        app.db
+            .put_upstream_oauth_token(
+                &integration,
+                &UpstreamOAuthToken {
+                    access_token_ciphertext: app.secrets.seal(b"access").unwrap(),
+                    refresh_token_ciphertext: None,
+                    token_type: "Bearer".into(),
+                    scope: "existing".into(),
+                    expires_at: None,
+                    refresh_expires_at: None,
+                },
+            )
+            .unwrap();
+        let url = start_upstream_step_up(
+            &app,
+            &user,
+            &integration,
+            &UpstreamInsufficientScope {
+                scopes: vec!["existing".into(), "extra".into()],
+                resource_metadata: format!("http://{address}/metadata"),
+            },
+        )
+        .await
+        .unwrap();
+        let pairs = url.query_pairs().into_owned().collect::<HashMap<_, _>>();
+        assert_eq!(pairs["scope"], "base existing extra");
+        assert_eq!(pairs["resource"], resource_url);
+        assert_eq!(pairs["code_challenge_method"], "S256");
+        assert_eq!(
+            app.db
+                .upstream_oauth_client(&integration)
+                .unwrap()
+                .unwrap()
+                .scope,
+            "base existing extra"
+        );
+        provider.abort();
+    }
+
+    #[tokio::test]
+    async fn upstream_callback_valid_state_failure_matrix_is_bounded() {
+        async fn incomplete() -> Json<Value> {
+            Json(json!({"token_type":"Bearer"}))
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let provider = tokio::spawn(
+            axum::serve(
+                listener,
+                Router::new().route("/incomplete", post(incomplete)),
+            )
+            .into_future(),
+        );
+        let (app, _directory) = route_test_app().await;
+        let user = app
+            .db
+            .create_user("callback-failures@example.com", "hash")
+            .unwrap();
+        let make = |name: &str| {
+            app.db
+                .create_integration(
+                    &user,
+                    name,
+                    "http",
+                    &json!({"url":"https://example.com/mcp","oauth":{}}),
+                    None,
+                )
+                .unwrap()
+        };
+        let store =
+            |state: &str, integration: &str, sealed: &str, expires: i64, resource: Option<&str>| {
+                app.db
+                    .store_oauth_state(
+                        &token_hash(state),
+                        &user,
+                        integration,
+                        sealed,
+                        "http://localhost/callback",
+                        expires,
+                        resource,
+                    )
+                    .unwrap()
+            };
+        let client =
+            |integration: &str, endpoint: String, resource: Option<&str>, issuer: Option<&str>| {
+                app.db
+                    .put_upstream_oauth_client(
+                        integration,
+                        &UpstreamOAuthClient {
+                            client_id: "client".into(),
+                            client_secret_ciphertext: None,
+                            authorization_endpoint: "https://issuer.example/authorize".into(),
+                            token_endpoint: endpoint,
+                            scope: "mcp".into(),
+                            resource: resource.map(str::to_owned),
+                            issuer: issuer.map(str::to_owned),
+                        },
+                    )
+                    .unwrap()
+            };
+        let now = chrono::Utc::now().timestamp();
+        let sealed = app.secrets.seal(b"verifier").unwrap();
+
+        let expired = make("expired");
+        client(&expired, format!("http://{address}/incomplete"), None, None);
+        store("expired-state", &expired, &sealed, now - 1, None);
+        let missing_client = make("missing-client");
+        store(
+            "missing-client-state",
+            &missing_client,
+            &sealed,
+            now + 60,
+            None,
+        );
+        let bad_seal = make("bad-seal");
+        client(
+            &bad_seal,
+            format!("http://{address}/incomplete"),
+            None,
+            None,
+        );
+        store(
+            "bad-seal-state",
+            &bad_seal,
+            "not-ciphertext",
+            now + 60,
+            None,
+        );
+        let changed = make("changed");
+        client(
+            &changed,
+            format!("http://{address}/incomplete"),
+            Some("https://new.example/mcp"),
+            None,
+        );
+        store(
+            "changed-state",
+            &changed,
+            &sealed,
+            now + 60,
+            Some("https://old.example/mcp"),
+        );
+        let issuer = make("issuer");
+        client(
+            &issuer,
+            format!("http://{address}/incomplete"),
+            None,
+            Some("https://issuer.example"),
+        );
+        store("issuer-state", &issuer, &sealed, now + 60, None);
+        let rejected = make("rejected");
+        client(&rejected, format!("http://{address}/missing"), None, None);
+        store("rejected-state", &rejected, &sealed, now + 60, None);
+        let incomplete_id = make("incomplete");
+        client(
+            &incomplete_id,
+            format!("http://{address}/incomplete"),
+            None,
+            None,
+        );
+        store("incomplete-state", &incomplete_id, &sealed, now + 60, None);
+
+        for (state, iss, expected) in [
+            ("expired-state", None, StatusCode::BAD_REQUEST),
+            ("missing-client-state", None, StatusCode::BAD_REQUEST),
+            ("bad-seal-state", None, StatusCode::BAD_REQUEST),
+            ("changed-state", None, StatusCode::BAD_REQUEST),
+            (
+                "issuer-state",
+                Some("https://evil.example"),
+                StatusCode::BAD_REQUEST,
+            ),
+            ("rejected-state", None, StatusCode::BAD_GATEWAY),
+            ("incomplete-state", None, StatusCode::BAD_GATEWAY),
+        ] {
+            let response = upstream_callback(
+                State(app.clone()),
+                Query(UpstreamCallback {
+                    code: Some("code".into()),
+                    state: state.into(),
+                    error: None,
+                    error_description: None,
+                    iss: iss.map(str::to_owned),
+                }),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), expected, "{state}");
+            assert!(response_text(response).await.len() < 16 * 1024);
+        }
+        provider.abort();
+    }
+
+    #[cfg(unix)]
+    struct SshGitFixture {
+        upstream: url::Url,
+    }
+
+    #[cfg(unix)]
+    #[async_trait::async_trait]
+    impl GitProvider for SshGitFixture {
+        async fn resolve_repository(
+            &self,
+            reference: &RepositoryReference,
+        ) -> anyhow::Result<ResolvedRepository> {
+            Ok(ResolvedRepository {
+                provider_repository_id: "fixture".into(),
+                display_name: reference.0.clone(),
+                upstream_url: self.upstream.clone(),
+                metadata: json!({"fixture":true}),
+            })
+        }
+        async fn authorize_upstream(
+            &self,
+            _repository: &ResolvedRepository,
+            _operation: GitOperation,
+        ) -> anyhow::Result<crate::git::UpstreamAuthorization> {
+            Ok(crate::git::UpstreamAuthorization::Anonymous)
+        }
+        fn upstream_url(&self, _repository: &ResolvedRepository) -> anyhow::Result<url::Url> {
+            Ok(self.upstream.clone())
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn production_ssh_handler_authenticates_and_proxies_upload_pack() {
+        use russh::server::Server as _;
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        async fn discovery(Query(query): Query<HashMap<String, String>>) -> impl IntoResponse {
+            let service = query
+                .get("service")
+                .map(String::as_str)
+                .unwrap_or("git-upload-pack");
+            (
+                [(
+                    http::header::CONTENT_TYPE,
+                    format!("application/x-{service}-advertisement"),
+                )],
+                format!("{:04x}# service={service}\n00000000", service.len() + 15),
+            )
+        }
+        async fn upload_rpc() -> impl IntoResponse {
+            (
+                [(
+                    http::header::CONTENT_TYPE,
+                    "application/x-git-upload-pack-result",
+                )],
+                "PACK",
+            )
+        }
+        async fn receive_rpc() -> impl IntoResponse {
+            (
+                [(
+                    http::header::CONTENT_TYPE,
+                    "application/x-git-receive-pack-result",
+                )],
+                "0000",
+            )
+        }
+        let upstream_task = tokio::spawn(
+            axum::serve(
+                upstream_listener,
+                Router::new()
+                    .route("/repository.git/info/refs", get(discovery))
+                    .route("/repository.git/git-upload-pack", post(upload_rpc))
+                    .route("/repository.git/git-receive-pack", post(receive_rpc)),
+            )
+            .into_future(),
+        );
+
+        let (mut app, directory) = route_test_app().await;
+        let user = app.db.create_user("ssh-route@example.com", "hash").unwrap();
+        app.db
+            .register_client(
+                "ssh-client",
+                Some(&user),
+                "SSH Agent",
+                &["http://localhost/cb".into()],
+            )
+            .unwrap();
+        let agent = app.db.agent_for_client("ssh-client").unwrap().unwrap();
+        let integration = app
+            .db
+            .create_integration(
+                &user,
+                "Git",
+                "git",
+                &json!({"kind":"git","provider":"github"}),
+                Some("sealed"),
+            )
+            .unwrap();
+        let resolved = ResolvedRepository {
+            provider_repository_id: "fixture".into(),
+            display_name: "owner/repository".into(),
+            upstream_url: format!("http://{upstream_address}/repository.git")
+                .parse()
+                .unwrap(),
+            metadata: json!({}),
+        };
+        let repository = app
+            .db
+            .upsert_git_repository(&user, &integration, &resolved)
+            .unwrap();
+        app.db
+            .set_git_grant(&user, "ssh-client", &repository.id, "write")
+            .unwrap();
+        app.git_providers.lock().await.insert(
+            integration.clone(),
+            Arc::new(SshGitFixture {
+                upstream: resolved.upstream_url.clone(),
+            }),
+        );
+
+        let keys = crate::git::ssh::KeySet::load_or_create(&app.db, &app.secrets).unwrap();
+        let host_encoded = crate::git::ssh::encode_private(&keys.host).unwrap();
+        let host_key = russh::keys::PrivateKey::from_openssh(&host_encoded).unwrap();
+        let subject = crate::git::ssh::generate_key().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let binding = crate::git::ssh::Binding {
+            version: 1,
+            issuance_id: uuid::Uuid::new_v4().to_string(),
+            user_id: user,
+            identity_id: agent.identity_id,
+            agent_id: agent.id,
+            client_id: "ssh-client".into(),
+            integration_id: integration,
+            repository_id: repository.id.clone(),
+            permission: "write".into(),
+            fingerprint: crate::git::ssh::fingerprint(subject.public_key()),
+            issued_at: now,
+            expires_at: now + 300,
+        };
+        let certificate = crate::git::ssh::sign(
+            &keys.user_ca,
+            subject.public_key(),
+            &binding,
+            crate::git::ssh::stable_serial(&binding.issuance_id),
+        )
+        .unwrap();
+        app.ssh_keys = Some(Arc::new(std::sync::RwLock::new(keys)));
+        app.ssh_ready.store(true, Ordering::Release);
+        app.config.ssh_listen = Some("127.0.0.1:22".parse().unwrap());
+        app.config.ssh_public_host = Some("localhost".into());
+        app.config.ssh_public_port = Some(22);
+        let access = GitControlProvider {
+            app: app.clone(),
+            auth: AuthContext {
+                user: binding.user_id.clone(),
+                identity: binding.identity_id.clone(),
+                agent: binding.agent_id.clone(),
+                client: binding.client_id.clone(),
+                scopes: HashSet::from([format!("integration:{}", binding.integration_id)]),
+                integrations: HashSet::from([binding.integration_id.clone()]),
+            },
+        }
+        .call(
+            "repository_access",
+            json!({"integrationId":binding.integration_id,"repository":"owner/repository"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(access["repositoryId"], repository.id);
+        assert_eq!(access["remotes"]["ssh"]["publicPort"], 22);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let config = Arc::new(russh::server::Config {
+            methods: russh::MethodSet::from(&[russh::MethodKind::PublicKey][..]),
+            auth_rejection_time: Duration::ZERO,
+            auth_rejection_time_initial: Some(Duration::ZERO),
+            keys: vec![host_key],
+            ..Default::default()
+        });
+        let server_app = app.clone();
+        let server_task = tokio::spawn(async move {
+            let mut factory = SshServerFactory { app: server_app };
+            factory.run_on_socket(config, &listener).await
+        });
+
+        let key_path = directory.path().join("id_ed25519");
+        let cert_path = directory.path().join("id_ed25519-cert.pub");
+        std::fs::write(
+            &key_path,
+            crate::git::ssh::encode_private(&subject).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(&cert_path, format!("{certificate}\n")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let output = tokio::process::Command::new("ssh")
+            .args(["-F", "/dev/null", "-i"])
+            .arg(&key_path)
+            .args(["-o"])
+            .arg(format!("CertificateFile={}", cert_path.display()))
+            .args([
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+                "-o",
+                "LogLevel=ERROR",
+                "-p",
+                &address.port().to_string(),
+                "git@127.0.0.1",
+                &format!("git-upload-pack '{}'", repository.id),
+            ])
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.starts_with(b"0000"));
+        assert_eq!(app.metrics.ssh_auth_success.load(Ordering::Relaxed), 1);
+        assert_eq!(app.metrics.ssh_read_operations.load(Ordering::Relaxed), 1);
+
+        let raw_key_path = directory.path().join("raw_ed25519");
+        std::fs::write(
+            &raw_key_path,
+            crate::git::ssh::encode_private(&subject).unwrap(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&raw_key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let common = |identity: &std::path::Path, certificate: Option<&std::path::Path>| {
+            let mut command = tokio::process::Command::new("ssh");
+            command.args(["-F", "/dev/null", "-i"]).arg(identity).args([
+                "-o",
+                "IdentitiesOnly=yes",
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+                "-o",
+                "LogLevel=ERROR",
+                "-p",
+                &address.port().to_string(),
+            ]);
+            if let Some(certificate) = certificate {
+                command
+                    .arg("-o")
+                    .arg(format!("CertificateFile={}", certificate.display()));
+            }
+            command
+        };
+        let mut raw = common(&raw_key_path, None);
+        raw.args(["git@127.0.0.1", "true"]);
+        assert!(!raw.output().await.unwrap().status.success());
+
+        let mut wrong_user = common(&key_path, Some(&cert_path));
+        wrong_user.args(["root@127.0.0.1", "true"]);
+        assert!(!wrong_user.output().await.unwrap().status.success());
+
+        let mut malformed = common(&key_path, Some(&cert_path));
+        malformed.args(["git@127.0.0.1", "not-a-git-command"]);
+        assert!(!malformed.output().await.unwrap().status.success());
+
+        let mut receive = common(&key_path, Some(&cert_path));
+        receive
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .args([
+                "git@127.0.0.1",
+                &format!("git-receive-pack '{}'", repository.id),
+            ]);
+        let mut receive = receive.spawn().unwrap();
+        receive
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"0000")
+            .await
+            .unwrap();
+        let receive = receive.wait_with_output().await.unwrap();
+        assert!(
+            receive.status.success(),
+            "{}",
+            String::from_utf8_lossy(&receive.stderr)
+        );
+        assert_eq!(app.metrics.ssh_write_operations.load(Ordering::Relaxed), 1);
+
+        assert!(
+            app.db
+                .revoke_git_grant(&binding.user_id, &binding.client_id, &repository.id)
+                .unwrap()
+        );
+        let mut revoked = common(&key_path, Some(&cert_path));
+        revoked.args([
+            "git@127.0.0.1",
+            &format!("git-upload-pack '{}'", repository.id),
+        ]);
+        let revoked = revoked.output().await.unwrap();
+        assert!(!revoked.status.success());
+        assert!(!revoked.stderr.is_empty());
+        assert_eq!(app.metrics.ssh_upstream_failures.load(Ordering::Relaxed), 1);
+
+        let mut shell = common(&key_path, Some(&cert_path));
+        shell.args(["-T", "git@127.0.0.1"]);
+        assert!(!shell.output().await.unwrap().status.success());
+        assert!(app.metrics.ssh_auth_denied.load(Ordering::Relaxed) >= 2);
+        server_task.abort();
+        upstream_task.abort();
     }
 }

@@ -246,6 +246,11 @@ fn configure_cog(
     port: u16,
 ) -> Command {
     command
+        // Each process needs its own SSH listener as well as its HTTP listener.
+        // The application default (127.0.0.1:2222) otherwise makes this
+        // intentional two-process lease test fail at bind time.
+        .env("COG_SSH_LISTEN", format!("127.0.0.1:{}", port + 1_000))
+        .env("COG_SSH_PUBLIC_HOST", "localhost")
         .env("COG_LISTEN", format!("127.0.0.1:{port}"))
         .env("COG_BASE_URL", format!("http://127.0.0.1:{port}"))
         .env("COG_DATA_DIR", data_dir)
@@ -265,7 +270,10 @@ fn configure_cog(
 
 async fn wait_ready(port: u16) {
     let client = reqwest::Client::new();
-    for _ in 0..150 {
+    // Instrumented binaries can take several seconds to restore and acquire a
+    // lease on slower CI runners. Keep polling bounded, but do not make the
+    // takeover test depend on a three-second startup deadline.
+    for _ in 0..500 {
         if client
             .get(format!("http://127.0.0.1:{port}/healthz"))
             .send()

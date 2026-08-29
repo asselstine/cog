@@ -1181,6 +1181,11 @@ mod tests {
             parse_upstream_insufficient_scope(reqwest::StatusCode::FORBIDDEN, challenge).unwrap();
         assert_eq!(parsed.scopes, ["account:read", "workers:write"]);
         assert_eq!(
+            parsed.to_string(),
+            "upstream MCP requires additional OAuth scope: account:read workers:write"
+        );
+        assert!(std::error::Error::source(&parsed).is_none());
+        assert_eq!(
             parsed.resource_metadata,
             "https://mcp.example/.well-known/oauth-protected-resource"
         );
@@ -1196,6 +1201,13 @@ mod tests {
             .is_err()
         );
         assert!(parse_upstream_insufficient_scope(reqwest::StatusCode::FORBIDDEN, r#"Bearer error="insufficient_scope", scope="x", resource_metadata="http://example.com/meta""#).is_err());
+        for malformed in [
+            r#"Basic error="insufficient_scope""#,
+            r#"Bearer error="insufficient_scope"#,
+            "Bearer error=\"bad\rvalue\"",
+        ] {
+            assert!(bearer_parameter(malformed, "error").is_none());
+        }
     }
 
     #[tokio::test]

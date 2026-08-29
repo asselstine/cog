@@ -248,7 +248,11 @@ impl GitProvider for GitHubProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Json, Router, extract::State, routing::post};
+    use axum::{
+        Json, Router,
+        extract::State,
+        routing::{get, post},
+    };
     use serde_json::Value;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -440,5 +444,71 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         assert!(error.contains("status 307"));
         assert!(!error.contains("short-lived-secret"));
         redirect_server.abort();
+    }
+
+    #[tokio::test]
+    async fn repository_resolution_success_status_and_shape_boundaries() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let fixture = Fixture {
+            calls: Arc::new(AtomicUsize::new(0)),
+            bodies: Arc::new(Mutex::new(Vec::new())),
+        };
+        let server = tokio::spawn(
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/app/installations/7/access_tokens", post(token))
+                    .route(
+                        "/repos/owner/repo",
+                        get(|| async {
+                            Json(json!({
+                                "id":42,
+                                "full_name":"owner/repo",
+                                "clone_url":"https://github.com/owner/repo.git",
+                                "private":true
+                            }))
+                        }),
+                    )
+                    .route(
+                        "/repos/owner/malformed",
+                        get(|| async { Json(json!({"id":"wrong"})) }),
+                    )
+                    .with_state(fixture.clone()),
+            )
+            .into_future(),
+        );
+        let provider =
+            GitHubProvider::new("1".into(), "7".into(), address.to_string(), KEY).unwrap();
+        for invalid in ["owner", "owner/repo/extra", "../repo"] {
+            assert!(
+                provider
+                    .resolve_repository(&RepositoryReference(invalid.into()))
+                    .await
+                    .is_err()
+            );
+        }
+        let repository = provider
+            .resolve_repository(&RepositoryReference("owner/repo".into()))
+            .await
+            .unwrap();
+        assert_eq!(repository.provider_repository_id, "42");
+        assert_eq!(repository.display_name, "owner/repo");
+        assert_eq!(repository.metadata["private"], true);
+        assert!(
+            provider
+                .resolve_repository(&RepositoryReference("owner/missing".into()))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("status 404")
+        );
+        assert!(
+            provider
+                .resolve_repository(&RepositoryReference("owner/malformed".into()))
+                .await
+                .is_err()
+        );
+        server.abort();
     }
 }

@@ -5,6 +5,24 @@ use std::{
     time::Duration,
 };
 
+#[cfg(unix)]
+fn stop(child: &mut std::process::Child) {
+    assert!(
+        Command::new("kill")
+            .args(["-INT", &child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(child.wait().unwrap().success());
+}
+
+#[cfg(not(unix))]
+fn stop(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 fn command(home: &std::path::Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_cog"));
     command
@@ -55,8 +73,12 @@ fn readme_first_run_bootstraps_and_restarts() {
             }
             thread::sleep(Duration::from_millis(50));
         }
-        let _ = child.kill();
-        let _ = child.wait();
+        if ready {
+            stop(&mut child);
+        } else {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         assert!(
             ready,
             "cog did not serve /readyz; stderr:\n{}",

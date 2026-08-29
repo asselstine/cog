@@ -227,6 +227,136 @@ mod tests {
     }
     impl std::error::Error for Injected {}
 
+    #[derive(Debug)]
+    struct Wrapped(Injected);
+    impl fmt::Display for Wrapped {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("outer")
+        }
+    }
+    impl std::error::Error for Wrapped {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    #[test]
+    fn every_phase_classification_and_guidance_is_bounded() {
+        let phases = [
+            (
+                StartupPhase::StorageInitialization,
+                "storage initialization",
+                "bucket",
+            ),
+            (
+                StartupPhase::ConditionalWriteProbe,
+                "conditional-write probing",
+                "conditional",
+            ),
+            (StartupPhase::LeaseAcquisition, "lease acquisition", "lease"),
+            (StartupPhase::Restore, "database restore", "LTX"),
+            (
+                StartupPhase::DatabaseOpen,
+                "local database initialization",
+                "SQLite",
+            ),
+            (
+                StartupPhase::InitialReplication,
+                "initial replication",
+                "lease",
+            ),
+        ];
+        for (phase, label, guidance) in phases {
+            assert_eq!(phase.to_string(), label);
+            let rendered = StartupError::new(phase, &Injected("opaque".into())).to_string();
+            assert!(rendered.contains(label));
+            assert!(rendered.contains(guidance));
+        }
+
+        let categories = [
+            ("ExpiredToken secret", "credentials expired"),
+            ("credential secret", "credentials unavailable or rejected"),
+            ("request timed out secret", "storage request timed out"),
+            ("DNS secret", "storage endpoint could not be reached"),
+            (
+                "precondition secret",
+                "storage conditional-write requirement was not met",
+            ),
+            ("NoSuchBucket secret", "bucket or object was not found"),
+            (
+                "opaque secret",
+                "storage operation failed (provider details redacted)",
+            ),
+        ];
+        for (raw, expected) in categories {
+            let error = Wrapped(Injected(raw.into()));
+            assert_eq!(redacted_error(&error), expected);
+            let safe = safe_error(&error);
+            assert!(safe.starts_with(expected));
+            assert!(!safe.contains("secret"));
+        }
+    }
+
+    #[test]
+    fn every_git_classification_is_bounded() {
+        let categories = [
+            ("zlib secret", "invalid Git pack stream"),
+            ("upstream discovery secret", "upstream Git discovery failed"),
+            ("upstream git rpc secret", "upstream Git request failed"),
+            ("idle timeout secret", "Git transport timed out"),
+            ("stream limit secret", "Git transport limit exceeded"),
+            ("client disconnected secret", "Git client disconnected"),
+            (
+                "grant revoked secret",
+                "Git authorization is no longer valid",
+            ),
+            ("opaque secret", "Git transport operation failed"),
+        ];
+        for (raw, expected) in categories {
+            assert_eq!(safe_git_error(&Wrapped(Injected(raw.into()))), expected);
+        }
+    }
+
+    #[test]
+    fn credential_precedence_covers_partial_and_complete_providers() {
+        let classify = |set: &[&str]| credential_provider_class_from(|name| set.contains(&name));
+        assert_eq!(
+            classify(&["AWS_ACCESS_KEY_ID"]),
+            "environment/static credentials (not renewable)"
+        );
+        assert_eq!(
+            classify(&["AWS_SECRET_ACCESS_KEY"]),
+            "environment/static credentials (not renewable)"
+        );
+        assert_eq!(
+            classify(&["AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_ROLE_ARN"]),
+            "web identity credentials (renewable)"
+        );
+        assert_eq!(
+            classify(&["AWS_WEB_IDENTITY_TOKEN_FILE"]),
+            "EC2 instance metadata credentials (renewable)"
+        );
+        assert_eq!(
+            classify(&["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"]),
+            "container credentials (renewable)"
+        );
+        assert_eq!(
+            classify(&[
+                "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+                "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE"
+            ]),
+            "container credentials (renewable)"
+        );
+        assert_eq!(
+            classify(&["AWS_CONTAINER_CREDENTIALS_FULL_URI"]),
+            "EC2 instance metadata credentials (renewable)"
+        );
+        assert_eq!(
+            classify(&[]),
+            "EC2 instance metadata credentials (renewable)"
+        );
+    }
+
     #[test]
     fn git_errors_are_bounded_and_do_not_retain_input() {
         let error = Injected("corrupt deflate stream token=recognizable-secret".into());

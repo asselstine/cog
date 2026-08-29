@@ -369,6 +369,21 @@ mod tests {
             ))
         }
     }
+    struct ScopeRequired;
+    #[async_trait]
+    impl ToolProvider for ScopeRequired {
+        async fn tools(&self) -> anyhow::Result<Vec<Tool>> {
+            Ok(vec![Tool {
+                name: "restricted".into(),
+                description: None,
+                input_schema: json!({}),
+                extra: serde_json::Map::new(),
+            }])
+        }
+        async fn call(&self, _name: &str, _args: Value) -> anyhow::Result<Value> {
+            Err(crate::authz::InsufficientScope::one("integration:restricted").into())
+        }
+    }
     #[tokio::test(flavor = "multi_thread")]
     async fn codemode_host_calls_and_errors() {
         let mut c = Catalog::new();
@@ -441,6 +456,12 @@ mod tests {
         big.add("big".into(), Arc::new(Big));
         let big = Arc::new(big);
         assert_eq!(
+            r.execute("codemode.search(''); return null".into(), big.clone(),)
+                .await
+                .unwrap(),
+            Value::Null
+        );
+        assert_eq!(
             r.execute(
                 format!(
                     "return codemode.call('big.make',{{text:'{}'}})",
@@ -465,14 +486,54 @@ mod tests {
             "tool result exceeds byte limit"
         );
         let aggregate = format!(
-            "{} return null",
+            "{} return codemode.call('big.make',{{size:{}}})",
             format!(
                 "codemode.call('big.make',{{size:{}}});",
-                MAX_RESULT_BYTES - 1
+                MAX_RESULT_BYTES - 3
             )
-            .repeat(5)
+            .repeat(4),
+            MAX_RESULT_BYTES - 3,
         );
-        assert_eq!(r.execute(aggregate, big).await.unwrap(), Value::Null);
+        assert_eq!(
+            r.execute(aggregate, big).await.unwrap()["error"],
+            "aggregate tool result limit exceeded"
+        );
+        assert_eq!(
+            r.execute(
+                "return __cog_call('unknown','','null')".into(),
+                Arc::new(Catalog::new()),
+            )
+            .await
+            .unwrap()["error"],
+            "unknown codemode operation"
+        );
+
+        let mut restricted = Catalog::new();
+        restricted.add("scope".into(), Arc::new(ScopeRequired));
+        let restricted = Arc::new(restricted);
+        assert_eq!(
+            r.execute(
+                "codemode.search(''); return null".into(),
+                restricted.clone(),
+            )
+            .await
+            .unwrap(),
+            Value::Null
+        );
+        let error = r
+            .execute(
+                "return codemode.call('scope.restricted',{})".into(),
+                restricted,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<crate::authz::InsufficientScope>()
+                .unwrap()
+                .scopes,
+            ["integration:restricted"]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
