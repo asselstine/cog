@@ -219,7 +219,10 @@ pub fn validate_transport(
 ) -> anyhow::Result<()> {
     validate_policy(config)?;
     match transport {
-        "http" | "sse" => {
+        "sse" => anyhow::bail!(
+            "legacy SSE integrations are unsupported; reconfigure with a Streamable HTTP endpoint using transport 'http'"
+        ),
+        "http" => {
             let parsed: HttpTransportConfig = serde_json::from_value(config.clone())?;
             anyhow::ensure!(
                 matches!(parsed.url.scheme(), "http" | "https"),

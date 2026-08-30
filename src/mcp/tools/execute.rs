@@ -14,8 +14,11 @@ pub fn definition() -> NativeToolDefinition {
         description: "Run JavaScript in an isolated V8 runtime. The execute tool accepts a synchronous JavaScript function body. Write statements directly; do not wrap them in a function or arrow function, do not use async/await, and do not return a Promise. Include an explicit return statement.",
         input_schema: json!({
             "type":"object",
-            "properties":{"code":{"type":"string","description":INSTRUCTIONS}},
-            "required":["code"],
+            "properties":{
+                "code":{"type":"string","description":INSTRUCTIONS},
+                "integrations":{"type":"array","items":{"type":"string"},"uniqueItems":true,"description":"Immutable integration IDs this invocation may access. Every integration used by codemode.describe or codemode.call must be declared here."}
+            },
+            "required":["code","integrations"],
             "additionalProperties":false
         }),
         annotations: annotations("mcp", false, false, false, true),

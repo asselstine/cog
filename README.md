@@ -123,7 +123,10 @@ curl -X POST "$COG_URL/api/integrations" \
   }'
 ```
 
-Supported configuration types are streamable HTTP/SSE and local stdio. Static HTTP headers can be supplied when creating an integration; they are encrypted before storage.
+Supported MCP upstream transports are Streamable HTTP and local stdio. The
+legacy two-endpoint HTTP+SSE transport is unsupported; replace existing SSE
+integrations with a Streamable HTTP endpoint. Static HTTP headers can be
+supplied when creating an integration; they are encrypted before storage.
 
 For upstream OAuth, add an `oauth` object. Clanker Operations Gateway discovers RFC 9728 protected-resource metadata, then supports both OAuth Authorization Server Metadata and OpenID Connect Discovery. Endpoints and a `client_id` may also be configured explicitly. When an authorization server advertises Client ID Metadata Document support, cog identifies itself with its stable `/.well-known/oauth-client` URL; otherwise it retains Dynamic Client Registration as a compatibility fallback. The protected metadata's exact `resource` URI is sent once in the authorization request and is bound to code exchange and refresh. Servers without protected-resource metadata can use an explicit `oauth.resource`; cog rejects a conflict rather than guessing which audience is correct. Resource URIs must be absolute, contain no userinfo or fragment, and use HTTPS except for loopback development.
 
@@ -201,7 +204,7 @@ least 95.25% line coverage.
 ### Request path and code mode
 
 The MCP endpoint defaults to hybrid mode at `/mcp`: `execute` provides code-mode
-access to every connected integration without expanding their tools into the
+access to explicitly declared integrations without expanding their tools into the
 top-level list, while COG-native tools are advertised directly. Native Git
 orchestration includes `repository_access`, `ssh_key_status`,
 `ssh_key_register`, and `ssh_key_lease_renew`; native
@@ -214,7 +217,22 @@ An agent discovers cog's OAuth metadata and dynamically registers an untrusted O
 
 Dynamic client registration remains automatic and requires no registration credential. Clanker Operations Gateway limits registrations to 128-byte client names, 10 unique redirect URIs of at most 2,048 bytes each, and 16 KiB of metadata. It accepts at most 20 registration attempts per minute, reuses an identical recent unused registration, removes unused registrations after 24 hours, and retains at most 1,000 unused clients. Clients with retained tokens or a live authorization code are never removed by this cleanup.
 
-Clanker Operations Gateway negotiates MCP `2025-11-25` and retains `2025-06-18` compatibility for clients and upstream servers. Each execution creates a fresh V8 isolate. The isolate has no filesystem, environment, process, socket, or unrestricted network APIs. Its only privileged host bridge is:
+Clanker Operations Gateway uses the official Rust MCP SDK, supports
+`server/discover` and MCP `2026-07-28`, and lets the SDK negotiate supported
+older lifecycle versions. Every `execute` call supplies an `integrations` array
+of immutable integration IDs; Cog preauthorizes the complete set and the V8 host
+cannot reach an undeclared integration. For example:
+
+```json
+{
+  "code": "return codemode.call('integration-id.tool-name', {});",
+  "integrations": ["integration-id"]
+}
+```
+
+Each execution creates a fresh V8 isolate. The isolate has no filesystem,
+environment, process, socket, or unrestricted network APIs. Its only privileged
+host bridge is:
 
 - `codemode.search(query)` performs case-insensitive literal substring matching (not semantic search) across names and descriptions without loading every schema. If a task phrase returns no matches, use `codemode.search("")` to enumerate the full catalog. Enabled integrations remain discoverable regardless of upstream connection or downstream grant state. Results report `upstreamConnected`, `upstreamStatus`, `clientAccessGranted`, and the exact OAuth `requiredScope`; describing or calling an ungranted integration produces only an `insufficient_scope` challenge so a capable host can request downstream incremental consent.
 - `codemode.describe("integration-id.tool-name")` returns one tool's schema. Both `describe` and `call` require the immutable target returned by search, not an integration label or bare tool name.

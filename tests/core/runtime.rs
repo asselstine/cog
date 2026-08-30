@@ -28,13 +28,7 @@ struct Fake;
 #[async_trait]
 impl ToolProvider for Fake {
     async fn tools(&self) -> anyhow::Result<Vec<Tool>> {
-        Ok(vec![Tool {
-            name: "add".into(),
-            title: None,
-            description: None,
-            input_schema: json!({}),
-            extra: serde_json::Map::new(),
-        }])
+        Ok(vec![Tool::new("add", "", serde_json::Map::new())])
     }
     async fn call(&self, name: &str, args: Value) -> anyhow::Result<Value> {
         anyhow::ensure!(name == "add", "unknown tool");
@@ -59,13 +53,7 @@ struct ScopeRequired;
 #[async_trait]
 impl ToolProvider for ScopeRequired {
     async fn tools(&self) -> anyhow::Result<Vec<Tool>> {
-        Ok(vec![Tool {
-            name: "restricted".into(),
-            title: None,
-            description: None,
-            input_schema: json!({}),
-            extra: serde_json::Map::new(),
-        }])
+        Ok(vec![Tool::new("restricted", "", serde_json::Map::new())])
     }
     async fn call(&self, _name: &str, _args: Value) -> anyhow::Result<Value> {
         Err(crate::authz::InsufficientScope::one("integration:restricted").into())

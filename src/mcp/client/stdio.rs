@@ -1,299 +1,145 @@
-use super::{MAX_DIAGNOSTIC_BYTES, MAX_MESSAGE_BYTES, MCP_PROTOCOL_VERSION, RPC_TIMEOUT};
-use crate::mcp::catalog::ToolProvider;
-use crate::mcp::model::Tool;
+use super::{MAX_DIAGNOSTIC_BYTES, RPC_TIMEOUT};
+use crate::mcp::{Tool, catalog::ToolProvider};
 use async_trait::async_trait;
-use serde_json::{Value, json};
-use std::{collections::HashMap, process::Stdio, sync::Arc, time::Duration};
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin, ChildStdout, Command},
-    sync::Mutex,
+use rmcp::{
+    ServiceExt,
+    model::{CallToolRequestParams, ClientInfo},
+    service::{RoleClient, RunningService},
+    transport::TokioChildProcess,
 };
+use serde_json::Value;
+use std::{collections::HashMap, process::Stdio, sync::Arc};
+use tokio::{io::AsyncReadExt, process::Command, sync::Mutex};
+
+type Client = RunningService<RoleClient, ClientInfo>;
 
 #[derive(Clone)]
 pub struct StdioMcp {
     command: String,
     args: Vec<String>,
     env: HashMap<String, String>,
-    process: Arc<Mutex<Option<StdioProcess>>>,
-    next: Arc<Mutex<u64>>,
+    client: Arc<Mutex<Option<Client>>>,
     diagnostics: Arc<Mutex<String>>,
 }
 
-struct StdioProcess {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
-}
-
-struct CancelProcessOnDrop<'a> {
-    process: &'a mut StdioProcess,
-    armed: bool,
-}
-
-impl Drop for CancelProcessOnDrop<'_> {
-    fn drop(&mut self) {
-        if self.armed {
-            terminate_process_tree(&mut self.process.child);
-        }
-    }
-}
 impl StdioMcp {
     pub fn new(command: String, args: Vec<String>, env: HashMap<String, String>) -> Self {
         Self {
             command,
             args,
             env,
-            process: Arc::new(Mutex::new(None)),
-            next: Arc::new(Mutex::new(1)),
+            client: Arc::new(Mutex::new(None)),
             diagnostics: Arc::new(Mutex::new(String::new())),
         }
     }
 
-    async fn start(&self) -> anyhow::Result<StdioProcess> {
+    async fn connect(&self) -> anyhow::Result<Client> {
         let mut command = Command::new(&self.command);
-        command
-            .args(&self.args)
-            .envs(&self.env)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
+        command.args(&self.args).envs(&self.env);
+        let (transport, stderr) = TokioChildProcess::builder(command)
             .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        #[cfg(unix)]
-        command.process_group(0);
-        let mut child = command.spawn()?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("stdio MCP stdin unavailable"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("stdio MCP stdout unavailable"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("stdio MCP stderr unavailable"))?;
-        let diagnostics = self.diagnostics.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let mut text = diagnostics.lock().await;
-                if !text.is_empty() {
-                    text.push('\n');
-                }
-                text.push_str(&line);
-                if text.len() > MAX_DIAGNOSTIC_BYTES {
-                    let split = text.len() - MAX_DIAGNOSTIC_BYTES;
-                    *text = text.split_off(split);
-                }
-            }
-        });
-        let mut process = StdioProcess {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout),
-        };
-        Self::write(
-            &mut process,
-            &json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":MCP_PROTOCOL_VERSION,"capabilities":{},"clientInfo":{"name":"cog","version":env!("CARGO_PKG_VERSION")}}}),
-        )
-        .await?;
-        let result = Self::read_response(&mut process, 0, RPC_TIMEOUT).await?;
-        validate_initialize(&result)?;
-        Self::write(
-            &mut process,
-            &json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
-        )
-        .await?;
-        Ok(process)
-    }
-
-    async fn write(process: &mut StdioProcess, message: &Value) -> anyhow::Result<()> {
-        let encoded = serde_json::to_vec(message)?;
-        anyhow::ensure!(
-            encoded.len() <= MAX_MESSAGE_BYTES,
-            "stdio request too large"
-        );
-        process.stdin.write_all(&encoded).await?;
-        process.stdin.write_all(b"\n").await?;
-        process.stdin.flush().await?;
-        Ok(())
-    }
-
-    async fn read_response(
-        process: &mut StdioProcess,
-        id: u64,
-        timeout: Duration,
-    ) -> anyhow::Result<Value> {
-        tokio::time::timeout(timeout, async {
-            loop {
-                let line = read_bounded_line(&mut process.stdout).await?;
-                let value: Value = serde_json::from_slice(&line)?;
-                if value.get("id") == Some(&json!(id)) {
-                    if let Some(error) = value.get("error") {
-                        anyhow::bail!("upstream MCP error: {error}")
+            .spawn()?;
+        if let Some(mut stderr) = stderr {
+            let diagnostics = self.diagnostics.clone();
+            let secrets = self
+                .env
+                .values()
+                .filter(|value| !value.is_empty())
+                .cloned()
+                .collect::<Vec<_>>();
+            tokio::spawn(async move {
+                let mut bytes = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                while let Ok(read) = stderr.read(&mut chunk).await {
+                    if read == 0 {
+                        break;
                     }
-                    return Ok(value.get("result").cloned().unwrap_or(Value::Null));
-                }
-                // Notifications and responses to cancelled/older requests are
-                // deliberately consumed while waiting for our serialized ID.
-            }
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("stdio MCP request timed out"))?
-    }
-
-    async fn reset(process: &mut Option<StdioProcess>) {
-        if let Some(mut old) = process.take() {
-            terminate_process_tree(&mut old.child);
-            let _ = old.child.wait().await;
-        }
-    }
-
-    async fn rpc(&self, method: &str, params: Value) -> anyhow::Result<Value> {
-        let mut process = self.process.lock().await;
-        let attempts = if method == "tools/list" { 2 } else { 1 };
-        let mut last_error = None;
-        for _ in 0..attempts {
-            if process.is_none() {
-                match self.start().await {
-                    Ok(started) => *process = Some(started),
-                    Err(error) => {
-                        last_error = Some(error);
-                        continue;
+                    bytes.extend_from_slice(&chunk[..read]);
+                    if bytes.len() > MAX_DIAGNOSTIC_BYTES {
+                        bytes.drain(..bytes.len() - MAX_DIAGNOSTIC_BYTES);
                     }
+                    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+                    for secret in &secrets {
+                        text = text.replace(secret, "[REDACTED]");
+                    }
+                    *diagnostics.lock().await = text;
                 }
-            }
-            let id = {
-                let mut next = self.next.lock().await;
-                let id = *next;
-                *next += 1;
-                id
-            };
-            let current = process.as_mut().expect("stdio process initialized");
-            let mut cancellation = CancelProcessOnDrop {
-                process: current,
-                armed: true,
-            };
-            let result = async {
-                Self::write(
-                    cancellation.process,
-                    &json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
-                )
-                .await?;
-                Self::read_response(cancellation.process, id, RPC_TIMEOUT).await
-            }
-            .await;
-            cancellation.armed = false;
-            drop(cancellation);
-            match result {
-                Ok(value) => return Ok(value),
-                Err(error) => {
-                    last_error = Some(error);
-                    Self::reset(&mut process).await;
-                }
-            }
+            });
         }
-        let diagnostics = self.diagnostics.lock().await.clone();
-        let error = last_error.unwrap_or_else(|| anyhow::anyhow!("stdio MCP unavailable"));
-        if diagnostics.is_empty() {
-            Err(error)
-        } else {
-            Err(error.context(format!("stdio diagnostics: {diagnostics}")))
+        ClientInfo::default()
+            .serve(transport)
+            .await
+            .map_err(|error| anyhow::anyhow!("stdio MCP initialization failed: {error}"))
+    }
+
+    async fn ensure_connected<'a>(
+        &self,
+        slot: &'a mut Option<Client>,
+    ) -> anyhow::Result<&'a mut Client> {
+        if slot.as_ref().is_none_or(Client::is_closed) {
+            *slot = Some(
+                tokio::time::timeout(RPC_TIMEOUT, self.connect())
+                    .await
+                    .map_err(|_| anyhow::anyhow!("stdio MCP initialization timed out"))??,
+            );
         }
+        Ok(slot.as_mut().expect("connected client"))
+    }
+
+    pub async fn diagnostic_tail(&self) -> String {
+        self.diagnostics.lock().await.clone()
     }
 }
 
-pub fn validate_initialize(result: &Value) -> anyhow::Result<String> {
-    let selected = result
-        .get("protocolVersion")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("upstream initialize result has no protocol version"))?;
-    anyhow::ensure!(
-        crate::mcp::protocol_version_supported(selected),
-        "upstream selected unsupported MCP protocol version"
-    );
-    anyhow::ensure!(
-        result.get("capabilities").is_some_and(Value::is_object),
-        "upstream initialize result has no capabilities object"
-    );
-    anyhow::ensure!(
-        result.get("serverInfo").is_some_and(Value::is_object),
-        "upstream initialize result has no serverInfo object"
-    );
-    Ok(selected.to_owned())
-}
-
-fn terminate_process_tree(child: &mut Child) {
-    #[cfg(unix)]
-    if let Some(pid) = child.id() {
-        // Each stdio integration is its own process group. Negative PID sends
-        // SIGKILL to the command and every descendant retaining its pipes.
-        unsafe {
-            libc::kill(-(pid as i32), libc::SIGKILL);
-        }
-        return;
-    }
-    let _ = child.start_kill();
-}
-
-async fn read_bounded_line(reader: &mut BufReader<ChildStdout>) -> anyhow::Result<Vec<u8>> {
-    let mut line = Vec::new();
-    loop {
-        let available = reader.fill_buf().await?;
-        if available.is_empty() {
-            anyhow::bail!("stdio MCP exited without response");
-        }
-        let consumed = available
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map_or(available.len(), |index| index + 1);
-        anyhow::ensure!(
-            line.len().saturating_add(consumed) <= MAX_MESSAGE_BYTES,
-            "stdio response too large"
-        );
-        line.extend_from_slice(&available[..consumed]);
-        reader.consume(consumed);
-        if line.last() == Some(&b'\n') {
-            line.pop();
-            if line.last() == Some(&b'\r') {
-                line.pop();
-            }
-            return Ok(line);
-        }
-    }
-}
 #[async_trait]
 impl ToolProvider for StdioMcp {
     async fn tools(&self) -> anyhow::Result<Vec<Tool>> {
-        let mut tools = Vec::new();
-        let mut cursor: Option<String> = None;
-        loop {
-            let params = cursor
-                .as_ref()
-                .map_or_else(|| json!({}), |cursor| json!({"cursor":cursor}));
-            let value = self.rpc("tools/list", params).await?;
-            tools.extend(serde_json::from_value::<Vec<Tool>>(
-                value.get("tools").cloned().unwrap_or(json!([])),
-            )?);
-            cursor = value
-                .get("nextCursor")
-                .and_then(Value::as_str)
-                .filter(|cursor| !cursor.is_empty())
-                .map(str::to_owned);
-            if cursor.is_none() {
-                return Ok(tools);
+        let mut slot = self.client.lock().await;
+        let client = self.ensure_connected(&mut slot).await?;
+        match tokio::time::timeout(RPC_TIMEOUT, client.list_all_tools()).await {
+            Ok(Ok(tools)) => Ok(tools),
+            first => {
+                let first = match first {
+                    Ok(Err(error)) => error.to_string(),
+                    Err(_) => "request timed out".to_owned(),
+                    Ok(Ok(_)) => unreachable!(),
+                };
+                *slot = None;
+                let retry = self.ensure_connected(&mut slot).await?.list_all_tools();
+                tokio::time::timeout(RPC_TIMEOUT, retry)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("stdio discovery timed out after restart; initial failure: {first}"))?
+                    .map_err(|second| anyhow::anyhow!("stdio discovery failed after restart: {second}; initial failure: {first}"))
             }
         }
     }
+
     async fn call(&self, name: &str, args: Value) -> anyhow::Result<Value> {
-        self.rpc("tools/call", json!({"name":name,"arguments":args}))
-            .await
+        let arguments = serde_json::from_value(args)?;
+        let mut slot = self.client.lock().await;
+        let client = self.ensure_connected(&mut slot).await?;
+        let result = tokio::time::timeout(
+            RPC_TIMEOUT,
+            client.call_tool(CallToolRequestParams::new(name.to_owned()).with_arguments(arguments)),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("stdio MCP tool call timed out"))?;
+        if result.is_err() && client.is_closed() {
+            *slot = None;
+        }
+        match result {
+            Ok(value) => Ok(serde_json::to_value(value)?),
+            Err(error) => anyhow::bail!(
+                "stdio MCP call failed: {error}; stderr: {}",
+                self.diagnostic_tail().await
+            ),
+        }
     }
+
     async fn close(&self) -> anyhow::Result<()> {
-        let mut process = self.process.lock().await;
-        Self::reset(&mut process).await;
+        if let Some(mut client) = self.client.lock().await.take() {
+            client.close_with_timeout(RPC_TIMEOUT).await?;
+        }
         Ok(())
     }
 }

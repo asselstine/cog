@@ -1,4 +1,7 @@
-use super::model::Tool;
+use super::model::{
+    META_CLIENT_ACCESS_GRANTED, META_INTEGRATION_LABEL, META_REQUIRED_SCOPE, META_SECURITY_SCHEMES,
+    Tool, insert_meta, meta_bool, meta_string, security_schemes,
+};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::{collections::HashMap, sync::Arc};
@@ -79,6 +82,10 @@ impl Catalog {
             },
         );
     }
+    pub fn retain_runtime_integrations(&mut self, declared: &std::collections::HashSet<String>) {
+        self.providers
+            .retain(|id, _| id == "git" || id == "cog" || declared.contains(id));
+    }
     pub async fn search(&self, query: &str) -> anyhow::Result<Value> {
         let q = query.to_lowercase();
         let mut found = Vec::new();
@@ -110,16 +117,10 @@ impl Catalog {
             }
             for tool in tools {
                 let target = format!("{id}.{}", tool.name);
-                let required_scope = tool
-                    .extra
-                    .get("x-cog-requiredScope")
-                    .and_then(Value::as_str)
+                let required_scope = meta_string(&tool, META_REQUIRED_SCOPE)
                     .map(str::to_owned)
                     .unwrap_or_else(|| format!("integration:{id}"));
-                let client_access_granted = tool
-                    .extra
-                    .get("x-cog-clientAccessGranted")
-                    .and_then(Value::as_bool)
+                let client_access_granted = meta_bool(&tool, META_CLIENT_ACCESS_GRANTED)
                     .unwrap_or(entry.client_access_granted);
                 let hay = format!(
                     "{} {} {} {}",
@@ -217,7 +218,7 @@ impl Catalog {
             .await?
             .into_iter()
             .map(|mut tool| {
-                tool.name = format!("{prefix}{}", tool.name);
+                tool.name = format!("{prefix}{}", tool.name).into();
                 tool
             })
             .collect())
@@ -232,13 +233,23 @@ impl Catalog {
                 continue;
             };
             for mut tool in provider.advertised_tools().await? {
-                tool.name = format!("{id}.{}", tool.name);
-                let security_schemes =
-                    json!([{"type":"oauth2","scopes":[format!("integration:{id}")]}]);
-                tool.extra
-                    .insert("securitySchemes".into(), security_schemes.clone());
-                tool.extra
-                    .insert("_meta".into(), json!({"securitySchemes":security_schemes}));
+                tool.name = format!("{id}.{}", tool.name).into();
+                insert_meta(
+                    &mut tool,
+                    META_SECURITY_SCHEMES,
+                    security_schemes([format!("integration:{id}")]),
+                );
+                insert_meta(
+                    &mut tool,
+                    META_REQUIRED_SCOPE,
+                    json!(format!("integration:{id}")),
+                );
+                insert_meta(
+                    &mut tool,
+                    META_CLIENT_ACCESS_GRANTED,
+                    json!(entry.client_access_granted),
+                );
+                insert_meta(&mut tool, META_INTEGRATION_LABEL, json!(entry.label));
                 tools.push(tool);
             }
         }

@@ -169,7 +169,7 @@ fn definition(
             true,
         ),
         "integration_create" => (
-            json!({"type":"object","properties":{"name":{"type":"string","description":"Integration display name."},"transport":{"type":"string","enum":["http","sse","stdio","git"],"description":"Connection transport."},"config":{"type":"object","description":"Transport-specific configuration."},"headers":{"type":"object","description":"Optional static upstream HTTP headers.","additionalProperties":{"type":"string"}}},"required":["name","transport","config"],"additionalProperties":false}),
+            json!({"type":"object","properties":{"name":{"type":"string","description":"Integration display name."},"transport":{"type":"string","enum":["http","stdio","git"],"description":"Connection transport. MCP upstreams support Streamable HTTP and stdio; git is Cog's native Git integration kind."},"config":{"type":"object","description":"Transport-specific configuration."},"headers":{"type":"object","description":"Optional static upstream HTTP headers.","additionalProperties":{"type":"string"}}},"required":["name","transport","config"],"additionalProperties":false}),
             false,
             false,
             false,
@@ -368,10 +368,16 @@ impl ToolProvider for AdminProvider {
                         | NativeToolId::AgentGetSelf
                         | NativeToolId::AgentUpdateSelf
                 ) || self.auth.allows(required_scope);
-                tool.extra
-                    .insert("x-cog-clientAccessGranted".into(), json!(access_granted));
-                tool.extra
-                    .insert("x-cog-requiredScope".into(), json!(required_scope));
+                crate::mcp::model::insert_meta(
+                    &mut tool,
+                    crate::mcp::model::META_CLIENT_ACCESS_GRANTED,
+                    json!(access_granted),
+                );
+                crate::mcp::model::insert_meta(
+                    &mut tool,
+                    crate::mcp::model::META_REQUIRED_SCOPE,
+                    json!(required_scope),
+                );
                 tool
             })
             .collect())
@@ -400,7 +406,7 @@ impl ToolProvider for AdminProvider {
         let arg_id = || {
             args.get("id")
                 .and_then(Value::as_str)
-                .ok_or_else(|| anyhow::anyhow!("id is required"))
+                .expect("validated administration arguments contain id")
         };
         match definition.id {
             AgentGetSelf => Ok(serde_json::to_value(
@@ -413,7 +419,7 @@ impl ToolProvider for AdminProvider {
                 let name = args
                     .get("display_name")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("display_name is required"))?;
+                    .expect("validated agent update arguments contain display_name");
                 anyhow::ensure!(
                     self.app.db.rename_self(&self.auth.agent, name)?,
                     "agent not found"
@@ -441,7 +447,7 @@ impl ToolProvider for AdminProvider {
             IntegrationGet => self
                 .app
                 .db
-                .integration(arg_id()?, &self.auth.user)?
+                .integration(arg_id(), &self.auth.user)?
                 .map(|integration| {
                     let access = self.auth.scopes.contains("admin")
                         || self.auth.integrations.contains(&integration.id);
@@ -471,39 +477,39 @@ impl ToolProvider for AdminProvider {
                 admin_github_app_setup_start(&self.app, &self.auth.user, args).await
             }
             GitHubAppSetupStatus => {
-                admin_github_app_setup_status(&self.app, &self.auth.user, arg_id()?).await
+                admin_github_app_setup_status(&self.app, &self.auth.user, arg_id()).await
             }
             IntegrationUpdate => {
-                admin_update(&self.app, &self.auth.user, arg_id()?.to_owned(), args).await
+                admin_update(&self.app, &self.auth.user, arg_id().to_owned(), args).await
             }
             IntegrationSetEnabled => {
                 let enabled = args
                     .get("enabled")
                     .and_then(Value::as_bool)
-                    .ok_or_else(|| anyhow::anyhow!("enabled is required"))?;
+                    .expect("validated integration update arguments contain enabled");
                 admin_update(
                     &self.app,
                     &self.auth.user,
-                    arg_id()?.to_owned(),
+                    arg_id().to_owned(),
                     json!({"enabled":enabled}),
                 )
                 .await
             }
-            IntegrationReconnect => admin_reconnect(&self.app, &self.auth.user, arg_id()?).await,
-            IntegrationDisconnect => admin_disconnect(&self.app, &self.auth.user, arg_id()?).await,
-            IntegrationAuthorize => admin_authorize(&self.app, &self.auth.user, arg_id()?).await,
-            IntegrationDelete => admin_delete(&self.app, &self.auth.user, arg_id()?).await,
-            AgentRevoke => admin_revoke_client(&self.app, &self.auth.user, arg_id()?).await,
-            TokenRevoke => admin_revoke_token(&self.app, &self.auth.user, arg_id()?).await,
+            IntegrationReconnect => admin_reconnect(&self.app, &self.auth.user, arg_id()).await,
+            IntegrationDisconnect => admin_disconnect(&self.app, &self.auth.user, arg_id()).await,
+            IntegrationAuthorize => admin_authorize(&self.app, &self.auth.user, arg_id()).await,
+            IntegrationDelete => admin_delete(&self.app, &self.auth.user, arg_id()).await,
+            AgentRevoke => admin_revoke_client(&self.app, &self.auth.user, arg_id()).await,
+            TokenRevoke => admin_revoke_token(&self.app, &self.auth.user, arg_id()).await,
             IdentityGrantRevoke => {
                 let client = args
                     .get("client_id")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("client_id is required"))?;
+                    .expect("validated grant arguments contain client_id");
                 let integration = args
                     .get("integration_id")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("integration_id is required"))?;
+                    .expect("validated grant arguments contain integration_id");
                 admin_revoke_grant(&self.app, &self.auth.user, client, integration).await
             }
             _ => unreachable!("administration registry returned a non-administration ID"),

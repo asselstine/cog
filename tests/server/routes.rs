@@ -13,6 +13,7 @@ use axum::{
 use cog::server::*;
 use cog::{
     Config,
+    authz::InsufficientScope,
     crypto::{SecretBox, token_hash},
     db::{Database, UpstreamOAuthClient, UpstreamOAuthToken},
     git::providers::GitProvider,
@@ -55,13 +56,7 @@ impl ToolProvider for PolicyFixture {
     async fn tools(&self) -> anyhow::Result<Vec<Tool>> {
         Ok(["read", "write"]
             .into_iter()
-            .map(|name| Tool {
-                name: name.into(),
-                title: None,
-                description: None,
-                input_schema: json!({}),
-                extra: Default::default(),
-            })
+            .map(|name| Tool::new(name, "", serde_json::Map::new()))
             .collect())
     }
     async fn call(&self, name: &str, _args: Value) -> anyhow::Result<Value> {
@@ -86,16 +81,37 @@ impl ToolProvider for FailingFixture {
 struct ScopeChallengeFixture {
     challenge: UpstreamInsufficientScope,
 }
+
+struct DownstreamScopeFixture;
+
+#[async_trait::async_trait]
+impl ToolProvider for DownstreamScopeFixture {
+    async fn tools(&self) -> anyhow::Result<Vec<Tool>> {
+        Ok(vec![Tool::new(
+            "late_scope",
+            "Discover a scope only when the upstream operation is attempted",
+            json!({"type":"object","additionalProperties":false})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )])
+    }
+
+    async fn call(&self, _name: &str, _args: Value) -> anyhow::Result<Value> {
+        Err(InsufficientScope {
+            scopes: vec!["provider:late".into(), "provider:write".into()],
+        }
+        .into())
+    }
+}
 #[async_trait::async_trait]
 impl ToolProvider for ScopeChallengeFixture {
     async fn tools(&self) -> anyhow::Result<Vec<Tool>> {
-        Ok(vec![Tool {
-            name: "search".into(),
-            title: None,
-            description: Some("Search provider operations".into()),
-            input_schema: json!({"type":"object"}),
-            extra: Default::default(),
-        }])
+        Ok(vec![Tool::new(
+            "search",
+            "Search provider operations",
+            json!({"type":"object"}).as_object().unwrap().clone(),
+        )])
     }
     async fn call(&self, _name: &str, _args: Value) -> anyhow::Result<Value> {
         Err(self.challenge.clone().into())
@@ -578,7 +594,53 @@ fn encoded_form(pairs: &[(&str, &str)]) -> String {
 
 async fn response_json(response: axum::response::Response) -> Value {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    serde_json::from_slice(&bytes).unwrap()
+    if bytes.starts_with(b"data:") {
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        let data = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .rfind(|line| !line.is_empty())
+            .unwrap();
+        serde_json::from_str(data).unwrap()
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    }
+}
+
+async fn initialize_mcp(router: &Router, token: &str) -> String {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::post("/mcp")
+                .header(http::header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .header(http::header::ACCEPT, "application/json, text/event-stream")
+                .body(Body::from(
+                    json!({
+                        "jsonrpc":"2.0","id":"initialize","method":"initialize","params":{
+                            "protocolVersion":"2025-11-25","capabilities":{},
+                            "clientInfo":{"name":"cog-tests","version":"1"}
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "{}",
+        response_text(response).await
+    );
+    response
+        .headers()
+        .get("Mcp-Session-Id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned()
 }
 
 async fn response_text(response: axum::response::Response) -> String {
@@ -1090,18 +1152,759 @@ async fn mcp_http_origin_version_and_incremental_scope_boundaries() {
         router.clone().oneshot(request).await.unwrap().status(),
         StatusCode::BAD_REQUEST
     );
-    let response = router.clone().oneshot(Request::post("/mcp?codemode=false").header(http::header::AUTHORIZATION, "Bearer mcp-boundary-token").header(http::header::CONTENT_TYPE, "application/json").body(Body::from(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cog_integration_create","arguments":{}}}).to_string())).unwrap()).await.unwrap();
+    let session = initialize_mcp(&router, "mcp-boundary-token").await;
+    let response = router.clone().oneshot(Request::post("/mcp?codemode=false").header(http::header::AUTHORIZATION, "Bearer mcp-boundary-token").header("Mcp-Session-Id", &session).header(http::header::CONTENT_TYPE, "application/json").body(Body::from(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cog_integration_create","arguments":{}}}).to_string())).unwrap()).await.unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert!(
         response
             .headers()
             .contains_key(http::header::WWW_AUTHENTICATE)
     );
-    let response = router.clone().oneshot(rpc(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"execute","arguments":{"code":format!("return codemode.describe('{integration}.tool');")}}}))).await.unwrap();
+    let response = router.clone().oneshot(Request::post("/mcp").header(http::header::AUTHORIZATION, "Bearer mcp-boundary-token").header("Mcp-Session-Id", &session).header(http::header::CONTENT_TYPE, "application/json").body(Body::from(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"execute","arguments":{"code":format!("return codemode.describe('{integration}.tool');"),"integrations":[integration.clone()]}}}).to_string())).unwrap()).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let response = router.oneshot(rpc(json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"execute","arguments":{"code":"return undefined;"}}}))).await.unwrap();
+    let response = router.oneshot(Request::post("/mcp").header(http::header::AUTHORIZATION, "Bearer mcp-boundary-token").header("Mcp-Session-Id", &session).header(http::header::CONTENT_TYPE, "application/json").body(Body::from(json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"execute","arguments":{"code":"return undefined;","integrations":[]}}}).to_string())).unwrap()).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response_json(response).await["result"]["isError"], true);
+}
+
+#[tokio::test]
+async fn mcp_sdk_discovery_codemode_validation_and_session_cleanup() {
+    let (app, _directory) = route_test_app().await;
+    let user = app.db.create_user("sdk-mcp@example.com", "hash").unwrap();
+    app.db
+        .register_client(
+            "sdk-mcp-client",
+            Some(&user),
+            "SDK MCP client",
+            &["http://localhost/callback".into()],
+        )
+        .unwrap();
+    app.db
+        .store_access_token(
+            &token_hash("sdk-mcp-token"),
+            "sdk-mcp-client",
+            &user,
+            "mcp",
+            chrono::Utc::now().timestamp() + 600,
+            None,
+            None,
+        )
+        .unwrap();
+    let router = build_router(app);
+
+    let discover = router
+        .clone()
+        .oneshot(
+            Request::post("/mcp?codemode=true")
+                .header(http::header::AUTHORIZATION, "Bearer sdk-mcp-token")
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .header(http::header::ACCEPT, "application/json, text/event-stream")
+                .header("MCP-Protocol-Version", "2026-07-28")
+                .header("Mcp-Method", "server/discover")
+                .body(Body::from(
+                    json!({
+                        "jsonrpc":"2.0",
+                        "id":"discover",
+                        "method":"server/discover",
+                        "params":{"_meta":{
+                            "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                            "io.modelcontextprotocol/clientInfo":{"name":"route-test","version":"1"},
+                            "io.modelcontextprotocol/clientCapabilities":{}
+                        }}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(discover.status(), StatusCode::OK);
+    assert!(discover.headers().get("Mcp-Session-Id").is_none());
+    let discover = response_json(discover).await;
+    assert_eq!(discover["id"], "discover");
+    assert_eq!(discover["result"]["resultType"], "complete");
+    assert!(
+        discover["result"]["supportedVersions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|version| version == "2026-07-28")
+    );
+    assert!(
+        discover["result"]["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("synchronous JavaScript")
+    );
+
+    let initialized = router
+        .clone()
+        .oneshot(
+            Request::post("/mcp?codemode=true")
+                .header(http::header::AUTHORIZATION, "Bearer sdk-mcp-token")
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .header(http::header::ACCEPT, "application/json, text/event-stream")
+                .body(Body::from(
+                    json!({
+                        "jsonrpc":"2.0","id":"init","method":"initialize","params":{
+                            "protocolVersion":"2025-11-25","capabilities":{},
+                            "clientInfo":{"name":"route-test","version":"1"}
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(initialized.status(), StatusCode::OK);
+    let session = initialized.headers()["Mcp-Session-Id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let initialized_body = response_json(initialized).await;
+    assert_eq!(initialized_body["result"]["protocolVersion"], "2025-11-25");
+    assert!(
+        initialized_body["result"]["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("synchronous JavaScript")
+    );
+
+    async fn rpc(router: &Router, session: &str, id: u64, method: &str, params: Value) -> Value {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/mcp?codemode=true")
+                    .header(http::header::AUTHORIZATION, "Bearer sdk-mcp-token")
+                    .header("Mcp-Session-Id", session)
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        if response.status() != StatusCode::OK {
+            panic!(
+                "unexpected MCP status for request {id}: {}",
+                response_text(response).await
+            );
+        }
+        response_json(response).await
+    }
+
+    let listed = rpc(&router, &session, 1, "tools/list", json!({})).await;
+    assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["result"]["tools"][0]["name"], "execute");
+    assert_eq!(
+        listed["result"]["tools"][0]["inputSchema"]["required"],
+        json!(["code", "integrations"])
+    );
+
+    let unknown = rpc(
+        &router,
+        &session,
+        2,
+        "tools/call",
+        json!({"name":"not-a-tool","arguments":{}}),
+    )
+    .await;
+    assert_eq!(unknown["error"]["code"], -32601);
+    for (id, arguments) in [
+        (3, json!({"integrations":[]})),
+        (4, json!({"code":"return 1;","integrations":{}})),
+        (5, json!({"code":"return 1;","integrations":[1]})),
+    ] {
+        let invalid = rpc(
+            &router,
+            &session,
+            id,
+            "tools/call",
+            json!({"name":"execute","arguments":arguments}),
+        )
+        .await;
+        assert_eq!(invalid["error"]["code"], -32602);
+    }
+
+    let unknown_integration = rpc(
+        &router,
+        &session,
+        6,
+        "tools/call",
+        json!({"name":"execute","arguments":{
+            "code":"return 1;","integrations":["missing-integration"]
+        }}),
+    )
+    .await;
+    assert_eq!(unknown_integration["result"]["isError"], true);
+    assert_eq!(
+        unknown_integration["result"]["structuredContent"]["error"]["corrective"],
+        true
+    );
+    assert!(
+        unknown_integration["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("unknown integration")
+    );
+
+    let success = rpc(
+        &router,
+        &session,
+        7,
+        "tools/call",
+        json!({"name":"execute","arguments":{
+            "code":"return {answer: 42};","integrations":[]
+        }}),
+    )
+    .await;
+    assert_ne!(success["result"]["isError"], true);
+    assert_eq!(success["result"]["structuredContent"]["answer"], 42);
+    assert_eq!(success["result"]["content"][0]["type"], "text");
+
+    let deleted = router
+        .clone()
+        .oneshot(
+            Request::delete("/mcp")
+                .header(http::header::AUTHORIZATION, "Bearer sdk-mcp-token")
+                .header("Mcp-Session-Id", &session)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::ACCEPTED);
+    let after_delete = router
+        .oneshot(
+            Request::post("/mcp")
+                .header(http::header::AUTHORIZATION, "Bearer sdk-mcp-token")
+                .header("Mcp-Session-Id", &session)
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"jsonrpc":"2.0","id":8,"method":"ping"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(after_delete.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn mcp_sdk_hybrid_native_dispatch_protocol_errors_and_limits() {
+    let (app, _directory) = route_test_app().await;
+    let user = app
+        .db
+        .create_user("sdk-hybrid@example.com", "hash")
+        .unwrap();
+    app.db
+        .register_client(
+            "sdk-hybrid-client",
+            Some(&user),
+            "SDK hybrid client",
+            &["http://localhost/callback".into()],
+        )
+        .unwrap();
+    app.db
+        .store_access_token(
+            &token_hash("sdk-hybrid-token"),
+            "sdk-hybrid-client",
+            &user,
+            "mcp integrations:read integrations:write agents:read agents:write tokens:read tokens:write audit:read identity:write git:read git:write",
+            chrono::Utc::now().timestamp() + 600,
+            None,
+            None,
+        )
+        .unwrap();
+    let other_identity = app.db.create_identity(&user, "Other identity").unwrap();
+    let first = app
+        .db
+        .create_connection(
+            &user,
+            &other_identity,
+            "First",
+            "http",
+            &json!({"url":"http://127.0.0.1:1/mcp"}),
+            None,
+        )
+        .unwrap();
+    let second = app
+        .db
+        .create_connection(
+            &user,
+            &other_identity,
+            "Second",
+            "http",
+            &json!({"url":"http://127.0.0.1:2/mcp"}),
+            None,
+        )
+        .unwrap();
+    let router = build_router(app);
+    let session = initialize_mcp(&router, "sdk-hybrid-token").await;
+
+    async fn request(router: &Router, session: &str, body: Value) -> axum::response::Response {
+        router
+            .clone()
+            .oneshot(
+                Request::post("/mcp?codemode=false")
+                    .header(http::header::AUTHORIZATION, "Bearer sdk-hybrid-token")
+                    .header("Mcp-Session-Id", session)
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    let initialized = request(
+        &router,
+        &session,
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+    )
+    .await;
+    assert_eq!(initialized.status(), StatusCode::ACCEPTED);
+    assert!(response_text(initialized).await.is_empty());
+
+    let ping = request(
+        &router,
+        &session,
+        json!({"jsonrpc":"2.0","id":1,"method":"ping"}),
+    )
+    .await;
+    assert_eq!(ping.status(), StatusCode::OK);
+    assert_eq!(response_json(ping).await["result"], json!({}));
+
+    let listed = request(
+        &router,
+        &session,
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+    )
+    .await;
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed = response_json(listed).await;
+    let tools = listed["result"]["tools"]
+        .as_array()
+        .unwrap_or_else(|| panic!("unexpected tools/list response: {listed}"));
+    assert!(tools.iter().any(|tool| tool["name"] == "execute"));
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool["name"] == "cog_integrations_list")
+    );
+    assert!(
+        tools
+            .iter()
+            .all(|tool| tool.get("securitySchemes").is_none())
+    );
+    let native = tools
+        .iter()
+        .find(|tool| tool["name"] == "cog_integrations_list")
+        .unwrap();
+    assert_eq!(
+        native["_meta"]["com.clanker.cog/requiredScope"],
+        "integrations:read"
+    );
+    assert_eq!(
+        native["_meta"]["com.clanker.cog/securitySchemes"][0]["scopes"],
+        json!(["integrations:read"])
+    );
+
+    let native_call = request(
+        &router,
+        &session,
+        json!({
+            "jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"cog_integrations_list","arguments":{}}
+        }),
+    )
+    .await;
+    assert_eq!(native_call.status(), StatusCode::OK);
+    let native_call = response_json(native_call).await;
+    assert_ne!(native_call["result"]["isError"], true);
+    let integrations = native_call["result"]["structuredContent"]["result"]
+        .as_array()
+        .unwrap();
+    assert_eq!(integrations.len(), 2);
+    assert!(integrations.iter().any(|value| value["id"] == first));
+    assert!(integrations.iter().any(|value| value["id"] == second));
+    assert!(
+        native_call["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("First")
+    );
+
+    let bad_native_call = request(
+        &router,
+        &session,
+        json!({
+            "jsonrpc":"2.0","id":4,"method":"tools/call",
+            "params":{"name":"cog_integration_get","arguments":{}}
+        }),
+    )
+    .await;
+    assert_eq!(bad_native_call.status(), StatusCode::OK);
+    let bad_native_call = response_json(bad_native_call).await;
+    assert_eq!(bad_native_call["result"]["isError"], true);
+    assert_eq!(
+        bad_native_call["result"]["structuredContent"]["error"]["corrective"],
+        true
+    );
+    assert!(
+        bad_native_call["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("id")
+    );
+
+    let primitive = request(
+        &router,
+        &session,
+        json!({
+            "jsonrpc":"2.0","id":5,"method":"tools/call",
+            "params":{"name":"execute","arguments":{
+                "code":"return 42;","integrations":[]
+            }}
+        }),
+    )
+    .await;
+    assert_eq!(primitive.status(), StatusCode::OK);
+    let primitive = response_json(primitive).await;
+    assert_eq!(primitive["result"]["structuredContent"]["result"], 42);
+    assert_eq!(primitive["result"]["content"][0]["text"], "42");
+
+    let accumulated_scope = request(
+        &router,
+        &session,
+        json!({
+            "jsonrpc":"2.0","id":6,"method":"tools/call",
+            "params":{"name":"execute","arguments":{
+                "code":"return 1;","integrations":[first.clone(),second.clone()]
+            }}
+        }),
+    )
+    .await;
+    assert_eq!(accumulated_scope.status(), StatusCode::FORBIDDEN);
+    let challenge = accumulated_scope.headers()[http::header::WWW_AUTHENTICATE]
+        .to_str()
+        .unwrap();
+    assert!(challenge.contains(&format!("integration:{first}")));
+    assert!(challenge.contains(&format!("integration:{second}")));
+    assert!(challenge.contains("scope=\"mcp "));
+    assert_eq!(
+        response_text(accumulated_scope).await,
+        "additional authorization is required"
+    );
+
+    let unknown_method = request(
+        &router,
+        &session,
+        json!({"jsonrpc":"2.0","id":7,"method":"cog/unknown"}),
+    )
+    .await;
+    assert_eq!(unknown_method.status(), StatusCode::OK);
+    assert_eq!(response_json(unknown_method).await["error"]["code"], -32601);
+
+    let malformed = router
+        .clone()
+        .oneshot(
+            Request::post("/mcp")
+                .header(http::header::AUTHORIZATION, "Bearer sdk-hybrid-token")
+                .header("Mcp-Session-Id", &session)
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{not-json"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(malformed.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+    let oversized = router
+        .oneshot(
+            Request::post("/mcp")
+                .header(http::header::AUTHORIZATION, "Bearer sdk-hybrid-token")
+                .header("Mcp-Session-Id", &session)
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    "x".repeat(cog::mcp::client::MAX_MESSAGE_BYTES + 1),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(oversized.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn mcp_sdk_late_scope_error_is_structured_for_same_client_reauthorization() {
+    let (app, _directory) = route_test_app().await;
+    let user = app
+        .db
+        .create_user("sdk-late-scope@example.com", "hash")
+        .unwrap();
+    app.db
+        .register_client(
+            "sdk-late-scope-client",
+            Some(&user),
+            "SDK late scope client",
+            &["http://localhost/callback".into()],
+        )
+        .unwrap();
+    let integration = app
+        .db
+        .create_integration(
+            &user,
+            "Late scope fixture",
+            "http",
+            &json!({"url":"http://fixture.invalid/mcp"}),
+            None,
+        )
+        .unwrap();
+    app.db
+        .store_access_token(
+            &token_hash("sdk-late-scope-token"),
+            "sdk-late-scope-client",
+            &user,
+            &format!("mcp integration:{integration}"),
+            chrono::Utc::now().timestamp() + 600,
+            None,
+            None,
+        )
+        .unwrap();
+    app.providers
+        .lock()
+        .await
+        .insert(integration.clone(), Arc::new(DownstreamScopeFixture));
+    let router = build_router(app);
+    let session = initialize_mcp(&router, "sdk-late-scope-token").await;
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::post("/mcp?codemode=true")
+                .header(
+                    http::header::AUTHORIZATION,
+                    "Bearer sdk-late-scope-token",
+                )
+                .header("Mcp-Session-Id", &session)
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "jsonrpc":"2.0","id":1,"method":"tools/call",
+                        "params":{"name":"execute","arguments":{
+                            "code":format!("return codemode.call('{integration}.late_scope', {{}});"),
+                            "integrations":[integration]
+                        }}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = response_json(response).await;
+    assert_eq!(response["result"]["isError"], true);
+    assert_eq!(
+        response["result"]["structuredContent"]["error"],
+        "insufficient_scope"
+    );
+    assert_eq!(
+        response["result"]["structuredContent"]["requiredScopes"],
+        json!(["mcp", "provider:late", "provider:write"])
+    );
+    assert_eq!(
+        response["result"]["structuredContent"]["action"],
+        "reauthorizeSameClient"
+    );
+    assert_eq!(
+        response["result"]["structuredContent"]["prohibitedAction"],
+        "integration_reconnect"
+    );
+    let message = response["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(message.contains("provider:late"));
+    assert!(message.contains("provider:write"));
+    assert!(message.contains("same MCP client"));
+    assert!(message.contains("Do not use integration_reconnect"));
+    let challenges = response["result"]["_meta"]["mcp/www_authenticate"]
+        .as_array()
+        .unwrap();
+    assert_eq!(challenges.len(), 1);
+    let challenge = challenges[0].as_str().unwrap();
+    assert!(challenge.starts_with("Bearer resource_metadata="));
+    assert!(challenge.contains("/.well-known/oauth-protected-resource"));
+    assert!(challenge.contains("error=\"insufficient_scope\""));
+    assert!(challenge.contains("scope=\"mcp provider:late provider:write\""));
+
+    let deleted = router
+        .oneshot(
+            Request::delete("/mcp")
+                .header(http::header::AUTHORIZATION, "Bearer sdk-late-scope-token")
+                .header("Mcp-Session-Id", session)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::ACCEPTED);
+}
+
+#[tokio::test]
+async fn sdk_native_providers_validate_typed_arguments_and_delegate_lifecycle() {
+    let (app, _directory) = route_test_app().await;
+    let user = app
+        .db
+        .create_user("sdk-native-provider@example.com", "hash")
+        .unwrap();
+    app.db
+        .register_client(
+            "sdk-native-provider-client",
+            Some(&user),
+            "SDK native provider client",
+            &["http://localhost/callback".into()],
+        )
+        .unwrap();
+    app.db
+        .store_access_token(
+            &token_hash("sdk-native-provider-token"),
+            "sdk-native-provider-client",
+            &user,
+            "mcp integrations:read integrations:write agents:read agents:write audit:read",
+            chrono::Utc::now().timestamp() + 600,
+            None,
+            None,
+        )
+        .unwrap();
+    let row = app
+        .db
+        .token_context(
+            &token_hash("sdk-native-provider-token"),
+            chrono::Utc::now().timestamp(),
+        )
+        .unwrap()
+        .unwrap();
+    let auth = AuthContext {
+        user: row.user_id,
+        agent: row.agent_id,
+        client: row.client_id,
+        identity: row.identity_id,
+        scopes: row.scopes.into_iter().collect(),
+        integrations: row.integration_ids.into_iter().collect(),
+    };
+
+    let admin = AdminProvider {
+        app: app.clone(),
+        auth: auth.clone(),
+    };
+    let updated = admin
+        .call(
+            "agent_update_self",
+            json!({"display_name":"Renamed SDK agent"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated["display_name"], "Renamed SDK agent");
+    assert_eq!(updated["oauth_client_id"], "sdk-native-provider-client");
+    assert_eq!(updated["identity_id"], auth.identity);
+    let current = admin.call("agent_get_self", json!({})).await.unwrap();
+    assert_eq!(current["display_name"], "Renamed SDK agent");
+    assert_eq!(current["id"], auth.agent);
+    let missing = admin
+        .call("integration_get", json!({"id":"missing"}))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(missing.contains("integration not found"));
+    let invalid_setup = admin
+        .call("github_app_setup_start", json!({"name":1}))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(!invalid_setup.is_empty());
+    let invalid_update = admin
+        .call(
+            "agent_update_self",
+            json!({"display_name":"name","unexpected":true}),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(invalid_update.contains("unknown field"));
+
+    let git = GitControlProvider {
+        app: app.clone(),
+        auth: auth.clone(),
+    };
+    let tools = git.tools().await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].name, "repository_access");
+    assert!(
+        git.call("missing", json!({}))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("unknown Git control operation")
+    );
+    assert!(
+        git.call("repository_access", json!({}))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("missing field")
+    );
+    assert!(
+        git.call("repository_access", json!({"integrationId":"id"}))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("repository")
+    );
+    assert!(
+        git.call("ssh_key_status", json!({"publicKey":1}))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("string")
+    );
+    let mut no_scope = auth.clone();
+    no_scope.scopes.clear();
+    let unauthorized_git = GitControlProvider {
+        app: app.clone(),
+        auth: no_scope,
+    };
+    let error = unauthorized_git
+        .call(
+            "repository_access",
+            json!({"integrationId":"id","repository":"owner/repo"}),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.downcast_ref::<InsufficientScope>().is_some());
+
+    let oauth = OAuthStepUpProvider {
+        inner: Arc::new(PolicyFixture),
+        app: app.clone(),
+        user: user.clone(),
+        integration: "unused".into(),
+    };
+    assert_eq!(oauth.advertised_tools().await.unwrap().len(), 2);
+    oauth.close().await.unwrap();
+    let measured = MeasuredProvider {
+        inner: Arc::new(PolicyFixture),
+        metrics: app.metrics.clone(),
+    };
+    measured.close().await.unwrap();
+    let policy = PolicyProvider {
+        inner: Arc::new(PolicyFixture),
+        allow: None,
+        deny: HashSet::new(),
+    };
+    assert_eq!(policy.advertised_tools().await.unwrap().len(), 2);
+    policy.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -1432,12 +2235,14 @@ async fn route_flow_covers_metadata_consent_tokens_mcp_and_admin_scopes() {
             .unwrap()
             .contains("scope=\"mcp\"")
     );
+    let mcp_session = initialize_mcp(&router, &access).await;
 
     let mcp = router
         .clone()
         .oneshot(
             axum::http::Request::post("/mcp")
                 .header(http::header::AUTHORIZATION, format!("Bearer {access}"))
+                .header("Mcp-Session-Id", &mcp_session)
                 .header(http::header::CONTENT_TYPE, "application/json")
                 .body(axum::body::Body::from(
                     json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}).to_string(),
@@ -1469,6 +2274,7 @@ async fn route_flow_covers_metadata_consent_tokens_mcp_and_admin_scopes() {
         .oneshot(
             axum::http::Request::post("/mcp?codemode=true")
                 .header(http::header::AUTHORIZATION, format!("Bearer {access}"))
+                .header("Mcp-Session-Id", &mcp_session)
                 .header(http::header::CONTENT_TYPE, "application/json")
                 .body(axum::body::Body::from(
                     json!({"jsonrpc":"2.0","id":21,"method":"tools/list"}).to_string(),
@@ -1490,6 +2296,7 @@ async fn route_flow_covers_metadata_consent_tokens_mcp_and_admin_scopes() {
         .oneshot(
             axum::http::Request::post("/mcp?codemode=maybe")
                 .header(http::header::AUTHORIZATION, format!("Bearer {access}"))
+                .header("Mcp-Session-Id", &mcp_session)
                 .header(http::header::CONTENT_TYPE, "application/json")
                 .body(axum::body::Body::from(
                     json!({"jsonrpc":"2.0","id":22,"method":"ping"}).to_string(),
@@ -1501,10 +2308,7 @@ async fn route_flow_covers_metadata_consent_tokens_mcp_and_admin_scopes() {
     assert_eq!(malformed_mode.status(), StatusCode::BAD_REQUEST);
 
     for (header, expected) in [
-        (
-            ("MCP-Protocol-Version", "2024-11-05"),
-            StatusCode::BAD_REQUEST,
-        ),
+        (("MCP-Protocol-Version", "2024-11-05"), StatusCode::OK),
         (
             (http::header::ORIGIN.as_str(), "https://evil.example"),
             StatusCode::FORBIDDEN,
@@ -1515,6 +2319,7 @@ async fn route_flow_covers_metadata_consent_tokens_mcp_and_admin_scopes() {
             .oneshot(
                 axum::http::Request::post("/mcp")
                     .header(http::header::AUTHORIZATION, format!("Bearer {access}"))
+                    .header("Mcp-Session-Id", &mcp_session)
                     .header(http::header::CONTENT_TYPE, "application/json")
                     .header(header.0, header.1)
                     .body(axum::body::Body::from(
@@ -1543,6 +2348,7 @@ async fn route_flow_covers_metadata_consent_tokens_mcp_and_admin_scopes() {
         .oneshot(
             axum::http::Request::post("/mcp?codemode=false")
                 .header(http::header::AUTHORIZATION, "Bearer step-up-token")
+                .header("Mcp-Session-Id", &mcp_session)
                 .header(http::header::CONTENT_TYPE, "application/json")
                 .body(axum::body::Body::from(
                     json!({
@@ -1562,17 +2368,13 @@ async fn route_flow_covers_metadata_consent_tokens_mcp_and_admin_scopes() {
         .unwrap();
     assert_eq!(hidden_integration_call.status(), StatusCode::OK);
     let hidden_integration_call = response_json(hidden_integration_call).await;
-    assert!(
-        hidden_integration_call["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("unknown tool")
-    );
+    assert_eq!(hidden_integration_call["error"]["code"], -32601);
     let step_up = router
         .clone()
         .oneshot(
             axum::http::Request::post("/mcp")
                 .header(http::header::AUTHORIZATION, "Bearer step-up-token")
+                .header("Mcp-Session-Id", &mcp_session)
                 .header(http::header::CONTENT_TYPE, "application/json")
                 .body(axum::body::Body::from(
                     json!({
@@ -1582,7 +2384,8 @@ async fn route_flow_covers_metadata_consent_tokens_mcp_and_admin_scopes() {
                         "params":{
                             "name":"execute",
                             "arguments":{
-                                "code":format!("return codemode.describe('{integration}.tool');")
+                                "code":format!("return codemode.describe('{integration}.tool');"),
+                                "integrations":[integration.clone()]
                             }
                         }
                     })
@@ -1593,8 +2396,7 @@ async fn route_flow_covers_metadata_consent_tokens_mcp_and_admin_scopes() {
         .await
         .unwrap();
     assert_eq!(step_up.status(), StatusCode::OK);
-    let step_up = response_json(step_up).await;
-    assert_ne!(step_up["result"]["isError"], true);
+    assert_ne!(response_json(step_up).await["result"]["isError"], true);
 
     // A capable MCP client accumulates its existing scopes with the scope
     // from the 403 challenge, performs a fresh authorization-code flow,
@@ -1709,6 +2511,7 @@ async fn route_flow_covers_metadata_consent_tokens_mcp_and_admin_scopes() {
                     http::header::AUTHORIZATION,
                     format!("Bearer {elevated_access}"),
                 )
+                .header("Mcp-Session-Id", &mcp_session)
                 .header(http::header::CONTENT_TYPE, "application/json")
                 .body(axum::body::Body::from(
                     json!({
@@ -1718,7 +2521,8 @@ async fn route_flow_covers_metadata_consent_tokens_mcp_and_admin_scopes() {
                         "params":{
                             "name":"execute",
                             "arguments":{
-                                "code":format!("return codemode.describe('{integration}.echo');")
+                                "code":format!("return codemode.describe('{integration}.echo');"),
+                                "integrations":[integration.clone()]
                             }
                         }
                     })
@@ -1731,7 +2535,10 @@ async fn route_flow_covers_metadata_consent_tokens_mcp_and_admin_scopes() {
     assert_eq!(retried.status(), StatusCode::OK);
     let retried = response_json(retried).await;
     assert_ne!(retried["result"]["isError"], true);
-    assert_eq!(retried["result"]["structuredContent"]["name"], "echo");
+    assert_eq!(
+        retried["result"]["structuredContent"]["name"], "echo",
+        "{retried}"
+    );
 
     let hidden_elevated_integration_call = router
         .clone()
@@ -1741,6 +2548,7 @@ async fn route_flow_covers_metadata_consent_tokens_mcp_and_admin_scopes() {
                     http::header::AUTHORIZATION,
                     format!("Bearer {elevated_access}"),
                 )
+                .header("Mcp-Session-Id", &mcp_session)
                 .header(http::header::CONTENT_TYPE, "application/json")
                 .body(axum::body::Body::from(
                     json!({
@@ -1760,18 +2568,14 @@ async fn route_flow_covers_metadata_consent_tokens_mcp_and_admin_scopes() {
         .unwrap();
     assert_eq!(hidden_elevated_integration_call.status(), StatusCode::OK);
     let hidden_elevated_integration_call = response_json(hidden_elevated_integration_call).await;
-    assert!(
-        hidden_elevated_integration_call["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("unknown tool")
-    );
+    assert_eq!(hidden_elevated_integration_call["error"]["code"], -32601);
 
     let dynamic_step_up = router
         .clone()
         .oneshot(
             axum::http::Request::post("/mcp")
                 .header(http::header::AUTHORIZATION, "Bearer step-up-token")
+                .header("Mcp-Session-Id", &mcp_session)
                 .header(http::header::CONTENT_TYPE, "application/json")
                 .body(axum::body::Body::from(
                     json!({
@@ -1781,7 +2585,8 @@ async fn route_flow_covers_metadata_consent_tokens_mcp_and_admin_scopes() {
                         "params":{
                             "name":"execute",
                             "arguments":{
-                                "code":"const matches = codemode.search('metadata fixture'); return codemode.describe(matches[0].integration + '.tool');"
+                                "code":"const matches = codemode.search('metadata fixture'); return codemode.describe(matches[0].integration + '.tool');",
+                                "integrations":[integration.clone()]
                             }
                         }
                     })
@@ -1792,13 +2597,16 @@ async fn route_flow_covers_metadata_consent_tokens_mcp_and_admin_scopes() {
         .await
         .unwrap();
     assert_eq!(dynamic_step_up.status(), StatusCode::OK);
-    let dynamic_step_up = response_json(dynamic_step_up).await;
-    assert_ne!(dynamic_step_up["result"]["isError"], true);
+    assert_ne!(
+        response_json(dynamic_step_up).await["result"]["isError"],
+        true
+    );
     let admin_step_up = router
         .clone()
         .oneshot(
             axum::http::Request::post("/mcp")
                 .header(http::header::AUTHORIZATION, "Bearer step-up-token")
+                .header("Mcp-Session-Id", &mcp_session)
                 .header(http::header::CONTENT_TYPE, "application/json")
                 .body(axum::body::Body::from(
                     json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"cog_integration_create","arguments":{}}}).to_string(),
@@ -1819,6 +2627,7 @@ async fn route_flow_covers_metadata_consent_tokens_mcp_and_admin_scopes() {
         .oneshot(
             axum::http::Request::post("/mcp")
                 .header(http::header::AUTHORIZATION, format!("Bearer {access}"))
+                .header("Mcp-Session-Id", &mcp_session)
                 .header(http::header::CONTENT_TYPE, "application/json")
                 .body(axum::body::Body::from(
                     json!({"jsonrpc":"2.0","method":"notifications/initialized"}).to_string(),
@@ -3389,6 +4198,20 @@ async fn provider_metrics_catalog_construction_and_oauth_shortcuts() {
         .create_integration(&user, "unknown", "future", &json!({}), None)
         .unwrap();
     let built = catalog(&app, &auth).await.unwrap();
+    let legacy = built.search("events").await.unwrap();
+    let legacy = legacy
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["integrationLabel"] == "events")
+        .unwrap();
+    assert_eq!(legacy["upstreamConnected"], false);
+    assert!(
+        legacy["upstreamStatus"]
+            .as_str()
+            .unwrap()
+            .contains("reconfigure with a Streamable HTTP endpoint")
+    );
     assert_eq!(
         built
             .call(&format!("{cached}.read"), json!({}))
@@ -3523,16 +4346,16 @@ async fn administration_provider_is_least_privilege_and_redacts_secrets() {
         .await
         .unwrap()
         .into_iter()
-        .map(|tool| (tool.name, tool.extra))
+        .map(|tool| (tool.name, tool.meta.unwrap_or_default()))
         .collect::<HashMap<_, _>>();
     assert!(names.contains_key("integrations_list"));
     assert!(names.contains_key("integration_delete"));
     assert_eq!(
-        names["integration_delete"]["x-cog-clientAccessGranted"],
+        names["integration_delete"][cog::mcp::model::META_CLIENT_ACCESS_GRANTED],
         false
     );
     assert_eq!(
-        names["integration_delete"]["x-cog-requiredScope"],
+        names["integration_delete"][cog::mcp::model::META_REQUIRED_SCOPE],
         "integrations:write"
     );
     assert!(
@@ -3757,16 +4580,13 @@ fn native_administration_tools_have_precise_safety_and_scope_metadata() {
             .tool()
     };
     let create = native_tool("integration_create");
-    assert_eq!(create.extra["annotations"]["readOnlyHint"], false);
-    assert_eq!(create.extra["annotations"]["destructiveHint"], false);
-    assert_eq!(create.extra["annotations"]["openWorldHint"], true);
+    let create_annotations = create.annotations.as_ref().unwrap();
+    assert_eq!(create_annotations.read_only_hint, Some(false));
+    assert_eq!(create_annotations.destructive_hint, Some(false));
+    assert_eq!(create_annotations.open_world_hint, Some(true));
     assert_eq!(
-        create.extra["securitySchemes"][0]["scopes"],
+        create.meta.as_ref().unwrap()[cog::mcp::model::META_SECURITY_SCHEMES][0]["scopes"],
         json!(["integrations:write"])
-    );
-    assert_eq!(
-        create.extra["_meta"]["securitySchemes"],
-        create.extra["securitySchemes"]
     );
     assert_eq!(
         create.input_schema["required"],
@@ -3785,17 +4605,14 @@ fn native_administration_tools_have_precise_safety_and_scope_metadata() {
     assert_eq!(native_admin_scope("execute"), None);
 
     let disconnect = native_tool("integration_disconnect");
-    assert_eq!(disconnect.extra["annotations"]["readOnlyHint"], false);
-    assert_eq!(disconnect.extra["annotations"]["destructiveHint"], true);
-    assert_eq!(disconnect.extra["annotations"]["idempotentHint"], true);
-    assert_eq!(disconnect.extra["annotations"]["openWorldHint"], false);
+    let disconnect_annotations = disconnect.annotations.as_ref().unwrap();
+    assert_eq!(disconnect_annotations.read_only_hint, Some(false));
+    assert_eq!(disconnect_annotations.destructive_hint, Some(true));
+    assert_eq!(disconnect_annotations.idempotent_hint, Some(true));
+    assert_eq!(disconnect_annotations.open_world_hint, Some(false));
     assert_eq!(
-        disconnect.extra["securitySchemes"][0]["scopes"],
+        disconnect.meta.as_ref().unwrap()[cog::mcp::model::META_SECURITY_SCHEMES][0]["scopes"],
         json!(["integrations:write"])
-    );
-    assert_eq!(
-        disconnect.extra["_meta"]["securitySchemes"],
-        disconnect.extra["securitySchemes"]
     );
 }
 
@@ -4554,7 +5371,6 @@ fn oauth_uri_transport_and_redaction_boundaries() {
 
     let valid = [
         ("http", json!({"url":"https://example.com/mcp"}), false),
-        ("sse", json!({"url":"https://example.com/sse"}), false),
         ("stdio", json!({"command":"safe-command","args":[]}), true),
     ];
     for (transport, config, allow_stdio) in valid {
@@ -4562,6 +5378,7 @@ fn oauth_uri_transport_and_redaction_boundaries() {
     }
     let invalid = [
         ("unknown", json!({}), false),
+        ("sse", json!({"url":"https://example.com/sse"}), false),
         ("http", json!({}), false),
         ("http", json!({"url":"file:///tmp/socket"}), false),
         ("stdio", json!({"command":"safe-command"}), false),

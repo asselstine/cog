@@ -157,6 +157,15 @@ pub async fn catalog(a: &App, auth: &AuthContext) -> anyhow::Result<Catalog> {
             .filter(|i| i.enabled && (compatibility_all || i.identity_id == auth.identity))
     {
         let authorized = compatibility_all || auth.integrations.contains(&i.id);
+        if i.transport == "sse" {
+            c.add_unavailable(
+                i.id,
+                i.name,
+                "unsupported: legacy SSE transport; reconfigure with a Streamable HTTP endpoint",
+                authorized,
+            );
+            continue;
+        }
         let oauth_enabled = i.config.get("oauth").is_some_and(|value| !value.is_null());
         if !oauth_enabled && let Some(provider) = a.providers.lock().await.get(&i.id).cloned() {
             if authorized {
@@ -171,7 +180,7 @@ pub async fn catalog(a: &App, auth: &AuthContext) -> anyhow::Result<Catalog> {
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("invalid integration config"))?;
         let provider: Option<Arc<dyn ToolProvider>> = match i.transport.as_str() {
-            "http" | "sse" => {
+            "http" => {
                 let url = cfg
                     .get("url")
                     .and_then(Value::as_str)
@@ -198,12 +207,7 @@ pub async fn catalog(a: &App, auth: &AuthContext) -> anyhow::Result<Catalog> {
                     };
                     headers.insert("Authorization".into(), authorization);
                 }
-                let provider = if i.transport == "sse" {
-                    HttpMcp::new_sse(url, headers)
-                } else {
-                    HttpMcp::new(url, headers)
-                };
-                Some(Arc::new(provider))
+                Some(Arc::new(HttpMcp::new(url, headers)))
             }
             "stdio" => {
                 anyhow::ensure!(

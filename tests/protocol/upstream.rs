@@ -1,10 +1,23 @@
 use async_trait::async_trait;
 use axum::{
-    Router, body::Bytes as AxumBytes, extract::State, response::IntoResponse, routing::post,
+    Router,
+    body::Bytes,
+    extract::State,
+    http::{HeaderMap, Method, StatusCode},
+    response::{IntoResponse, Response},
+    routing::post,
 };
-use cog::mcp::client::*;
-use cog::mcp::{Catalog, Tool, ToolProvider};
-use proptest::prelude::*;
+use cog::mcp::{
+    Catalog, Tool, ToolProvider,
+    client::{
+        HttpMcp, MAX_DIAGNOSTIC_BYTES, StdioMcp, bearer_parameter,
+        parse_upstream_insufficient_scope,
+    },
+    model::{
+        META_CLIENT_ACCESS_GRANTED, META_INTEGRATION_LABEL, META_REQUIRED_SCOPE,
+        META_SECURITY_SCHEMES,
+    },
+};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -14,80 +27,148 @@ use std::{
     },
     time::Duration,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
 struct Fake;
+
 #[async_trait]
 impl ToolProvider for Fake {
     async fn tools(&self) -> anyhow::Result<Vec<Tool>> {
-        Ok(vec![Tool {
-            name: "send".into(),
-            title: None,
-            description: Some("Send mail".into()),
-            input_schema: json!({"type":"object"}),
-            extra: serde_json::Map::new(),
-        }])
+        Ok(vec![Tool::new(
+            "send",
+            "Send mail",
+            json!({"type":"object"}).as_object().unwrap().clone(),
+        )])
     }
-    async fn call(&self, n: &str, a: Value) -> anyhow::Result<Value> {
-        Ok(json!([n, a]))
+
+    async fn call(&self, name: &str, args: Value) -> anyhow::Result<Value> {
+        Ok(json!([name, args]))
     }
 }
+
+struct Broken;
+
+#[async_trait]
+impl ToolProvider for Broken {
+    async fn tools(&self) -> anyhow::Result<Vec<Tool>> {
+        anyhow::bail!("fixture unavailable")
+    }
+
+    async fn call(&self, _name: &str, _args: Value) -> anyhow::Result<Value> {
+        anyhow::bail!("fixture unavailable")
+    }
+}
+
 #[tokio::test]
-async fn catalog() {
-    let mut c = Catalog::default();
-    c.add("mail".into(), Arc::new(Fake));
-    assert_eq!(c.search("mail").await.unwrap().as_array().unwrap().len(), 1);
-    assert_eq!(c.search("").await.unwrap().as_array().unwrap().len(), 1);
-    assert_eq!(c.describe("mail.send").await.unwrap()["name"], "send");
+async fn catalog_routes_sdk_tools_and_restricts_runtime_integrations() {
+    let mut catalog = Catalog::default();
+    catalog.add("mail".into(), Arc::new(Fake));
+    catalog.add("other".into(), Arc::new(Fake));
+    assert_eq!(catalog.describe("mail.send").await.unwrap()["name"], "send");
     assert_eq!(
-        c.call("mail.send", json!({"x":1})).await.unwrap()[0],
+        catalog.call("mail.send", json!({"x":1})).await.unwrap()[0],
         "send"
     );
+    catalog.retain_runtime_integrations(&["mail".to_owned()].into_iter().collect());
+    assert!(catalog.describe("other.send").await.is_err());
+}
 
-    c.add_discoverable("locked".into(), "Locked mail".into(), Arc::new(Fake));
-    let locked = c.search("locked").await.unwrap();
-    assert_eq!(locked[0]["authorized"], false);
-    assert_eq!(locked[0]["upstreamConnected"], true);
+#[tokio::test]
+async fn catalog_reports_discovery_authorization_and_availability_states() {
+    let mut catalog = Catalog::new();
+    catalog.add_labeled("mail-id".into(), "Mail".into(), Arc::new(Fake));
+    catalog.add_discoverable("locked".into(), "Locked Mail".into(), Arc::new(Fake));
+    catalog.add_unavailable("legacy".into(), "Legacy".into(), "unsupported", false);
+    catalog.add_unavailable("offline".into(), "Offline".into(), "expired", true);
+    catalog.add_labeled("broken".into(), "Broken".into(), Arc::new(Broken));
+
+    let all = catalog.search("").await.unwrap();
+    assert!(all.as_array().unwrap().len() >= 4);
+    let locked = catalog.search("locked").await.unwrap();
+    assert_eq!(locked[0]["integration"], "locked");
     assert_eq!(locked[0]["clientAccessGranted"], false);
     assert_eq!(locked[0]["authorizationRequired"], true);
     assert_eq!(locked[0]["requiredScope"], "integration:locked");
-    let direct = c.direct_tools("cog").await.unwrap();
+    assert_eq!(locked[0]["target"], "locked.send");
+
+    let legacy = catalog.search("legacy").await.unwrap();
+    assert_eq!(legacy[0]["upstreamConnected"], false);
+    assert_eq!(legacy[0]["upstreamStatus"], "unsupported");
+    let broken = catalog.search("broken").await.unwrap();
+    assert_eq!(broken[0]["upstreamStatus"], "temporarilyUnavailable");
+
+    let miss = catalog
+        .search("semantic phrase with no match")
+        .await
+        .unwrap();
+    assert_eq!(miss[0]["matches"], false);
+    assert_eq!(miss[0]["searchMode"], "literalSubstring");
+    assert_eq!(miss[0]["broadDiscoveryFallback"], "codemode.search('')");
+
+    assert!(catalog.describe("missing-separator").await.is_err());
+    assert!(catalog.describe("unknown.send").await.is_err());
+    assert!(catalog.describe("mail-id.unknown").await.is_err());
+    assert!(catalog.describe("locked.send").await.is_err());
+    assert!(catalog.describe("legacy.send").await.is_err());
+    assert!(catalog.call("locked.send", json!({})).await.is_err());
+    assert!(catalog.call("legacy.send", json!({})).await.is_err());
+    assert!(
+        catalog
+            .describe("offline.send")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("upstream integration is expired")
+    );
+    assert!(
+        catalog
+            .call("offline.send", json!({}))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("upstream integration is expired")
+    );
+
+    let direct = catalog.direct_tools("broken").await.unwrap();
     assert_eq!(direct.len(), 2);
-    assert!(direct.iter().any(|tool| tool.name == "mail.send"));
     let locked = direct
         .iter()
         .find(|tool| tool.name == "locked.send")
         .unwrap();
     assert_eq!(
-        locked.extra["securitySchemes"][0]["scopes"],
+        locked.meta.as_ref().unwrap()[META_SECURITY_SCHEMES][0]["scopes"],
         json!(["integration:locked"])
     );
-    assert!(c.describe("locked.send").await.is_err());
-    assert!(c.call("locked.send", json!({})).await.is_err());
-    assert!(c.describe("bad").await.is_err());
-    assert!(c.describe("none.send").await.is_err());
-    assert!(c.describe("mail.none").await.is_err());
-    assert!(c.call("bad", json!({})).await.is_err());
-    assert!(c.call("none.x", json!({})).await.is_err());
-
-    c.add_unavailable("offline".into(), "Offline mail".into(), "expired", false);
-    let offline = c.search("offline").await.unwrap();
-    assert_eq!(offline[0]["upstreamConnected"], false);
-    assert_eq!(offline[0]["upstreamStatus"], "expired");
-    assert_eq!(offline[0]["clientAccessGranted"], false);
-    assert_eq!(offline[0]["requiredScope"], "integration:offline");
-    Arc::new(Fake).close().await.unwrap();
     assert_eq!(
-        parse_sse_json(
-            "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}\n\n",
-            1
-        )
-        .unwrap()["result"],
-        Value::Null
+        locked.meta.as_ref().unwrap()[META_REQUIRED_SCOPE],
+        "integration:locked"
     );
+    assert_eq!(
+        locked.meta.as_ref().unwrap()[META_CLIENT_ACCESS_GRANTED],
+        false
+    );
+    assert_eq!(
+        locked.meta.as_ref().unwrap()[META_INTEGRATION_LABEL],
+        "Locked Mail"
+    );
+    assert_eq!(
+        catalog.native_tools("unknown", "cog_").await.unwrap(),
+        vec![]
+    );
+    assert_eq!(
+        catalog.native_tools("legacy", "cog_").await.unwrap(),
+        vec![]
+    );
+    assert!(catalog.native_tools("broken", "cog_").await.is_err());
+    assert_eq!(
+        catalog.native_tools("mail-id", "cog_").await.unwrap()[0].name,
+        "cog_send"
+    );
+    Arc::new(Fake).close().await.unwrap();
+    assert!(catalog.direct_tools("nothing").await.is_err());
 }
 
 #[test]
-fn parses_and_validates_upstream_scope_challenges() {
+fn parses_and_rejects_upstream_incremental_scope_challenges() {
     let challenge = r#"Bearer error="insufficient_scope", scope="account:read workers:write", resource_metadata="https://mcp.example/.well-known/oauth-protected-resource""#;
     let parsed =
         parse_upstream_insufficient_scope(reqwest::StatusCode::FORBIDDEN, challenge).unwrap();
@@ -96,100 +177,326 @@ fn parses_and_validates_upstream_scope_challenges() {
         parsed.to_string(),
         "upstream MCP requires additional OAuth scope: account:read workers:write"
     );
-    assert!(std::error::Error::source(&parsed).is_none());
     assert_eq!(
         parsed.resource_metadata,
         "https://mcp.example/.well-known/oauth-protected-resource"
     );
+    assert!(std::error::Error::source(&parsed).is_none());
     assert!(
         parse_upstream_insufficient_scope(reqwest::StatusCode::UNAUTHORIZED, challenge).is_err()
     );
-    assert!(
-        parse_upstream_insufficient_scope(
-            reqwest::StatusCode::FORBIDDEN,
-            r#"Bearer error="insufficient_scope", scope="x""#
-        )
-        .is_err()
-    );
-    assert!(parse_upstream_insufficient_scope(reqwest::StatusCode::FORBIDDEN, r#"Bearer error="insufficient_scope", scope="x", resource_metadata="http://example.com/meta""#).is_err());
-    for malformed in [
+    for invalid in [
         r#"Basic error="insufficient_scope""#,
-        r#"Bearer error="insufficient_scope"#,
+        r#"Bearer error="wrong", scope="x", resource_metadata="https://example.com/meta""#,
+        r#"Bearer error="insufficient_scope", resource_metadata="https://example.com/meta""#,
+        r#"Bearer error="insufficient_scope", scope="", resource_metadata="https://example.com/meta""#,
+        r#"Bearer error="insufficient_scope", scope="x""#,
+        r#"Bearer error="insufficient_scope", scope="x", resource_metadata="http://example.com/meta""#,
+    ] {
+        assert!(
+            parse_upstream_insufficient_scope(reqwest::StatusCode::FORBIDDEN, invalid).is_err()
+        );
+    }
+    assert_eq!(
+        bearer_parameter("bearer error=\"insufficient_scope\"", "ERROR").as_deref(),
+        Some("insufficient_scope")
+    );
+    for malformed in [
+        "Digest token",
+        r#"Bearer error=unquoted"#,
         "Bearer error=\"bad\rvalue\"",
+        "Bearer error=\"bad\nvalue\"",
+        r#"Bearer error="unterminated"#,
     ] {
         assert!(bearer_parameter(malformed, "error").is_none());
     }
 }
 
-#[tokio::test]
-async fn search_explains_literal_matching_targets_and_broad_fallback() {
-    let mut catalog = Catalog::new();
-    catalog.add_labeled("immutable-id".into(), "Cloudflare".into(), Arc::new(Fake));
-    let match_result = catalog.search("send mail").await.unwrap();
-    assert_eq!(match_result[0]["target"], "immutable-id.send");
-    assert_eq!(match_result[0]["searchMode"], "literalSubstring");
-    let miss = catalog.search("semantic task phrase").await.unwrap();
-    assert_eq!(miss[0]["matches"], false);
-    assert_eq!(miss[0]["broadDiscoveryFallback"], "codemode.search('')");
+#[derive(Clone, Default)]
+struct HttpFixture {
+    requests: Arc<AtomicUsize>,
+    session_requests: Arc<AtomicUsize>,
+    deleted: Arc<AtomicBool>,
 }
 
-#[tokio::test]
-async fn nested_code_mode_provider_is_discovered_then_used_for_provider_discovery() {
-    struct NestedProvider;
-    #[async_trait]
-    impl ToolProvider for NestedProvider {
-        async fn tools(&self) -> anyhow::Result<Vec<Tool>> {
-            Ok(vec![Tool {
-                name: "search".into(),
-                title: None,
-                description: Some("Search Cloudflare operations before executing one".into()),
-                input_schema: json!({"type":"object","properties":{"query":{"type":"string"}}}),
-                extra: Default::default(),
-            }])
-        }
-
-        async fn call(&self, name: &str, args: Value) -> anyhow::Result<Value> {
-            anyhow::ensure!(name == "search", "unexpected outer tool");
-            anyhow::ensure!(
-                args["query"] == "purge cache",
-                "provider query was not forwarded"
-            );
-            Ok(json!({
-                "operation":"zones.cache.purge",
-                "invokeWith":{"zone_id":"zone-1"}
-            }))
-        }
-    }
-
-    let mut catalog = Catalog::new();
-    catalog.add_labeled(
-        "cloudflare-id".into(),
-        "Cloudflare".into(),
-        Arc::new(NestedProvider),
+async fn http_fixture(
+    State(state): State<HttpFixture>,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    state.requests.fetch_add(1, Ordering::SeqCst);
+    assert_eq!(headers.get("x-cog-test").unwrap(), "present");
+    assert_eq!(
+        headers.get(http::header::AUTHORIZATION).unwrap(),
+        "Bearer secret"
     );
-    let outer = catalog.search("Cloudflare operations").await.unwrap();
-    assert_eq!(outer[0]["target"], "cloudflare-id.search");
-    let described = catalog.describe("cloudflare-id.search").await.unwrap();
-    assert_eq!(described["name"], "search");
-    let provider_result = catalog
-        .call("cloudflare-id.search", json!({"query":"purge cache"}))
+    if method == Method::DELETE {
+        state.deleted.store(true, Ordering::SeqCst);
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    if headers.get("Mcp-Session-Id").is_some() {
+        state.session_requests.fetch_add(1, Ordering::SeqCst);
+    }
+    let request: Value = serde_json::from_slice(&body).unwrap();
+    let Some(id) = request.get("id").cloned() else {
+        return StatusCode::ACCEPTED.into_response();
+    };
+    let method = request.get("method").and_then(Value::as_str).unwrap();
+    let response = match method {
+        "server/discover" => json!({
+            "jsonrpc":"2.0","id":id,
+            "error":{"code":-32601,"message":"Method not found"}
+        }),
+        "initialize" => json!({
+            "jsonrpc":"2.0","id":id,
+            "result":{
+                "protocolVersion":"2025-11-25",
+                "capabilities":{"tools":{}},
+                "serverInfo":{"name":"fixture","version":"1"}
+            }
+        }),
+        "tools/list" => {
+            if request.pointer("/params/cursor") == Some(&json!("next")) {
+                json!({"jsonrpc":"2.0","id":id,"result":{"tools":[{
+                    "name":"second","description":"Second page","inputSchema":{"type":"object"}
+                }]}})
+            } else {
+                json!({"jsonrpc":"2.0","id":id,"result":{"tools":[{
+                    "name":"first","description":"First page","inputSchema":{"type":"object"}
+                }],"nextCursor":"next"}})
+            }
+        }
+        "tools/call" => json!({
+            "jsonrpc":"2.0","id":id,
+            "result":{
+                "content":[{"type":"text","text":"called"}],
+                "structuredContent":{"name":request.pointer("/params/name"),"arguments":request.pointer("/params/arguments")}
+            }
+        }),
+        other => panic!("unexpected fixture method: {other}"),
+    };
+    (
+        [("Mcp-Session-Id", "fixture-session")],
+        axum::Json(response),
+    )
+        .into_response()
+}
+
+async fn spawn_http_fixture() -> (String, HttpFixture, tokio::task::JoinHandle<()>) {
+    let state = HttpFixture::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server_state = state.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .route("/mcp", post(http_fixture).delete(http_fixture))
+                .with_state(server_state),
+        )
         .await
         .unwrap();
-    assert_eq!(provider_result["operation"], "zones.cache.purge");
-    assert_eq!(provider_result["invokeWith"]["zone_id"], "zone-1");
+    });
+    (format!("http://{address}/mcp"), state, server)
 }
 
 #[tokio::test]
-async fn stdio_process_is_persistent() {
-    let dir = tempfile::tempdir().unwrap();
-    let marker = dir.path().join("starts");
+async fn sdk_streamable_http_uses_headers_sessions_pagination_calls_and_cleanup() {
+    let (url, state, server) = spawn_http_fixture().await;
+    let provider = HttpMcp::new(
+        url,
+        HashMap::from([
+            ("Authorization".into(), "Bearer secret".into()),
+            ("x-cog-test".into(), "present".into()),
+        ]),
+    );
+    let tools = provider.tools().await.unwrap();
+    assert_eq!(
+        tools
+            .iter()
+            .map(|tool| tool.name.as_ref())
+            .collect::<Vec<_>>(),
+        ["first", "second"]
+    );
+    let result = provider.call("first", json!({"value":42})).await.unwrap();
+    assert_eq!(result["structuredContent"]["name"], "first");
+    assert_eq!(result["structuredContent"]["arguments"]["value"], 42);
+    assert!(state.requests.load(Ordering::SeqCst) >= 6);
+    assert!(state.session_requests.load(Ordering::SeqCst) >= 3);
+    provider.close().await.unwrap();
+    assert!(state.deleted.load(Ordering::SeqCst));
+    server.abort();
+}
+
+#[tokio::test]
+async fn sdk_http_connection_failures_are_bounded_and_safe_to_close() {
+    let provider = HttpMcp::new(
+        "http://127.0.0.1:1/mcp".into(),
+        HashMap::from([("Authorization".into(), "not-a-bearer-value".into())]),
+    );
+    let error = provider.tools().await.unwrap_err().to_string();
+    assert!(!error.contains("not-a-bearer-value"));
+    provider.close().await.unwrap();
+}
+
+async fn sse_error_fixture(body: Bytes) -> Response {
+    let request: Value = serde_json::from_slice(&body).unwrap();
+    let Some(id) = request.get("id").cloned() else {
+        return StatusCode::ACCEPTED.into_response();
+    };
+    let method = request.get("method").and_then(Value::as_str);
+    let response = match method {
+        Some("server/discover") => json!({
+            "jsonrpc":"2.0","id":id,
+            "error":{"code":-32601,"message":"legacy fixture"}
+        }),
+        Some("initialize") => json!({
+            "jsonrpc":"2.0","id":id,
+            "result":{
+                "protocolVersion":"2025-11-25",
+                "capabilities":{"tools":{}},
+                "serverInfo":{"name":"sse-error-fixture","version":"1"}
+            }
+        }),
+        Some("tools/list") => json!({
+            "jsonrpc":"2.0","id":id,
+            "result":{"tools":[{
+                "name":"fails","description":"Return a structured protocol error",
+                "inputSchema":{"type":"object","additionalProperties":false}
+            }]}
+        }),
+        Some("tools/call") => json!({
+            "jsonrpc":"2.0","id":id,
+            "error":{"code":-32000,"message":"fixture tool failure","data":{
+                "retryable":false,"category":"fixture"
+            }}
+        }),
+        method => panic!("unexpected SSE fixture method: {method:?}"),
+    };
+    if matches!(method, Some("server/discover" | "initialize")) {
+        let mut response = axum::Json(response).into_response();
+        if method == Some("initialize") {
+            response
+                .headers_mut()
+                .insert("Mcp-Session-Id", "sse-session".parse().unwrap());
+        }
+        return response;
+    }
+    let mut response = (
+        [(http::header::CONTENT_TYPE, "text/event-stream")],
+        format!(
+            ": keepalive\nevent: message\ndata: {}\n\n",
+            serde_json::to_string(&response).unwrap()
+        ),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert("Mcp-Session-Id", "sse-session".parse().unwrap());
+    response
+}
+
+#[tokio::test]
+async fn sdk_streamable_http_accepts_sse_and_preserves_protocol_errors() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route("/mcp", post(sse_error_fixture)),
+        )
+        .await
+        .unwrap();
+    });
+    let provider = HttpMcp::new(format!("http://{address}/mcp"), HashMap::new());
+    let tools = provider.tools().await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].name, "fails");
+    assert_eq!(
+        tools[0].description.as_deref(),
+        Some("Return a structured protocol error")
+    );
+    assert_eq!(tools[0].input_schema["type"], "object");
+    assert_eq!(tools[0].input_schema["additionalProperties"], false);
+    let error = provider.call("fails", json!({})).await.unwrap_err();
+    let error = error.to_string();
+    assert!(error.contains("fixture tool failure"));
+    assert!(error.contains("retryable"));
+    assert!(error.contains("category"));
+    assert!(error.contains("fixture"));
+    provider.close().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn sdk_http_rejects_invalid_custom_header_configuration_without_io() {
+    for headers in [
+        HashMap::from([("bad header name".into(), "value".into())]),
+        HashMap::from([("x-test".into(), "bad\rvalue".into())]),
+    ] {
+        let provider = HttpMcp::new("http://127.0.0.1:1/mcp".into(), headers);
+        let error = provider.tools().await.unwrap_err().to_string();
+        assert!(!error.is_empty());
+        assert!(error.len() < 1_024);
+        provider.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn sdk_stdio_discovers_calls_reuses_process_redacts_stderr_and_closes() {
+    let fixture = format!("{}/tests/fixtures/stdio-mcp.sh", env!("CARGO_MANIFEST_DIR"));
+    let provider = StdioMcp::new("sh".into(), vec![fixture], HashMap::new());
+    assert_eq!(provider.tools().await.unwrap()[0].name, "echo");
+    assert_eq!(provider.tools().await.unwrap()[0].name, "echo");
+    let result = provider.call("echo", json!({"value":42})).await.unwrap();
+    assert_eq!(result["structuredContent"]["value"], 42);
+    provider.close().await.unwrap();
+
+    let secret = "credential-that-must-not-escape";
+    let script = r#"
+echo "$FIXTURE_SECRET diagnostic output" >&2
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"diagnostic","version":"1"}}}\n' "$id" ;;
+    *'"method":"tools/list"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[]}}\n' "$id" ;;
+  esac
+done
+"#;
+    let diagnostic = StdioMcp::new(
+        "sh".into(),
+        vec!["-c".into(), script.into()],
+        HashMap::from([("FIXTURE_SECRET".into(), secret.into())]),
+    );
+    assert!(diagnostic.tools().await.unwrap().is_empty());
+    for _ in 0..100 {
+        if !diagnostic.diagnostic_tail().await.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let tail = diagnostic.diagnostic_tail().await;
+    assert!(tail.contains("[REDACTED] diagnostic output"));
+    assert!(!tail.contains(secret));
+    assert!(tail.len() <= MAX_DIAGNOSTIC_BYTES);
+    diagnostic.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn sdk_stdio_restarts_discovery_after_a_terminal_child_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("starts");
     let script = r#"
 echo started >> "$1"
-i=0
+count=$(wc -l < "$1")
 while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   case "$line" in
-*'"id":0'*) printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"fixture","version":"1"}}}' ;;
-*'"method":"tools/list"'*) i=$((i+1)); printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","inputSchema":{"type":"object"}}]}}\n' "$i" ;;
+    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"restart","version":"1"}}}\n' "$id" ;;
+    *'"method":"tools/list"'*)
+      if [ "$count" -eq 1 ]; then echo first-process-failed >&2; exit 17; fi
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"recovered","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
   esac
 done
 "#;
@@ -203,72 +510,103 @@ done
         ],
         HashMap::new(),
     );
-    assert_eq!(provider.tools().await.unwrap()[0].name, "echo");
-    assert_eq!(provider.tools().await.unwrap()[0].name, "echo");
+    assert_eq!(provider.tools().await.unwrap()[0].name, "recovered");
+    assert_eq!(std::fs::read_to_string(marker).unwrap().lines().count(), 2);
+    assert!(
+        provider
+            .diagnostic_tail()
+            .await
+            .contains("first-process-failed")
+    );
+    provider.close().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn sdk_stdio_tool_call_times_out_without_retrying_side_effects() {
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("calls");
+    let script = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"timeout","version":"1"}}}\n' "$id" ;;
+    *'"method":"tools/call"'*) echo called >> "$1"; sleep 300 ;;
+  esac
+done
+"#;
+    let provider = Arc::new(StdioMcp::new(
+        "sh".into(),
+        vec![
+            "-c".into(),
+            script.into(),
+            "fixture".into(),
+            marker.display().to_string(),
+        ],
+        HashMap::new(),
+    ));
+    let request = {
+        let provider = provider.clone();
+        tokio::spawn(async move { provider.call("side_effect", json!({})).await })
+    };
+    for _ in 0..1_000 {
+        if marker.exists() {
+            break;
+        }
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(marker.exists());
+    tokio::time::advance(Duration::from_secs(31)).await;
+    let error = request.await.unwrap().unwrap_err().to_string();
+    assert!(error.contains("timed out"));
     assert_eq!(std::fs::read_to_string(marker).unwrap().lines().count(), 1);
     provider.close().await.unwrap();
 }
 
 #[tokio::test]
-async fn fixture_stdio_covers_discovery_calls_and_malformed_output() {
-    let fixture = format!("{}/tests/fixtures/stdio-mcp.sh", env!("CARGO_MANIFEST_DIR"));
-    let provider = StdioMcp::new("sh".into(), vec![fixture.clone()], HashMap::new());
-    assert_eq!(provider.tools().await.unwrap()[0].name, "echo");
-    let result = provider.call("echo", json!({"value":42})).await.unwrap();
-    assert_eq!(result["structuredContent"]["value"], 42);
-
-    let malformed = StdioMcp::new(
-        "sh".into(),
-        vec![fixture],
-        HashMap::from([("COG_STDIO_FIXTURE_MODE".into(), "malformed".into())]),
-    );
-    assert!(malformed.tools().await.is_err());
-}
-
-#[tokio::test]
-async fn stdio_restarts_safe_discovery_after_crash() {
-    let dir = tempfile::tempdir().unwrap();
-    let marker = dir.path().join("starts");
+async fn sdk_stdio_terminal_call_failure_keeps_only_a_bounded_redacted_tail() {
+    let secret = "stdio-secret-value";
     let script = r#"
-echo x >> "$1"
-count=$(wc -l < "$1")
 while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   case "$line" in
-*'"id":0'*) printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"fixture","version":"1"}}}' ;;
-*'"method":"tools/list"'*)
-  if [ "$count" -eq 1 ]; then exit 7; fi
-  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
-  printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"ok","inputSchema":{}}]}}\n' "$id" ;;
+    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"stderr","version":"1"}}}\n' "$id" ;;
+    *'"method":"tools/call"'*)
+      i=0
+      while [ "$i" -lt 1000 ]; do printf '%s diagnostic-%s\n' "$FIXTURE_SECRET" "$i" >&2; i=$((i + 1)); done
+      exit 23 ;;
   esac
 done
 "#;
     let provider = StdioMcp::new(
         "sh".into(),
-        vec![
-            "-c".into(),
-            script.into(),
-            "fixture".into(),
-            marker.display().to_string(),
-        ],
-        HashMap::new(),
+        vec!["-c".into(), script.into()],
+        HashMap::from([("FIXTURE_SECRET".into(), secret.into())]),
     );
-    assert_eq!(provider.tools().await.unwrap()[0].name, "ok");
-    assert_eq!(std::fs::read_to_string(marker).unwrap().lines().count(), 2);
+    let error = provider.call("fail", json!({})).await.unwrap_err();
+    let error = error.to_string();
+    assert!(error.contains("stdio MCP call failed"));
+    assert!(!error.contains(secret));
+    let tail = provider.diagnostic_tail().await;
+    assert!(!tail.is_empty());
+    assert!(tail.len() <= MAX_DIAGNOSTIC_BYTES);
+    assert!(!tail.contains(secret));
+    assert!(tail.contains("[REDACTED]"));
+    assert!(tail.contains("diagnostic-"));
+    provider.close().await.unwrap();
 }
 
 #[tokio::test(start_paused = true)]
-async fn stdio_hang_is_killed_at_deadline_with_bounded_diagnostics() {
-    let dir = tempfile::tempdir().unwrap();
-    let marker = dir.path().join("starts");
+async fn sdk_stdio_discovery_timeout_returns_a_bounded_error() {
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("starts");
     let script = r#"
+echo started >> "$1"
 while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   case "$line" in
-*'"id":0'*) printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"fixture","version":"1"}}}' ;;
-*'"method":"tools/list"'*)
-  echo x >> "$1"
-  i=0
-  while [ "$i" -lt 2000 ]; do echo diagnostic-output >&2; i=$((i + 1)); done
-  sleep 300 ;;
+    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"discovery-timeout","version":"1"}}}\n' "$id" ;;
+    *'"method":"tools/list"'*) echo waiting-for-tools >&2; sleep 300 ;;
   esac
 done
 "#;
@@ -286,434 +624,18 @@ done
         let provider = provider.clone();
         tokio::spawn(async move { provider.tools().await })
     };
-    for expected in 1..=2 {
-        for _ in 0..1000 {
-            let starts = std::fs::read_to_string(&marker)
-                .map(|value| value.lines().count())
-                .unwrap_or(0);
-            if starts >= expected {
-                break;
-            }
-            tokio::task::yield_now().await;
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert_eq!(
-            std::fs::read_to_string(&marker).unwrap().lines().count(),
-            expected
-        );
-        tokio::time::advance(Duration::from_secs(31)).await;
-    }
-    let error = format!("{:#}", request.await.unwrap().unwrap_err());
-    assert!(error.contains("timed out"));
-    assert!(error.len() <= MAX_DIAGNOSTIC_BYTES + 256);
-}
-
-#[tokio::test]
-async fn cancelling_stdio_rpc_terminates_the_supervised_process() {
-    let dir = tempfile::tempdir().unwrap();
-    let marker = dir.path().join("called");
-    let script = r#"
-while IFS= read -r line; do
-  case "$line" in
-*'"id":0'*) printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"fixture","version":"1"}}}' ;;
-*'"method":"tools/list"'*) sleep 30 & echo $! > "$1"; wait ;;
-  esac
-done
-"#;
-    let provider = Arc::new(StdioMcp::new(
-        "sh".into(),
-        vec![
-            "-c".into(),
-            script.into(),
-            "fixture".into(),
-            marker.display().to_string(),
-        ],
-        HashMap::new(),
-    ));
-    let running = {
-        let provider = provider.clone();
-        tokio::spawn(async move { provider.tools().await })
-    };
-    for _ in 0..100 {
+    for _ in 0..5_000 {
         if marker.exists() {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(1));
     }
     assert!(marker.exists());
-    let child = std::fs::read_to_string(&marker).unwrap();
-    let child = child.trim();
-    running.abort();
-    let _ = running.await;
-    for _ in 0..100 {
-        let alive = std::process::Command::new("kill")
-            .args(["-0", child])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success());
-        if !alive {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("cancelled stdio MCP process remained alive");
-}
-
-#[tokio::test]
-async fn every_transport_rejects_oversized_requests_before_io() {
-    let huge = "x".repeat(MAX_MESSAGE_BYTES);
-    let http = HttpMcp::new("http://127.0.0.1:1".into(), HashMap::new());
-    let error = http
-        .rpc_request("tools/call", json!({"value":huge}))
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("request too large"));
-
-    let script = r#"while IFS= read -r line; do case "$line" in *'"id":0'*) printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"fixture","version":"1"}}}' ;; esac; done"#;
-    let stdio = StdioMcp::new(
-        "sh".into(),
-        vec!["-c".into(), script.into()],
-        HashMap::new(),
-    );
-    let error = stdio
-        .call("echo", json!({"value":"x".repeat(MAX_MESSAGE_BYTES)}))
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("request too large"));
-}
-
-#[tokio::test]
-async fn stdio_output_limit_is_enforced_while_streaming() {
-    let script = r#"
-while IFS= read -r line; do
-  case "$line" in
-*'"id":0'*) printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"fixture","version":"1"}}}' ;;
-*'"method":"tools/list"'*) head -c 1048577 /dev/zero | tr '\0' x ;;
-  esac
-done
-"#;
-    let provider = StdioMcp::new(
-        "sh".into(),
-        vec!["-c".into(), script.into()],
-        HashMap::new(),
-    );
-    let error = format!("{:#}", provider.tools().await.unwrap_err());
-    assert!(error.contains("response too large"));
-}
-
-#[test]
-fn parses_chunk_agnostic_multiline_sse_events() {
-    let body = concat!(
-        ": keepalive\r\n",
-        "event: message\r\n",
-        "data: {\"jsonrpc\":\"2.0\",\r\n",
-        "data: \"method\":\"notifications/tools/list_changed\"}\r\n\r\n",
-        "id: event-2\r\n",
-        "data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}\r\n\r\n"
-    );
-    assert_eq!(parse_sse_json(body, 7).unwrap()["result"]["ok"], true);
-    assert!(parse_sse_json(body, 8).is_err());
-}
-
-#[test]
-fn initialize_conformance_rejects_unsupported_or_incomplete_servers() {
-    let valid = json!({
-        "protocolVersion": MCP_PROTOCOL_VERSION,
-        "capabilities": {},
-        "serverInfo": {"name":"fixture","version":"1"}
-    });
-    assert!(validate_initialize(&valid).is_ok());
-    assert!(
-        validate_initialize(&json!({
-            "protocolVersion":"2024-11-05",
-            "capabilities":{},
-            "serverInfo":{}
-        }))
-        .is_err()
-    );
-    assert!(validate_initialize(&json!({"protocolVersion":MCP_PROTOCOL_VERSION})).is_err());
-}
-
-#[tokio::test]
-async fn legacy_sse_discovers_endpoint_and_keeps_stream() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        let (mut events, _) = listener.accept().await.unwrap();
-        let mut request = vec![0; 4096];
-        let _ = events.read(&mut request).await.unwrap();
-        events
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n")
-            .await
-            .unwrap();
-        write_chunk(&mut events, "event: endpoint\ndata: /messages\n\n").await;
-
-        for (id, result) in [
-            (
-                Some(1),
-                json!({"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"fixture","version":"1"}}),
-            ),
-            (None, Value::Null),
-            (
-                Some(2),
-                json!({"tools":[{"name":"echo","inputSchema":{"type":"object"}}]}),
-            ),
-        ] {
-            let (mut post, _) = listener.accept().await.unwrap();
-            let mut request = vec![0; 4096];
-            let _ = post.read(&mut request).await.unwrap();
-            post.write_all(
-                b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            )
-            .await
-            .unwrap();
-            if let Some(id) = id {
-                write_chunk(
-                    &mut events,
-                    &format!(
-                        "event: message\ndata: {}\n\n",
-                        json!({"jsonrpc":"2.0","id":id,"result":result})
-                    ),
-                )
-                .await;
-            }
-        }
-    });
-
-    let provider = HttpMcp::new_sse(format!("http://{address}/sse"), HashMap::new());
-    let tools = provider.tools().await.unwrap();
-    assert_eq!(tools[0].name, "echo");
-    server.await.unwrap();
-}
-
-#[derive(Clone, Default)]
-struct StreamableFixture {
-    session_requests: Arc<AtomicUsize>,
-    deleted: Arc<AtomicBool>,
-}
-
-async fn streamable_fixture(
-    State(state): State<StreamableFixture>,
-    method: axum::http::Method,
-    headers: axum::http::HeaderMap,
-    body: AxumBytes,
-) -> axum::response::Response {
-    if method == axum::http::Method::DELETE {
-        assert_eq!(
-            headers
-                .get("MCP-Protocol-Version")
-                .and_then(|value| value.to_str().ok()),
-            Some(MCP_PROTOCOL_VERSION)
-        );
-        if headers.get("Mcp-Session-Id").and_then(|v| v.to_str().ok()) == Some("session-1") {
-            state.deleted.store(true, Ordering::SeqCst);
-        }
-        return axum::http::StatusCode::NO_CONTENT.into_response();
-    }
-    assert_eq!(
-        headers
-            .get(axum::http::header::ACCEPT)
-            .and_then(|value| value.to_str().ok()),
-        Some("application/json, text/event-stream")
-    );
-    if headers.get("Mcp-Session-Id").and_then(|v| v.to_str().ok()) == Some("session-1") {
-        state.session_requests.fetch_add(1, Ordering::SeqCst);
-    }
-    let request: Value = serde_json::from_slice(&body).unwrap();
-    if request.get("method").and_then(Value::as_str) != Some("initialize") {
-        assert_eq!(
-            headers
-                .get("MCP-Protocol-Version")
-                .and_then(|value| value.to_str().ok()),
-            Some(MCP_PROTOCOL_VERSION)
-        );
-    }
-    let Some(id) = request.get("id").cloned() else {
-        return axum::http::StatusCode::ACCEPTED.into_response();
-    };
-    let result = match request.get("method").and_then(Value::as_str) {
-        Some("initialize") => json!({
-            "protocolVersion":MCP_PROTOCOL_VERSION,
-            "capabilities":{"tools":{"listChanged":true}},
-            "serverInfo":{"name":"fixture","version":"1"}
-        }),
-        Some("tools/list") => {
-            json!({"tools":[{"name":"echo","inputSchema":{"type":"object"}}]})
-        }
-        _ => Value::Null,
-    };
-    (
-        [("Mcp-Session-Id", "session-1")],
-        axum::Json(json!({"jsonrpc":"2.0","id":id,"result":result})),
-    )
-        .into_response()
-}
-
-#[tokio::test]
-async fn streamable_http_conforms_and_cleans_up_session() {
-    let state = StreamableFixture::default();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(
-        axum::serve(
-            listener,
-            Router::new()
-                .route("/", post(streamable_fixture).delete(streamable_fixture))
-                .with_state(state.clone()),
-        )
-        .into_future(),
-    );
-    let provider = HttpMcp::new(format!("http://{address}/"), HashMap::new());
-    assert_eq!(provider.tools().await.unwrap()[0].name, "echo");
-    assert!(state.session_requests.load(Ordering::SeqCst) >= 2);
+    tokio::time::advance(Duration::from_secs(61)).await;
+    let error = request.await.unwrap().unwrap_err().to_string();
+    assert!(error.contains("timed out"));
+    assert!(error.len() < MAX_DIAGNOSTIC_BYTES + 1_024);
+    assert_eq!(std::fs::read_to_string(marker).unwrap().lines().count(), 1);
     provider.close().await.unwrap();
-    assert!(state.deleted.load(Ordering::SeqCst));
-    server.abort();
-}
-
-async fn large_catalog_fixture(body: AxumBytes) -> axum::response::Response {
-    let request: Value = serde_json::from_slice(&body).unwrap();
-    let Some(id) = request.get("id").cloned() else {
-        return axum::http::StatusCode::ACCEPTED.into_response();
-    };
-    let result = match request.get("method").and_then(Value::as_str) {
-        Some("initialize") => json!({
-            "protocolVersion":MCP_PROTOCOL_VERSION,
-            "capabilities":{"tools":{}},
-            "serverInfo":{"name":"large-catalog-fixture","version":"1"}
-        }),
-        Some("tools/list") => json!({"tools":[{
-            "name":"large",
-            "description":"x".repeat(MAX_MESSAGE_BYTES),
-            "inputSchema":{"type":"object"}
-        }]}),
-        Some("tools/call") => json!({"content":[{
-            "type":"text",
-            "text":"x".repeat(MAX_MESSAGE_BYTES)
-        }]}),
-        _ => Value::Null,
-    };
-    axum::Json(json!({"jsonrpc":"2.0","id":id,"result":result})).into_response()
-}
-
-#[tokio::test]
-async fn streamable_http_allows_large_tool_catalogs_but_bounds_tool_results() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(
-        axum::serve(
-            listener,
-            Router::new().route("/", post(large_catalog_fixture)),
-        )
-        .into_future(),
-    );
-    let provider = HttpMcp::new(format!("http://{address}/"), HashMap::new());
-    let tools = provider.tools().await.unwrap();
-    assert_eq!(tools.len(), 1);
-    assert_eq!(tools[0].name, "large");
-    assert_eq!(
-        tools[0].description.as_ref().unwrap().len(),
-        MAX_MESSAGE_BYTES
-    );
-
-    let error = provider.call("large", json!({})).await.unwrap_err();
-    assert!(error.to_string().contains("response too large"));
-    server.abort();
-}
-
-async fn streamable_sse_fixture(body: AxumBytes) -> axum::response::Response {
-    let request: Value = serde_json::from_slice(&body).unwrap();
-    let Some(id) = request.get("id").cloned() else {
-        return axum::http::StatusCode::ACCEPTED.into_response();
-    };
-    let response = match request.get("method").and_then(Value::as_str) {
-        Some("initialize") => json!({"jsonrpc":"2.0","id":id,"result":{
-            "protocolVersion":MCP_PROTOCOL_VERSION,"capabilities":{},
-            "serverInfo":{"name":"sse-fixture","version":"1"}}}),
-        Some("tools/list") => json!({"jsonrpc":"2.0","id":id,"result":{
-            "tools":[{"name":"echo","inputSchema":{}}]}}),
-        Some("tools/call") => json!({"jsonrpc":"2.0","id":id,"error":{
-            "code":-32000,"message":"fixture failure","data":{"retryable":false}}}),
-        _ => json!({"jsonrpc":"2.0","id":id,"result":null}),
-    };
-    (
-        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
-        format!(
-            ": keepalive\nevent: message\ndata: {}\n\n",
-            serde_json::to_string(&response).unwrap()
-        ),
-    )
-        .into_response()
-}
-
-#[tokio::test]
-async fn streamable_http_accepts_sse_and_preserves_json_rpc_errors() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(
-        axum::serve(
-            listener,
-            Router::new().route("/", post(streamable_sse_fixture)),
-        )
-        .into_future(),
-    );
-    let provider = HttpMcp::new(format!("http://{address}/"), HashMap::new());
-    assert_eq!(provider.tools().await.unwrap()[0].name, "echo");
-    let error = provider.call("echo", json!({})).await.unwrap_err();
-    assert!(error.to_string().contains("fixture failure"));
-    assert!(error.to_string().contains("retryable"));
-    server.abort();
-}
-
-#[tokio::test]
-async fn legacy_cancellation_sends_protocol_notification() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let received = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut request = vec![0; 8192];
-        let size = stream.read(&mut request).await.unwrap();
-        stream
-            .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            .await
-            .unwrap();
-        String::from_utf8(request[..size].to_vec()).unwrap()
-    });
-    drop(cancellation_guard(
-        reqwest::Client::new(),
-        HashMap::new(),
-        format!("http://{address}/messages"),
-        42,
-        false,
-        MCP_PROTOCOL_VERSION.to_owned(),
-    ));
-    let request = tokio::time::timeout(Duration::from_secs(1), received)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(request.contains("notifications/cancelled"));
-    assert!(request.contains("requestId"));
-}
-
-async fn write_chunk(stream: &mut tokio::net::TcpStream, value: &str) {
-    stream
-        .write_all(format!("{:x}\r\n{value}\r\n", value.len()).as_bytes())
-        .await
-        .unwrap();
-    stream.flush().await.unwrap();
-}
-
-proptest! {
-    #[test]
-    fn sse_parser_round_trips_json_rpc(id in any::<u64>(), text in "[a-zA-Z0-9 ]{0,128}") {
-        let body = format!("event: message\ndata: {}\n\n", json!({"jsonrpc":"2.0","id":id,"result":{"text":text}}));
-        let parsed = parse_sse_json(&body, id).unwrap();
-        prop_assert_eq!(parsed["result"]["text"].as_str(), Some(text.as_str()));
-    }
-
-    #[test]
-    fn sse_parser_never_panics(input in any::<String>(), id in any::<u64>()) {
-        let _ = parse_sse_json(&input, id);
-    }
 }

@@ -85,12 +85,7 @@ fn definition(
             false,
             false,
         ),
-        _ => (
-            json!({"type":"object","properties":{},"additionalProperties":false}),
-            false,
-            false,
-            false,
-        ),
+        _ => unreachable!("Git definitions only"),
     };
     NativeToolDefinition {
         id,
@@ -242,7 +237,7 @@ impl ToolProvider for GitControlProvider {
                 let integration_id = args
                     .get("integrationId")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("integrationId is required"))?;
+                    .expect("validated repository arguments contain integrationId");
                 if !self.auth.allows_integration(integration_id) {
                     return Err(crate::authz::InsufficientScope {
                         scopes: vec![format!("integration:{integration_id}")],
@@ -257,7 +252,7 @@ impl ToolProvider for GitControlProvider {
                 let repository = args
                     .get("repository")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("repository is required"))?;
+                    .expect("validated repository arguments contain repository");
                 let provider_config = integration
                     .config
                     .get("providerConfig")
@@ -357,7 +352,7 @@ impl ToolProvider for GitControlProvider {
                 let public_key = crate::git::ssh::parse_public_key(
                     args.get("publicKey")
                         .and_then(Value::as_str)
-                        .ok_or_else(|| anyhow::anyhow!("publicKey is required"))?,
+                        .expect("validated SSH arguments contain publicKey"),
                 )?;
                 let canonical = public_key.to_openssh()?;
                 let now = chrono::Utc::now().timestamp();
@@ -392,7 +387,7 @@ impl ToolProvider for GitControlProvider {
                 let public_key = crate::git::ssh::parse_public_key(
                     args.get("publicKey")
                         .and_then(Value::as_str)
-                        .ok_or_else(|| anyhow::anyhow!("publicKey is required"))?,
+                        .expect("validated SSH arguments contain publicKey"),
                 )?;
                 let canonical = public_key.to_openssh()?;
                 let fingerprint = crate::git::ssh::fingerprint(&public_key);

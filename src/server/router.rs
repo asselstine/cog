@@ -1,7 +1,7 @@
 use super::*;
 
 pub fn build_router(app: App) -> Router {
-    Router::new()
+    let routes = Router::new()
         .route("/", get(home))
         .route("/healthz", get(health))
         .route("/readyz", get(readiness))
@@ -51,7 +51,6 @@ pub fn build_router(app: App) -> Router {
         .route("/oauth/authorize", get(authorize_page))
         .route("/oauth/token", post(token))
         .route("/oauth/revoke", post(revoke_token))
-        .route("/mcp", post(mcp_endpoint))
         .route("/github/app/setup/{state}", get(github_app_setup_launch))
         .route(
             "/github/app/manifest/callback",
@@ -105,5 +104,6 @@ pub fn build_router(app: App) -> Router {
             get(authorize_consent).post(authorize_post),
         )
         .route("/oauth/upstream/callback", get(upstream_callback))
-        .with_state(app)
+        .with_state(app.clone());
+    routes.merge(mcp_router(app))
 }

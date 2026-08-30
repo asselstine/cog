@@ -1,5 +1,6 @@
-use crate::mcp::{SecurityScheme, Tool, ToolAnnotations};
-use serde_json::{Value, json};
+use crate::mcp::{Tool, ToolAnnotations};
+use serde_json::Value;
+use std::sync::Arc;
 
 pub mod admin;
 pub mod execute;
@@ -64,20 +65,22 @@ pub struct NativeToolDefinition {
     pub title: &'static str,
     pub description: &'static str,
     pub input_schema: Value,
-    pub annotations: serde_json::Map<String, Value>,
+    pub annotations: ToolAnnotations,
     pub required_scope: &'static str,
     pub availability: NativeAvailability,
 }
 
 impl NativeToolDefinition {
     pub fn tool(&self) -> Tool {
-        Tool {
-            name: self.wire_name.into(),
-            title: Some(self.title.into()),
-            description: Some(self.description.into()),
-            input_schema: self.input_schema.clone(),
-            extra: self.annotations.clone(),
-        }
+        let input_schema = self
+            .input_schema
+            .as_object()
+            .cloned()
+            .expect("native tool input schema is an object");
+        Tool::new(self.wire_name, self.description, Arc::new(input_schema))
+            .with_title(self.title)
+            .with_annotations(self.annotations.clone())
+            .with_meta(crate::mcp::model::native_tool_meta(self.required_scope))
     }
 
     pub fn code_target(&self) -> String {
@@ -131,21 +134,11 @@ pub fn annotations(
     destructive: bool,
     idempotent: bool,
     open_world: bool,
-) -> serde_json::Map<String, Value> {
-    let security = serde_json::to_value([SecurityScheme::Oauth2 {
-        scopes: vec![required_scope.to_owned()],
-    }])
-    .expect("native security scheme serializes");
-    let annotations = ToolAnnotations {
-        read_only_hint: read_only,
-        destructive_hint: destructive,
-        idempotent_hint: idempotent,
-        open_world_hint: open_world,
-    };
-    serde_json::from_value(json!({
-        "annotations": annotations,
-        "securitySchemes": security,
-        "_meta": {"securitySchemes": security}
-    }))
-    .expect("native annotations are an object")
+) -> ToolAnnotations {
+    let _ = required_scope;
+    ToolAnnotations::new()
+        .read_only(read_only)
+        .destructive(destructive)
+        .idempotent(idempotent)
+        .open_world(open_world)
 }
