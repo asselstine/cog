@@ -173,13 +173,13 @@ pub(super) struct StdioTransportConfig {
 }
 
 #[derive(Clone, Default, Deserialize)]
-pub(super) struct IntegrationPolicy {
-    pub(super) allow_tools: Option<Vec<String>>,
+pub struct IntegrationPolicy {
+    pub allow_tools: Option<Vec<String>>,
     #[serde(default)]
-    pub(super) deny_tools: Vec<String>,
+    pub deny_tools: Vec<String>,
 }
 
-pub(super) fn integration_policy(config: &Value) -> anyhow::Result<Option<IntegrationPolicy>> {
+pub fn integration_policy(config: &Value) -> anyhow::Result<Option<IntegrationPolicy>> {
     config
         .get("policy")
         .filter(|value| !value.is_null())
@@ -381,7 +381,7 @@ pub(super) struct UpdateIntegration {
     headers: Option<HashMap<String, String>>,
 }
 
-pub(super) async fn admin_create(a: &App, user: &str, args: Value) -> anyhow::Result<Value> {
+pub async fn admin_create(a: &App, user: &str, args: Value) -> anyhow::Result<Value> {
     let _mutation = a.mutations.lock().await;
     a.lease.assert_live()?;
     let request: NewIntegration = serde_json::from_value(args)?;
@@ -407,12 +407,7 @@ pub(super) async fn admin_create(a: &App, user: &str, args: Value) -> anyhow::Re
     Ok(json!({"id":id}))
 }
 
-pub(super) async fn admin_update(
-    a: &App,
-    user: &str,
-    id: String,
-    args: Value,
-) -> anyhow::Result<Value> {
+pub async fn admin_update(a: &App, user: &str, id: String, args: Value) -> anyhow::Result<Value> {
     let _mutation = a.mutations.lock().await;
     a.lease.assert_live()?;
     let update: UpdateIntegration = serde_json::from_value(args)?;
@@ -448,7 +443,7 @@ pub(super) async fn admin_update(
     Ok(json!({"id":id,"updated":true}))
 }
 
-pub(super) async fn admin_reconnect(a: &App, user: &str, id: &str) -> anyhow::Result<Value> {
+pub async fn admin_reconnect(a: &App, user: &str, id: &str) -> anyhow::Result<Value> {
     admin_disconnect(a, user, id).await?;
     let integration =
         a.db.integration(id, user)?
@@ -476,7 +471,7 @@ pub(super) async fn admin_reconnect(a: &App, user: &str, id: &str) -> anyhow::Re
     Ok(result)
 }
 
-pub(super) async fn admin_disconnect(a: &App, user: &str, id: &str) -> anyhow::Result<Value> {
+pub async fn admin_disconnect(a: &App, user: &str, id: &str) -> anyhow::Result<Value> {
     let _mutation = a.mutations.lock().await;
     a.lease.assert_live()?;
     anyhow::ensure!(
@@ -493,7 +488,7 @@ pub(super) async fn admin_disconnect(a: &App, user: &str, id: &str) -> anyhow::R
     Ok(safe_integration(a, integration, false))
 }
 
-pub(super) async fn admin_delete(a: &App, user: &str, id: &str) -> anyhow::Result<Value> {
+pub async fn admin_delete(a: &App, user: &str, id: &str) -> anyhow::Result<Value> {
     let _mutation = a.mutations.lock().await;
     a.lease.assert_live()?;
     anyhow::ensure!(a.db.delete_integration(id, user)?, "integration not found");
@@ -504,7 +499,7 @@ pub(super) async fn admin_delete(a: &App, user: &str, id: &str) -> anyhow::Resul
     Ok(json!({"id":id,"deleted":true}))
 }
 
-pub(super) async fn admin_revoke_client(a: &App, user: &str, id: &str) -> anyhow::Result<Value> {
+pub async fn admin_revoke_client(a: &App, user: &str, id: &str) -> anyhow::Result<Value> {
     let _mutation = a.mutations.lock().await;
     a.lease.assert_live()?;
     anyhow::ensure!(a.db.revoke_agent_client(user, id)?, "client not found");
@@ -513,7 +508,7 @@ pub(super) async fn admin_revoke_client(a: &App, user: &str, id: &str) -> anyhow
     Ok(json!({"id":id,"revoked":true}))
 }
 
-pub(super) async fn admin_revoke_token(a: &App, user: &str, id: &str) -> anyhow::Result<Value> {
+pub async fn admin_revoke_token(a: &App, user: &str, id: &str) -> anyhow::Result<Value> {
     let _mutation = a.mutations.lock().await;
     a.lease.assert_live()?;
     anyhow::ensure!(a.db.revoke_agent_token(user, id)?, "token not found");
@@ -522,7 +517,7 @@ pub(super) async fn admin_revoke_token(a: &App, user: &str, id: &str) -> anyhow:
     Ok(json!({"id":id,"revoked":true}))
 }
 
-pub(super) async fn admin_revoke_grant(
+pub async fn admin_revoke_grant(
     a: &App,
     user: &str,
     client: &str,

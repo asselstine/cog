@@ -341,7 +341,7 @@ pub(super) fn ensure_s3_database_compatible(config: &Config) -> anyhow::Result<(
     Ok(())
 }
 
-pub(super) async fn persist(a: &App) -> anyhow::Result<()> {
+pub async fn persist(a: &App) -> anyhow::Result<()> {
     a.lease.assert_live()?;
     let durable_txid = match a.replicator.sync().await {
         Ok(txid) => txid,

@@ -9,7 +9,6 @@ pub mod mcp;
 pub mod oauth;
 pub mod runtime;
 pub mod server;
-pub mod upstream;
 
 pub use config::Config;
 pub mod authz;

@@ -2,7 +2,8 @@ use async_trait::async_trait;
 use axum::{
     Router, body::Bytes as AxumBytes, extract::State, response::IntoResponse, routing::post,
 };
-use cog::upstream::*;
+use cog::mcp::client::*;
+use cog::mcp::{Catalog, Tool, ToolProvider};
 use proptest::prelude::*;
 use serde_json::{Value, json};
 use std::{
@@ -20,6 +21,7 @@ impl ToolProvider for Fake {
     async fn tools(&self) -> anyhow::Result<Vec<Tool>> {
         Ok(vec![Tool {
             name: "send".into(),
+            title: None,
             description: Some("Send mail".into()),
             input_schema: json!({"type":"object"}),
             extra: serde_json::Map::new(),
@@ -139,6 +141,7 @@ async fn nested_code_mode_provider_is_discovered_then_used_for_provider_discover
         async fn tools(&self) -> anyhow::Result<Vec<Tool>> {
             Ok(vec![Tool {
                 name: "search".into(),
+                title: None,
                 description: Some("Search Cloudflare operations before executing one".into()),
                 input_schema: json!({"type":"object","properties":{"query":{"type":"string"}}}),
                 extra: Default::default(),

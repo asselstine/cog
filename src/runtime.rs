@@ -1,4 +1,4 @@
-use crate::{authz::InsufficientScope, upstream::Catalog};
+use crate::{authz::InsufficientScope, mcp::RuntimeHost};
 use serde_json::Value;
 use std::{
     collections::BTreeSet,
@@ -27,7 +27,7 @@ fn init() {
 }
 
 struct Host {
-    catalog: Arc<Catalog>,
+    mcp: Arc<dyn RuntimeHost>,
     handle: tokio::runtime::Handle,
     deadline: Instant,
     calls: AtomicUsize,
@@ -69,13 +69,16 @@ impl CodeRuntime {
             timeout,
         }
     }
-    pub async fn execute(&self, code: String, catalog: Arc<Catalog>) -> anyhow::Result<Value> {
+    pub async fn execute<H>(&self, code: String, mcp: Arc<H>) -> anyhow::Result<Value>
+    where
+        H: RuntimeHost + 'static,
+    {
         anyhow::ensure!(code.len() <= MAX_CODE_BYTES, "code exceeds byte limit");
         reject_discarded_wrapper(&code)?;
         let heap = self.heap_bytes;
         let timeout = self.timeout;
         let handle = tokio::runtime::Handle::current();
-        tokio::task::spawn_blocking(move || run_v8(heap, timeout, &code, catalog, handle)).await?
+        tokio::task::spawn_blocking(move || run_v8(heap, timeout, &code, mcp, handle)).await?
     }
 }
 
@@ -108,7 +111,7 @@ fn run_v8(
     heap: usize,
     timeout: Duration,
     code: &str,
-    catalog: Arc<Catalog>,
+    mcp: Arc<dyn RuntimeHost>,
     handle: tokio::runtime::Handle,
 ) -> anyhow::Result<Value> {
     let mut isolate = v8::Isolate::new(v8::CreateParams::default().heap_limits(0, heap));
@@ -132,7 +135,7 @@ fn run_v8(
         }
     });
     let host = Box::new(Host {
-        catalog,
+        mcp,
         handle,
         deadline: Instant::now() + timeout,
         calls: AtomicUsize::new(0),
@@ -260,10 +263,10 @@ fn host_call(
         host.handle.block_on(async {
             tokio::time::timeout(remaining, async {
                 match op.as_str() {
-                    "search" => host.catalog.search(&target).await,
-                    "describe" => host.catalog.describe(&target).await,
+                    "search" => host.mcp.search(&target).await,
+                    "describe" => host.mcp.describe(&target).await,
                     "call" => {
-                        host.catalog
+                        host.mcp
                             .call(&target, serde_json::from_str(&json_args)?)
                             .await
                     }

@@ -1,4 +1,9 @@
 use super::*;
+use rust_embed::RustEmbed;
+
+#[derive(RustEmbed)]
+#[folder = "frontend/dist"]
+pub struct Frontend;
 
 pub fn frontend_response(path: &str) -> Response {
     let Some(file) = Frontend::get(path) else {

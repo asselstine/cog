@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use cog::mcp::*;
 use cog::{
     authz::InsufficientScope,
+    mcp::{Catalog, Tool, ToolProvider},
     runtime::CodeRuntime,
-    upstream::{Catalog, Tool, ToolProvider},
 };
 use proptest::prelude::*;
 use serde_json::{Value, json};
@@ -13,39 +13,82 @@ struct NativeFixture;
 
 #[test]
 fn native_definition_registry_is_complete_and_unique() {
-    use cog::mcp::tools::{admin, execute, git};
+    use cog::mcp::tools::{NativeAvailability, NativeNamespace, definitions};
     use std::collections::HashSet;
 
-    let execute = execute::definition();
-    assert_eq!(execute.required_scope, "mcp");
-    assert!(execute.tool.input_schema.is_object());
-    assert!(execute.tool.extra.contains_key("annotations"));
+    let definitions = definitions();
+    assert!(!definitions.is_empty());
+    let ids = definitions
+        .iter()
+        .map(|definition| definition.id)
+        .collect::<HashSet<_>>();
+    let public_names = definitions
+        .iter()
+        .map(|definition| definition.public_name())
+        .collect::<HashSet<_>>();
+    let targets = definitions
+        .iter()
+        .map(|definition| definition.code_target())
+        .collect::<HashSet<_>>();
+    assert_eq!(ids.len(), definitions.len());
+    assert_eq!(public_names.len(), definitions.len());
+    assert_eq!(targets.len(), definitions.len());
 
-    let names = std::iter::once(execute.tool.name.as_str())
-        .chain(admin::NAMES.iter().copied())
-        .chain(git::NAMES.iter().copied())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        names.iter().copied().collect::<HashSet<_>>().len(),
-        names.len()
-    );
-    for name in admin::NAMES {
-        let scope = admin::required_scope(name).expect("registered tool has a scope");
-        let tool = admin::tool(name, "registry test");
-        assert!(tool.input_schema.is_object());
-        assert!(tool.extra.contains_key("annotations"));
-        assert_eq!(tool.extra["securitySchemes"][0]["scopes"], json!([scope]));
-    }
-    for name in git::NAMES {
-        let tool = git::tool(name, "registry test");
-        assert!(tool.input_schema.is_object());
-        assert!(tool.extra.contains_key("annotations"));
+    for definition in &definitions {
+        assert!(!definition.title.trim().is_empty());
+        assert!(!definition.description.trim().is_empty());
+        assert_eq!(definition.input_schema["type"], "object");
+        assert_eq!(definition.input_schema["additionalProperties"], false);
+        for parameter in definition.input_schema["properties"]
+            .as_object()
+            .expect("object schema has properties")
+            .values()
+        {
+            assert!(
+                parameter["description"]
+                    .as_str()
+                    .is_some_and(|description| !description.trim().is_empty()),
+                "{} has an undocumented parameter: {parameter}",
+                definition.wire_name
+            );
+        }
+        assert!(definition.annotations.contains_key("annotations"));
         assert_eq!(
-            tool.extra["securitySchemes"][0]["scopes"],
-            json!([git::REQUIRED_SCOPE])
+            definition.annotations["securitySchemes"][0]["scopes"],
+            json!([definition.required_scope])
         );
+        assert_eq!(
+            cog::mcp::tools::by_id(definition.id).wire_name,
+            definition.wire_name
+        );
+        assert_eq!(
+            cog::mcp::tools::by_code_target(&definition.code_target())
+                .unwrap()
+                .id,
+            definition.id
+        );
+        assert_eq!(
+            cog::mcp::tools::by_public_name(&definition.public_name())
+                .unwrap()
+                .id,
+            definition.id
+        );
+        let tool = definition.tool();
+        assert_eq!(tool.name, definition.wire_name);
+        assert_eq!(tool.title.as_deref(), Some(definition.title));
+        assert_eq!(tool.description.as_deref(), Some(definition.description));
     }
-    assert_eq!(git::REQUIRED_SCOPE, "mcp");
+
+    for definition in definitions {
+        if definition.namespace == NativeNamespace::Git
+            && definition.availability == NativeAvailability::Ssh
+        {
+            assert!(!definition.available(false));
+            assert!(definition.available(true));
+        } else {
+            assert!(definition.available(false));
+        }
+    }
 }
 
 #[async_trait]
@@ -54,24 +97,28 @@ impl ToolProvider for NativeFixture {
         Ok(vec![
             Tool {
                 name: "repository_access".into(),
+                title: None,
                 description: None,
                 input_schema: json!({}),
                 extra: serde_json::Map::new(),
             },
             Tool {
                 name: "object".into(),
+                title: None,
                 description: None,
                 input_schema: json!({}),
                 extra: serde_json::Map::new(),
             },
             Tool {
-                name: "scalar".into(),
+                name: "integration_get".into(),
+                title: None,
                 description: None,
                 input_schema: json!({}),
                 extra: serde_json::Map::new(),
             },
             Tool {
-                name: "scope".into(),
+                name: "integration_create".into(),
+                title: None,
                 description: None,
                 input_schema: json!({}),
                 extra: serde_json::Map::new(),
@@ -81,8 +128,10 @@ impl ToolProvider for NativeFixture {
     async fn call(&self, name: &str, _args: Value) -> anyhow::Result<Value> {
         match name {
             "object" | "repository_access" => Ok(json!({"ok": true})),
-            "scalar" => Ok(json!(7)),
-            "scope" => Err(InsufficientScope::one("integration:fixture").into()),
+            "integration_get" => Ok(json!(7)),
+            "integration_create" | "scope" => {
+                Err(InsufficientScope::one("integration:fixture").into())
+            }
             _ => anyhow::bail!("fixture failure"),
         }
     }
@@ -247,7 +296,7 @@ async fn validation_native_calls_and_error_shapes() {
     assert!(listed["tools"].as_array().unwrap().len() >= 7);
     for (name, expected) in [
         ("repository_access", json!({"ok":true})),
-        ("cog_scalar", json!(7)),
+        ("cog_integration_get", json!(7)),
     ] {
         let response = request(
             "tools/call",
@@ -269,7 +318,7 @@ async fn validation_native_calls_and_error_shapes() {
     }
     let scoped = request(
         "tools/call",
-        json!({"name":"cog_scope"}),
+        json!({"name":"cog_integration_create"}),
         false,
         fixture.clone(),
     )
@@ -294,11 +343,8 @@ async fn validation_native_calls_and_error_shapes() {
         execute_scoped["structuredContent"]["requiredScopes"],
         json!(["mcp", "integration:fixture"])
     );
-    let failed = request("tools/call", json!({"name":"cog_missing"}), false, fixture)
-        .await
-        .result
-        .unwrap();
-    assert_eq!(failed["isError"], true);
+    let failed = request("tools/call", json!({"name":"cog_missing"}), false, fixture).await;
+    assert_eq!(failed.error.unwrap()["message"], "unknown tool");
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn protocol() {

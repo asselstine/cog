@@ -19,8 +19,8 @@ use cog::{
     git::{GitOperation, RepositoryReference, ResolvedRepository},
     lease::LeaseGuard,
     ltx::Replicator,
+    mcp::{Catalog, Tool, ToolProvider, UpstreamInsufficientScope},
     runtime::CodeRuntime,
-    upstream::{Catalog, Tool, ToolProvider, UpstreamInsufficientScope},
 };
 use http_body_util::BodyExt;
 use object_store::memory::InMemory;
@@ -57,6 +57,7 @@ impl ToolProvider for PolicyFixture {
             .into_iter()
             .map(|name| Tool {
                 name: name.into(),
+                title: None,
                 description: None,
                 input_schema: json!({}),
                 extra: Default::default(),
@@ -90,6 +91,7 @@ impl ToolProvider for ScopeChallengeFixture {
     async fn tools(&self) -> anyhow::Result<Vec<Tool>> {
         Ok(vec![Tool {
             name: "search".into(),
+            title: None,
             description: Some("Search provider operations".into()),
             input_schema: json!({"type":"object"}),
             extra: Default::default(),
@@ -637,7 +639,7 @@ async fn github_manifest_setup_returns_browser_handoff_and_pending_repository_re
             agent: "test-agent".into(),
             identity: "test-identity".into(),
             client: "manifest-client".into(),
-            scopes: HashSet::from([format!("integration:{integration}")]),
+            scopes: HashSet::from(["mcp".into(), format!("integration:{integration}")]),
             integrations: HashSet::from([integration.to_owned()]),
         },
     };
@@ -679,7 +681,7 @@ async fn ssh_key_registration_and_internal_lease_renewal_reuse_exact_key() {
         agent: agent.id,
         identity: agent.identity_id,
         client: client.into(),
-        scopes: HashSet::new(),
+        scopes: HashSet::from(["mcp".into()]),
         integrations: HashSet::new(),
     };
     let control = GitControlProvider { app, auth };
@@ -3749,7 +3751,12 @@ async fn administration_provider_exercises_every_database_backed_operation() {
 
 #[test]
 fn native_administration_tools_have_precise_safety_and_scope_metadata() {
-    let create = admin_tool("integration_create", "Create an integration.");
+    let native_tool = |name: &str| {
+        cog::mcp::tools::by_code_target(&format!("cog.{name}"))
+            .expect("native tool is registered")
+            .tool()
+    };
+    let create = native_tool("integration_create");
     assert_eq!(create.extra["annotations"]["readOnlyHint"], false);
     assert_eq!(create.extra["annotations"]["destructiveHint"], false);
     assert_eq!(create.extra["annotations"]["openWorldHint"], true);
@@ -3765,7 +3772,7 @@ fn native_administration_tools_have_precise_safety_and_scope_metadata() {
         create.input_schema["required"],
         json!(["name", "transport", "config"])
     );
-    let audit = admin_tool("audit_list", "Read recent audit events.");
+    let audit = native_tool("audit_list");
     assert_eq!(audit.input_schema["properties"]["limit"]["maximum"], 1000);
     assert_eq!(
         native_admin_scope("cog_integration_create"),
@@ -3777,10 +3784,7 @@ fn native_administration_tools_have_precise_safety_and_scope_metadata() {
     );
     assert_eq!(native_admin_scope("execute"), None);
 
-    let disconnect = admin_tool(
-        "integration_disconnect",
-        "Disconnect credentials while preserving the integration.",
-    );
+    let disconnect = native_tool("integration_disconnect");
     assert_eq!(disconnect.extra["annotations"]["readOnlyHint"], false);
     assert_eq!(disconnect.extra["annotations"]["destructiveHint"], true);
     assert_eq!(disconnect.extra["annotations"]["idempotentHint"], true);
@@ -5203,7 +5207,7 @@ async fn production_ssh_handler_authenticates_and_proxies_upload_pack() {
             identity: binding.identity_id.clone(),
             agent: binding.agent_id.clone(),
             client: binding.client_id.clone(),
-            scopes: HashSet::from([format!("integration:{integration}")]),
+            scopes: HashSet::from(["mcp".into(), format!("integration:{integration}")]),
             integrations: HashSet::from([integration.clone()]),
         },
     }

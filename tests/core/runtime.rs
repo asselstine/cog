@@ -1,6 +1,6 @@
 use async_trait::async_trait;
+use cog::mcp::{Catalog, Tool, ToolProvider};
 use cog::runtime::*;
-use cog::upstream::{Catalog, Tool, ToolProvider};
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
 #[tokio::test(flavor = "multi_thread")]
@@ -30,6 +30,7 @@ impl ToolProvider for Fake {
     async fn tools(&self) -> anyhow::Result<Vec<Tool>> {
         Ok(vec![Tool {
             name: "add".into(),
+            title: None,
             description: None,
             input_schema: json!({}),
             extra: serde_json::Map::new(),
@@ -60,6 +61,7 @@ impl ToolProvider for ScopeRequired {
     async fn tools(&self) -> anyhow::Result<Vec<Tool>> {
         Ok(vec![Tool {
             name: "restricted".into(),
+            title: None,
             description: None,
             input_schema: json!({}),
             extra: serde_json::Map::new(),

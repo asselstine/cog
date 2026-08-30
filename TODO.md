@@ -46,32 +46,83 @@ introduce a workspace if a genuinely independent, I/O-free core emerges.
   serving, and Git transport handling into `src/server/ssh.rs`; return a
   lifecycle handle to startup so `startup.rs` retains shutdown ordering and
   durability coordination. Leave transport-neutral Git logic under `src/git/`.
-- [ ] Extract the HTTP MCP endpoint, authenticated catalog construction, native
-  provider dispatch, and the policy, measurement, and OAuth step-up adapters
-  into one cohesive `src/server/mcp.rs` module. Keep authorization checks at
-  their existing call boundaries; do not create a directory of one-file server
-  adapters in the first pass.
-- [ ] Keep MCP protocol types, parsing, and dispatch in the existing
-  `src/mcp.rs` facade, and add a narrowly scoped `src/mcp/tools/` tree for the
-  native tool surface:
-  - `src/mcp/tools/mod.rs` composes the complete native definition list and
-    provides shared definition/annotation helpers.
-  - `src/mcp/tools/execute.rs` owns the `execute` definition and its agent
-    instructions.
-  - `src/mcp/tools/admin.rs` owns administration tool names, descriptions,
-    input schemas, annotations, and required scopes.
-  - `src/mcp/tools/git.rs` owns `repository_access` and the supporting SSH-key
-    tool definitions; keep these together until they become independently
-    substantial.
-- [ ] Make each native tool definition the single source of truth for its name,
-  description, input schema, annotations, and required scope. Have both catalog
-  advertisement and preauthorization consult those definitions instead of
-  maintaining separate name-to-scope matches.
-- [ ] Keep the native MCP provider implementations thin where practical, but do
-  not introduce a new service layer solely for this move. As administration and
-  Git behavior move into their existing feature modules, have the MCP adapters
-  call those transport-neutral operations rather than calling HTTP handlers or
-  duplicating their logic.
+- [ ] Consolidate MCP ownership under a cohesive `src/mcp/` subsystem rather
+  than concentrating it in one large file. Use this target layout:
+  - `src/mcp.rs` remains the small public facade and child-module declaration
+    point.
+  - `src/mcp/protocol.rs` owns JSON-RPC request/response types and MCP
+    initialize, list, and call dispatch.
+  - `src/mcp/model.rs` owns the MCP tool wire model, annotations, and security
+    schemes. Model `title` explicitly instead of relying on flattened extension
+    data; reserve the flattened map for genuinely unknown or extension fields.
+  - `src/mcp/catalog.rs` owns `ToolProvider`, `Catalog`, discovery, describe,
+    invocation, namespacing, and advertisement transforms.
+  - `src/mcp/service.rs` builds the authenticated catalog and owns the native,
+    policy, measurement, and OAuth step-up provider composition.
+  - `src/mcp/client/http.rs`, `src/mcp/client/stdio.rs`, and
+    `src/mcp/client/auth.rs` own upstream MCP transports, session lifecycle,
+    challenge parsing, and incremental-scope handling. Remove `src/upstream.rs`
+    after its MCP-specific responsibilities have moved here.
+  - `src/mcp/tools/mod.rs`, `execute.rs`, `admin.rs`, and `git.rs` own the full
+    native tool surface, grouped by coherent feature rather than one file per
+    small tool.
+- [ ] Introduce one complete `NativeToolDefinition` and registry as the single
+  source of truth for every native tool. Each definition must include a stable
+  enum ID, namespace, wire name, title, description, input schema, annotations,
+  required scope, and any runtime availability rule needed for advertisement.
+  Resolve external names to the enum once and dispatch on that enum rather than
+  repeatedly matching string names.
+- [ ] Remove parallel native-tool registries and routing tables, including
+  `admin::NAMES`, `git::NAMES`, name-to-scope matches, `native_target`,
+  `admin_tool(name, description)`, and `git_control_tool(name, description)`.
+  Registry methods should be the only implementation of public-name mapping,
+  `cog_` prefixes, code-mode targets, required scopes, and conditional
+  advertisement.
+- [ ] Colocate every native tool's title, tool description, typed arguments,
+  parameter descriptions, schema constraints, annotations, scope, availability,
+  and dispatch adapter in its owning `src/mcp/tools/*.rs` module. Generate JSON
+  Schema from typed argument structs if practical so the advertised schema and
+  deserialized arguments cannot drift; otherwise keep a neighboring `schema()`
+  function beside the argument type.
+- [ ] Move `AdminProvider`, `GitControlProvider`, and execute invocation glue
+  into their corresponding `src/mcp/tools/` modules. A handler should receive
+  an already-resolved definition, authorize with that definition's scope,
+  deserialize its typed arguments, invoke the domain operation, and return the
+  result. Unknown tools and insufficient scope must remain distinguishable.
+- [ ] Move shared administration, identity, integration, and Git behavior out
+  of HTTP/server helpers into transport-neutral domain operations, for example
+  focused `integrations`, `identity`, and `git` service modules. HTTP handlers
+  and MCP tool adapters should both call those operations; domain services must
+  not know about tool names, MCP schemas, JSON-RPC, or MCP authorization
+  metadata.
+- [ ] Reduce `src/server/mcp.rs` to the HTTP transport boundary: parse MCP query
+  options, authenticate the bearer token, validate origin and protocol headers,
+  apply HTTP-level limits, invoke the MCP service, and convert its response to
+  Axum. It must not contain tool metadata, tool-name routing, scope maps, native
+  provider implementations, catalog behavior, or upstream MCP client logic.
+- [ ] Replace `runtime.rs`'s concrete `Catalog` dependency with a narrow MCP-owned
+  host interface for `search`, `describe`, and `call`. The V8 runtime needs a
+  privileged execution bridge but should not know how MCP catalogs, providers,
+  or tool definitions are represented.
+- [ ] Add registry-focused tests that iterate the real definitions and verify
+  unique IDs and public names; non-empty titles and descriptions; documented
+  parameters; object schemas that reject unknown fields; annotations and
+  scopes; a dispatch handler for every definition; no unreachable handler;
+  round-tripping of native prefixes and code-mode targets; conditional Git/SSH
+  availability; and identical metadata across `tools/list`, code-mode search,
+  and describe.
+- [ ] Complete the MCP consolidation in reviewable stages: establish the model,
+  IDs, typed arguments, and registry; move all metadata into definitions;
+  switch advertisement, authorization, and routing to the registry; move native
+  providers; extract shared domain operations; move the catalog and upstream
+  clients; thin the HTTP endpoint; narrow the runtime bridge; then remove stale
+  helpers, imports, and checklist entries.
+- [ ] Treat the MCP consolidation as complete only when a production-code search
+  for native names such as `repository_access` or `integration_disconnect`
+  finds their definitions and handlers only under `src/mcp/tools/`. Outside
+  `src/mcp/`, permit MCP tool concepts only at necessary boundaries such as the
+  HTTP endpoint and runtime host bridge; tests and user-facing documentation are
+  expected exceptions.
 - [ ] Extract authenticated JSON administration endpoints into focused modules
   rather than one catch-all API file if integrations, identities, and tokens
   remain independently substantial.

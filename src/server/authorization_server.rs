@@ -972,7 +972,7 @@ pub struct AuthContext {
 }
 
 impl AuthContext {
-    pub(super) fn allows(&self, required: &str) -> bool {
+    pub fn allows(&self, required: &str) -> bool {
         self.scopes.contains(required)
             || (self.scopes.contains("admin")
                 && matches!(

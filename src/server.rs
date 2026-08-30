@@ -10,9 +10,9 @@ use crate::{
     git::{GitOperation, ResolvedRepository},
     lease::{LeaseGuard, probe_conditional_writes},
     ltx::Replicator,
+    mcp::{ToolProvider, UpstreamInsufficientScope},
     oauth,
     runtime::CodeRuntime,
-    upstream::{ToolProvider, UpstreamInsufficientScope},
 };
 use anyhow::Context;
 use argon2::{
@@ -33,13 +33,13 @@ use russh::{Channel, ChannelId};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     net::{IpAddr, SocketAddr},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -55,12 +55,20 @@ mod ssh;
 mod startup;
 mod upstream_oauth;
 
+pub use crate::mcp::service::{
+    MeasuredProvider, OAuthStepUpProvider, PolicyProvider, catalog, git_provider,
+    native_admin_scope, safe_integration, upstream_connection_state,
+};
+pub use crate::mcp::tools::{
+    admin::{AdminProvider, redact_value},
+    git::GitControlProvider,
+};
 pub use administration::*;
 pub use authorization_server::*;
 pub use frontend::*;
 pub use github::*;
 pub use health::*;
-pub use mcp::*;
+use mcp::*;
 pub use router::*;
 pub use session::*;
 pub use ssh::*;
@@ -104,7 +112,7 @@ impl Authority {
             Self::S3(lease) => lease.is_live(),
         }
     }
-    fn assert_live(&self) -> anyhow::Result<()> {
+    pub fn assert_live(&self) -> anyhow::Result<()> {
         match self {
             Self::Local => Ok(()),
             Self::S3(lease) => lease.assert_live(),
@@ -153,5 +161,91 @@ impl Durability {
             Self::Local => 0,
             Self::S3(repl) => repl.pending_txids(),
         }
+    }
+}
+#[derive(Default)]
+pub struct Metrics {
+    pub oauth_failures: AtomicU64,
+    pub execution_failures: AtomicU64,
+    pub v8_limit_hits: AtomicU64,
+    pub upstream_calls: AtomicU64,
+    pub upstream_failures: AtomicU64,
+    pub ssh_handshakes: AtomicU64,
+    pub ssh_auth_success: AtomicU64,
+    pub ssh_auth_denied: AtomicU64,
+    pub ssh_active_sessions: AtomicU64,
+    pub ssh_read_operations: AtomicU64,
+    pub ssh_write_operations: AtomicU64,
+    pub ssh_request_bytes: AtomicU64,
+    pub ssh_response_bytes: AtomicU64,
+    pub ssh_timeouts: AtomicU64,
+    pub ssh_limit_rejections: AtomicU64,
+    pub ssh_upstream_failures: AtomicU64,
+    pub ssh_key_registrations: AtomicU64,
+    pub ssh_key_lease_renewals: AtomicU64,
+}
+
+#[derive(Default)]
+pub struct ClientStreamLimiter {
+    pub active: std::sync::Mutex<HashMap<String, usize>>,
+}
+pub struct ClientStreamPermit {
+    limiter: Arc<ClientStreamLimiter>,
+    client: String,
+}
+impl ClientStreamLimiter {
+    pub fn try_acquire(
+        self: &Arc<Self>,
+        client: &str,
+        maximum: usize,
+    ) -> Option<ClientStreamPermit> {
+        let mut active = self.active.lock().ok()?;
+        let count = active.entry(client.to_owned()).or_default();
+        if *count >= maximum {
+            return None;
+        }
+        *count += 1;
+        Some(ClientStreamPermit {
+            limiter: self.clone(),
+            client: client.to_owned(),
+        })
+    }
+}
+impl Drop for ClientStreamPermit {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.limiter.active.lock()
+            && let Some(count) = active.get_mut(&self.client)
+        {
+            *count -= 1;
+            if *count == 0 {
+                active.remove(&self.client);
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct RateLimiter {
+    attempts: std::sync::Mutex<HashMap<String, VecDeque<Instant>>>,
+}
+
+impl RateLimiter {
+    pub fn allow(&self, key: String, maximum: usize, window: Duration) -> bool {
+        let Ok(mut attempts) = self.attempts.lock() else {
+            return false;
+        };
+        let now = Instant::now();
+        let queue = attempts.entry(key).or_default();
+        while queue
+            .front()
+            .is_some_and(|attempt| now.duration_since(*attempt) >= window)
+        {
+            queue.pop_front();
+        }
+        if queue.len() >= maximum {
+            return false;
+        }
+        queue.push_back(now);
+        true
     }
 }
