@@ -143,6 +143,15 @@ Agent-to-cog authorization and cog-to-upstream authorization are separate trust 
 
 The project requires stable Rust, Node.js with npm, Docker, and Docker Compose. V8 is downloaded as a prebuilt artifact by the `v8` crate during the first build. The Vite + React + Tailwind CSS application lives in `frontend`; Cargo installs its locked dependencies, builds it, and embeds the generated assets in the cog binary.
 
+### Repository layout
+
+- `src/server.rs` and `src/db.rs` are public facades; their feature-focused implementations live in `src/server/` and `src/db/`.
+- `src/mcp.rs` owns MCP protocol handling, while native tool definitions live under `src/mcp/tools/`.
+- `src/git/` contains transport-neutral Git behavior; SSH transport lifecycle remains owned by the server.
+- `frontend/src/` contains the Vite application, with screens and reusable components split into their own directories.
+- `tests/` contains integration suites, fixtures, shared helpers, and operational test infrastructure.
+- `docs/design/`, `docs/plans/`, and `docs/adr/` contain design notes, future plans, and architectural decisions.
+
 For frontend-only development, run `npm install` and `npm run dev` in `frontend`. The Vite development server proxies application requests to a local cog instance.
 
 Run local checks:

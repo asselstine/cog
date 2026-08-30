@@ -10,6 +10,44 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 
 struct NativeFixture;
+
+#[test]
+fn native_definition_registry_is_complete_and_unique() {
+    use cog::mcp::tools::{admin, execute, git};
+    use std::collections::HashSet;
+
+    let execute = execute::definition();
+    assert_eq!(execute.required_scope, "mcp");
+    assert!(execute.tool.input_schema.is_object());
+    assert!(execute.tool.extra.contains_key("annotations"));
+
+    let names = std::iter::once(execute.tool.name.as_str())
+        .chain(admin::NAMES.iter().copied())
+        .chain(git::NAMES.iter().copied())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names.iter().copied().collect::<HashSet<_>>().len(),
+        names.len()
+    );
+    for name in admin::NAMES {
+        let scope = admin::required_scope(name).expect("registered tool has a scope");
+        let tool = admin::tool(name, "registry test");
+        assert!(tool.input_schema.is_object());
+        assert!(tool.extra.contains_key("annotations"));
+        assert_eq!(tool.extra["securitySchemes"][0]["scopes"], json!([scope]));
+    }
+    for name in git::NAMES {
+        let tool = git::tool(name, "registry test");
+        assert!(tool.input_schema.is_object());
+        assert!(tool.extra.contains_key("annotations"));
+        assert_eq!(
+            tool.extra["securitySchemes"][0]["scopes"],
+            json!([git::REQUIRED_SCOPE])
+        );
+    }
+    assert_eq!(git::REQUIRED_SCOPE, "mcp");
+}
+
 #[async_trait]
 impl ToolProvider for NativeFixture {
     async fn tools(&self) -> anyhow::Result<Vec<Tool>> {

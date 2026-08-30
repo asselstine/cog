@@ -16,42 +16,62 @@ introduce a workspace if a genuinely independent, I/O-free core emerges.
   coverage associated with `src/server.rs` and `src/db.rs` before moving code.
 - [ ] Keep structural moves separate from behavior changes so each change can
   be reviewed as a relocation with equivalent tests.
-- [ ] Verify whether the ignored literal `~/rexec-data/` directory is used by
-  any process or configuration, then move or remove it from the checkout as a
-  separate operational cleanup.
-- [ ] Clean generated build trees (`target/`, `fuzz/target/`,
-  `frontend/node_modules/`, and `frontend/dist/`) when they are not needed;
-  keep all of them ignored.
 
 ## Rust application structure
 
-- [ ] Convert `src/server.rs` to `src/server/mod.rs` with a small public surface
-  containing the application state and server entry points.
-- [ ] Extract startup, storage construction, listener setup, graceful shutdown,
-  and durability coordination into `src/server/startup.rs`.
+- [ ] Keep `src/server.rs` as a small facade containing the application state,
+  child-module declarations, and server entry points; add implementation modules
+  under `src/server/` without converting the facade to `src/server/mod.rs`.
+- [ ] Extract startup orchestration, storage construction, HTTP listener setup,
+  graceful shutdown ordering, and durability coordination into
+  `src/server/startup.rs`. Keep lifecycle ownership there while delegating
+  protocol-specific construction and serving to the owning feature module.
 - [ ] Extract route assembly into `src/server/router.rs`; keep handlers in
   feature modules instead of adding more implementation to the router.
 - [ ] Extract health, readiness, version, and metrics handlers into
   `src/server/health.rs`.
 - [ ] Extract login, logout, cookies, browser sessions, CSRF checks, and browser
   authentication into `src/server/session.rs`.
-- [ ] Extract embedded Vite assets and UI bootstrap/data endpoints into
-  `src/server/frontend.rs`. Keep interactive screens and reusable UI components
-  in `frontend/` as required by `AGENTS.md`.
+- [ ] Extract only embedded Vite assets, the application shell/fallback, and
+  static asset responses into `src/server/frontend.rs`. Keep UI bootstrap and
+  mutation JSON endpoints with their owning administration/feature modules, and
+  keep interactive screens and reusable UI components in `frontend/` as
+  required by `AGENTS.md`.
 - [ ] Separate downstream OAuth authorization-server routes from upstream
-  integration OAuth flows, using `src/server/oauth.rs` and
+  integration OAuth flows, using `src/server/authorization_server.rs` and
   `src/server/upstream_oauth.rs`.
 - [ ] Extract GitHub App setup, manifest callbacks, and installation callbacks
   into `src/server/github.rs`.
-- [ ] Extract SSH listener, connection, authentication, and Git transport
-  handling into `src/server/ssh.rs` while leaving transport-neutral Git logic
-  under `src/git/`.
-- [ ] Extract the HTTP MCP endpoint and catalog construction into
-  `src/server/mcp.rs`; retain protocol types and parsing in the existing
-  `src/mcp.rs`.
-- [ ] Group tool-provider adapters under `src/server/providers/` (`admin`,
-  `git`, `policy`, `measured`, and OAuth step-up) and keep authorization checks
-  at their existing call boundaries.
+- [ ] Extract SSH binding, server configuration, connection, authentication,
+  serving, and Git transport handling into `src/server/ssh.rs`; return a
+  lifecycle handle to startup so `startup.rs` retains shutdown ordering and
+  durability coordination. Leave transport-neutral Git logic under `src/git/`.
+- [ ] Extract the HTTP MCP endpoint, authenticated catalog construction, native
+  provider dispatch, and the policy, measurement, and OAuth step-up adapters
+  into one cohesive `src/server/mcp.rs` module. Keep authorization checks at
+  their existing call boundaries; do not create a directory of one-file server
+  adapters in the first pass.
+- [ ] Keep MCP protocol types, parsing, and dispatch in the existing
+  `src/mcp.rs` facade, and add a narrowly scoped `src/mcp/tools/` tree for the
+  native tool surface:
+  - `src/mcp/tools/mod.rs` composes the complete native definition list and
+    provides shared definition/annotation helpers.
+  - `src/mcp/tools/execute.rs` owns the `execute` definition and its agent
+    instructions.
+  - `src/mcp/tools/admin.rs` owns administration tool names, descriptions,
+    input schemas, annotations, and required scopes.
+  - `src/mcp/tools/git.rs` owns `repository_access` and the supporting SSH-key
+    tool definitions; keep these together until they become independently
+    substantial.
+- [ ] Make each native tool definition the single source of truth for its name,
+  description, input schema, annotations, and required scope. Have both catalog
+  advertisement and preauthorization consult those definitions instead of
+  maintaining separate name-to-scope matches.
+- [ ] Keep the native MCP provider implementations thin where practical, but do
+  not introduce a new service layer solely for this move. As administration and
+  Git behavior move into their existing feature modules, have the MCP adapters
+  call those transport-neutral operations rather than calling HTTP handlers or
+  duplicating their logic.
 - [ ] Extract authenticated JSON administration endpoints into focused modules
   rather than one catch-all API file if integrations, identities, and tokens
   remain independently substantial.
@@ -60,19 +80,23 @@ introduce a workspace if a genuinely independent, I/O-free core emerges.
 
 ## Database structure
 
-- [ ] Convert `src/db.rs` to `src/db/mod.rs`, retaining the `Database` handle
-  and shared transaction primitives there.
+- [ ] Keep `src/db.rs` as a small facade retaining the `Database` handle, shared
+  transaction primitives, and child-module declarations; add implementation
+  modules under `src/db/` without converting the facade to `src/db/mod.rs`.
 - [ ] Move schema versions and migration execution into
   `src/db/migrations.rs` without changing migration order or transaction
   boundaries.
-- [ ] Move database row/domain types into `src/db/models.rs` or their owning
-  feature module, avoiding a second generic dumping ground.
-- [ ] Group identity, agent, session, token, and grant operations under a clear
-  authentication/identity database module.
-- [ ] Group integration, connection, secret, and upstream OAuth persistence
-  under integration-focused database modules.
-- [ ] Move Git repository, grant, pending-request, and SSH-key persistence into
-  Git-focused database modules.
+- [ ] Colocate database row/domain types with their owning feature module;
+  avoid a generic `models.rs` dumping ground.
+- [ ] Move user, identity, and agent persistence into `src/db/identity.rs`.
+- [ ] Move browser sessions, OAuth clients, authorization codes, tokens, and
+  client grants into `src/db/oauth.rs`.
+- [ ] Move integration, connection, secret, GitHub App setup, and upstream OAuth
+  persistence into `src/db/integrations.rs`.
+- [ ] Move Git repository, grant, and pending-request persistence into
+  `src/db/git.rs`.
+- [ ] Move host and agent SSH-key persistence into `src/db/ssh.rs`.
+- [ ] Move audit-event persistence and queries into `src/db/audit.rs`.
 - [ ] Preserve operations that must be atomic as single `Database` methods or
   explicit transactions; do not split transaction ownership merely to shorten
   files.
@@ -91,7 +115,18 @@ introduce a workspace if a genuinely independent, I/O-free core emerges.
 - [ ] Add frontend linting and tests if the split introduces enough independent
   UI logic to justify them; do not add tooling solely for directory symmetry.
 
-## Repository root and documentation
+## Separate operational and repository cleanup
+
+These tasks are intentionally independent of the module reorganization so
+structural commits remain reviewable and operational state is not changed as a
+side effect of source moves.
+
+- [ ] Verify whether the ignored literal `~/rexec-data/` directory is used by
+  any process or configuration, then move or remove it from the checkout as a
+  separate operational cleanup.
+- [ ] Clean generated build trees (`target/`, `fuzz/target/`,
+  `frontend/node_modules/`, and `frontend/dist/`) only when they are not needed;
+  keep all of them ignored and do not make cleanup a refactoring prerequisite.
 
 - [ ] Move `SCALING.md` to `docs/design/scaling.md` and
   `FUTURE_ENVELOPE_ENCRYPTION_PLAN.md` to a clearly named `docs/design/` or
@@ -109,6 +144,9 @@ introduce a workspace if a genuinely independent, I/O-free core emerges.
 
 ## Test alignment and verification
 
+- [ ] Add focused tests for the native MCP definition registry: tool names are
+  unique, every advertised native tool has a schema and annotations, and
+  preauthorization uses the required scope stored in the same definition.
 - [ ] Mirror the new server and database feature boundaries in the existing
   integration-test modules while retaining a small number of Cargo test
   targets to avoid unnecessary build/link overhead.

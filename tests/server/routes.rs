@@ -3911,16 +3911,21 @@ async fn disconnect_is_idempotent_preserves_target_and_grant_while_delete_remove
 
 #[test]
 fn integration_ui_distinguishes_disconnect_from_permanent_delete() {
-    let source = include_str!("../../frontend/src/main.jsx");
-    assert!(source.contains("Disconnect credentials but preserve this connection?"));
-    assert!(source.contains("Delete this connection and every descendant?"));
-    assert!(source.contains("all of its connections, agents, credentials, and grants"));
-    assert!(source.contains("function Consent()"));
-    assert!(source.contains("payload.identities[0]?.id"));
-    assert!(source.contains("identity === \"\""));
-    assert!(source.contains("action=\"/api/oauth/consent\""));
-    assert!(source.contains("function GitHubInstallationComplete()"));
-    assert!(source.contains("/github/app/installation/complete"));
+    let dashboard = include_str!("../../frontend/src/screens/Dashboard.jsx");
+    assert!(dashboard.contains("Disconnect credentials but preserve this connection?"));
+    assert!(dashboard.contains("Delete this connection and every descendant?"));
+    assert!(dashboard.contains("all of its connections, agents, credentials, and grants"));
+
+    let consent = include_str!("../../frontend/src/screens/Consent.jsx");
+    assert!(consent.contains("function Consent()"));
+    assert!(consent.contains("payload.identities[0]?.id"));
+    assert!(consent.contains("identity === \"\""));
+    assert!(consent.contains("action=\"/api/oauth/consent\""));
+
+    let github = include_str!("../../frontend/src/screens/GitHubInstallationComplete.jsx");
+    assert!(github.contains("function GitHubInstallationComplete()"));
+    let app = include_str!("../../frontend/src/App.jsx");
+    assert!(app.contains("/github/app/installation/complete"));
 }
 
 #[test]
